@@ -123,6 +123,34 @@ class ReadingShelfStore:
                 reverse=True,
             )
 
+    def get_book(self, book_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            for book in self._load_unlocked():
+                if book.get("id") == book_id:
+                    return book
+        return None
+
+    def search_books(
+        self,
+        query: str = "",
+        status: str = "",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        clean_query = _text(query, 500).casefold()
+        clean_status = _text(status, 20)
+        limit = max(1, min(int(limit), 50))
+
+        matches = []
+        for book in self.list_books():
+            if clean_status and book.get("status") != clean_status:
+                continue
+            if clean_query and clean_query not in self._search_text(book):
+                continue
+            matches.append(book)
+            if len(matches) >= limit:
+                break
+        return matches
+
     def create_book(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             books = self._load_unlocked()
@@ -136,7 +164,8 @@ class ReadingShelfStore:
             books = self._load_unlocked()
             for index, book in enumerate(books):
                 if book.get("id") == book_id:
-                    updated = normalize_book(payload, existing=book)
+                    merged_payload = {**book, **payload}
+                    updated = normalize_book(merged_payload, existing=book)
                     books[index] = updated
                     self._save_unlocked(books)
                     return updated
@@ -150,6 +179,27 @@ class ReadingShelfStore:
                 return False
             self._save_unlocked(kept)
             return True
+
+    @staticmethod
+    def _search_text(book: dict[str, Any]) -> str:
+        parts = [
+            book.get("title", ""),
+            book.get("author", ""),
+            book.get("summary", ""),
+            book.get("ruby_notes", ""),
+            book.get("cyan_notes", ""),
+            " ".join(book.get("tags", [])),
+            " ".join(book.get("source_bucket_ids", [])),
+        ]
+        for excerpt in book.get("excerpts", []):
+            if isinstance(excerpt, dict):
+                parts.extend([
+                    excerpt.get("quote", ""),
+                    excerpt.get("page", ""),
+                    excerpt.get("note", ""),
+                    excerpt.get("added_by", ""),
+                ])
+        return "\n".join(str(part) for part in parts).casefold()
 
     def _load_unlocked(self) -> list[dict[str, Any]]:
         if not os.path.exists(self.path):

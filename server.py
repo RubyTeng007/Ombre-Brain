@@ -10,8 +10,8 @@
 # 核心职责：
 #   - Initialize config, bucket manager, dehydrator, decay engine
 #     初始化配置、记忆桶管理器、脱水器、衰减引擎
-#   - Expose 6 MCP tools:
-#     暴露 6 个 MCP 工具：
+#   - Expose 7 MCP tools:
+#     暴露 7 个 MCP 工具：
 #       breath — Surface unresolved memories or search by keyword
 #                浮现未解决记忆 或 按关键词检索
 #       hold   — Store a single memory (or write a `feel` reflection)
@@ -24,6 +24,8 @@
 #                系统状态 + 所有桶列表
 #       dream  — Surface recent dynamic buckets for self-digestion
 #                返回最近桶 供模型自省/写 feel
+#       shelf  — Read and write the shared-reading shelf
+#                读取、搜索与修改共读书架
 #
 # Startup:
 # 启动方式：
@@ -1259,6 +1261,149 @@ async def dream() -> str:
     final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
+
+
+# =============================================================
+# Tool 7: shelf — Shared reading shelf
+# 工具 7：shelf — 共讀書架
+# =============================================================
+def _shelf_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _shelf_compact(book: dict) -> dict:
+    return {
+        "id": book.get("id", ""),
+        "title": book.get("title", ""),
+        "author": book.get("author", ""),
+        "status": book.get("status", ""),
+        "started_at": book.get("started_at", ""),
+        "finished_at": book.get("finished_at", ""),
+        "tags": book.get("tags", []),
+        "summary": book.get("summary", "")[:500],
+        "excerpt_count": len(book.get("excerpts", [])),
+        "updated_at": book.get("updated_at", ""),
+    }
+
+
+def _shelf_json(data) -> str:
+    return _json_lib.dumps(data, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def shelf(
+    action: str = "list",
+    book_id: str = "",
+    query: str = "",
+    title: str | None = None,
+    author: str | None = None,
+    status: str | None = None,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    cover_color: str | None = None,
+    summary: str | None = None,
+    ruby_notes: str | None = None,
+    cyan_notes: str | None = None,
+    tags: str | None = None,
+    source_bucket_ids: str | None = None,
+    excerpts_json: str | None = None,
+    quote: str = "",
+    page: str = "",
+    note: str = "",
+    added_by: str = "我們",
+    limit: int = 20,
+) -> str:
+    """共讀書架讀寫工具。action=list/get/search/create/update/add_excerpt/delete。list/search回傳書籍摘要；get回傳完整內容。create需title；update/delete/get需book_id；tags與source_bucket_ids用逗號分隔；excerpts_json是節錄陣列JSON。delete只在使用者明確要求刪除時使用。"""
+    action = (action or "list").strip().lower()
+    valid_actions = {"list", "get", "search", "create", "update", "add_excerpt", "delete"}
+    if action not in valid_actions:
+        return f"不支援的 action: {action}。可用: {', '.join(sorted(valid_actions))}"
+
+    try:
+        if action in {"list", "search"}:
+            books = reading_shelf.search_books(
+                query=query if action == "search" else "",
+                status=status or "",
+                limit=limit,
+            )
+            return _shelf_json({
+                "count": len(books),
+                "books": [_shelf_compact(book) for book in books],
+            })
+
+        if action == "get":
+            if not book_id.strip():
+                return "get 需要 book_id。"
+            book = reading_shelf.get_book(book_id.strip())
+            return _shelf_json(book) if book else f"找不到書籍: {book_id}"
+
+        if action == "delete":
+            if not book_id.strip():
+                return "delete 需要 book_id。"
+            deleted = reading_shelf.delete_book(book_id.strip())
+            return f"已刪除書籍: {book_id}" if deleted else f"找不到書籍: {book_id}"
+
+        if action == "add_excerpt":
+            if not book_id.strip():
+                return "add_excerpt 需要 book_id。"
+            if not quote.strip():
+                return "add_excerpt 需要 quote。"
+            book = reading_shelf.get_book(book_id.strip())
+            if not book:
+                return f"找不到書籍: {book_id}"
+            excerpts = list(book.get("excerpts", []))
+            excerpts.append({
+                "quote": quote,
+                "page": page,
+                "note": note,
+                "added_by": added_by,
+            })
+            updated = reading_shelf.update_book(book_id.strip(), {"excerpts": excerpts})
+            return _shelf_json(updated)
+
+        payload = {}
+        field_values = {
+            "title": title,
+            "author": author,
+            "status": status,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "cover_color": cover_color,
+            "summary": summary,
+            "ruby_notes": ruby_notes,
+            "cyan_notes": cyan_notes,
+        }
+        payload.update({key: value for key, value in field_values.items() if value is not None})
+        if tags is not None:
+            payload["tags"] = _shelf_csv(tags)
+        if source_bucket_ids is not None:
+            payload["source_bucket_ids"] = _shelf_csv(source_bucket_ids)
+        if excerpts_json is not None:
+            try:
+                excerpts = _json_lib.loads(excerpts_json)
+            except _json_lib.JSONDecodeError as exc:
+                return f"excerpts_json 不是有效 JSON: {exc}"
+            if not isinstance(excerpts, list):
+                return "excerpts_json 必須是 JSON 陣列。"
+            payload["excerpts"] = excerpts
+
+        if action == "create":
+            if not title or not title.strip():
+                return "create 需要 title。"
+            return _shelf_json(reading_shelf.create_book(payload))
+
+        if not book_id.strip():
+            return "update 需要 book_id。"
+        if not payload:
+            return "沒有任何欄位需要修改。"
+        return _shelf_json(reading_shelf.update_book(book_id.strip(), payload))
+    except ValueError as exc:
+        return f"書架資料不合法: {exc}"
+    except KeyError:
+        return f"找不到書籍: {book_id}"
+    except Exception as exc:
+        logger.exception("Reading shelf tool failed")
+        return f"共讀書架操作失敗: {exc}"
 
 
 # =============================================================

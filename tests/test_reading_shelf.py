@@ -66,6 +66,47 @@ def test_store_crud_and_atomic_file(tmp_path):
     assert store.list_books() == []
 
 
+def test_store_partial_update_preserves_other_fields(tmp_path):
+    store = ReadingShelfStore(str(tmp_path))
+    created = store.create_book({
+        "title": "長日將盡",
+        "author": "石黑一雄",
+        "summary": "共同摘要",
+        "ruby_notes": "Ruby 原本的心得",
+        "excerpts": [{"quote": "值得留下的句子", "added_by": "我們"}],
+    })
+
+    updated = store.update_book(created["id"], {"cyan_notes": "Cyan 新增的心得"})
+
+    assert updated["title"] == "長日將盡"
+    assert updated["author"] == "石黑一雄"
+    assert updated["summary"] == "共同摘要"
+    assert updated["ruby_notes"] == "Ruby 原本的心得"
+    assert updated["cyan_notes"] == "Cyan 新增的心得"
+    assert updated["excerpts"][0]["quote"] == "值得留下的句子"
+
+
+def test_store_get_and_search_across_notes_and_excerpts(tmp_path):
+    store = ReadingShelfStore(str(tmp_path))
+    first = store.create_book({
+        "title": "長日將盡",
+        "author": "石黑一雄",
+        "status": "已讀完",
+        "cyan_notes": "關於忠誠與自我欺騙",
+        "excerpts": [{"quote": "回首一生時才明白", "added_by": "Cyan"}],
+    })
+    store.create_book({
+        "title": "別的書",
+        "status": "想讀",
+    })
+
+    assert store.get_book(first["id"])["title"] == "長日將盡"
+    assert store.get_book("missing") is None
+    assert [book["id"] for book in store.search_books("自我欺騙")] == [first["id"]]
+    assert [book["id"] for book in store.search_books("回首一生")] == [first["id"]]
+    assert [book["id"] for book in store.search_books(status="已讀完")] == [first["id"]]
+
+
 def test_store_rejects_corrupt_json(tmp_path):
     store = ReadingShelfStore(str(tmp_path))
     with open(store.path, "w", encoding="utf-8") as handle:
