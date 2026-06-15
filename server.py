@@ -56,6 +56,7 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
+from reading_shelf import ReadingShelfStore
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -102,6 +103,7 @@ bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket 
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
+reading_shelf = ReadingShelfStore(config["buckets_dir"])
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -1318,6 +1320,71 @@ async def api_bucket_detail(request):
     })
 
 
+@mcp.custom_route("/api/reading-shelf", methods=["GET"])
+async def api_reading_shelf(request):
+    """List books stored in the shared-reading shelf."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        return JSONResponse({"books": reading_shelf.list_books()})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading-shelf/books", methods=["POST"])
+async def api_reading_shelf_create(request):
+    """Create a shared-reading shelf entry."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    try:
+        return JSONResponse(reading_shelf.create_book(body), status_code=201)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading-shelf/books/{book_id}", methods=["PUT"])
+async def api_reading_shelf_update(request):
+    """Update a shared-reading shelf entry."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    try:
+        return JSONResponse(reading_shelf.update_book(request.path_params["book_id"], body))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except KeyError:
+        return JSONResponse({"error": "book not found"}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading-shelf/books/{book_id}", methods=["DELETE"])
+async def api_reading_shelf_delete(request):
+    """Delete a shared-reading shelf entry."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        deleted = reading_shelf.delete_book(request.path_params["book_id"])
+        if not deleted:
+            return JSONResponse({"error": "book not found"}, status_code=404)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @mcp.custom_route("/api/search", methods=["GET"])
 async def api_search(request):
     """Search buckets by query."""
@@ -1899,7 +1966,7 @@ async def api_system_status(request):
                 "total": stats.get("permanent_count", 0) + stats.get("dynamic_count", 0),
             },
             "using_env_password": bool(os.environ.get("OMBRE_DASHBOARD_PASSWORD", "")),
-            "version": "1.3.0",
+            "version": "1.4.0",
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
