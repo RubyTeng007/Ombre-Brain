@@ -10,8 +10,8 @@
 # 核心职责：
 #   - Initialize config, bucket manager, dehydrator, decay engine
 #     初始化配置、记忆桶管理器、脱水器、衰减引擎
-#   - Expose 6 MCP tools:
-#     暴露 6 个 MCP 工具：
+#   - Expose 7 MCP tools:
+#     暴露 7 个 MCP 工具：
 #       breath — Surface unresolved memories or search by keyword
 #                浮现未解决记忆 或 按关键词检索
 #       hold   — Store a single memory (or write a `feel` reflection)
@@ -24,6 +24,8 @@
 #                系统状态 + 所有桶列表
 #       dream  — Surface recent dynamic buckets for self-digestion
 #                返回最近桶 供模型自省/写 feel
+#       shelf  — Read and write the shared-reading shelf
+#                读取、搜索与修改共读书架
 #
 # Startup:
 # 启动方式：
@@ -56,6 +58,7 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
+from reading_shelf import ReadingShelfStore
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -102,6 +105,7 @@ bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket 
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
+reading_shelf = ReadingShelfStore(config["buckets_dir"])
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -545,18 +549,33 @@ async def breath(
 
     # --- No args or empty query: surfacing mode (weight pool active push) ---
     # --- 无参数或空query：浮现模式（权重池主动推送）---
-    if not query or not query.strip():
+    if (not query or not query.strip()) and (domain or "").strip().lower() != "feel":
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
         except Exception as e:
             logger.error(f"Failed to list buckets for surfacing / 浮现列桶失败: {e}")
             return "记忆系统暂时无法访问。"
 
+        domain_filter = [
+            d.strip()
+            for d in (domain or "").split(",")
+            if d.strip() and d.strip().lower() != "feel"
+        ]
+
+        def _in_domain(bucket):
+            if not domain_filter:
+                return True
+            meta_domain = bucket["metadata"].get("domain", [])
+            if isinstance(meta_domain, str):
+                meta_domain = [meta_domain]
+            return any(d in meta_domain for d in domain_filter)
+
         # --- Pinned/protected buckets: always surface as core principles ---
         # --- 钉选桶：作为核心准则，始终浮现 ---
         pinned_buckets = [
             b for b in all_buckets
-            if b["metadata"].get("pinned") or b["metadata"].get("protected")
+            if (b["metadata"].get("pinned") or b["metadata"].get("protected"))
+            and _in_domain(b)
         ]
         pinned_results = []
         for b in pinned_buckets:
@@ -576,6 +595,7 @@ async def breath(
             and b["metadata"].get("type") not in ("permanent", "feel")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
+            and _in_domain(b)
         ]
 
         logger.info(
@@ -1260,6 +1280,149 @@ async def dream() -> str:
 
 
 # =============================================================
+# Tool 7: shelf — Shared reading shelf
+# 工具 7：shelf — 共讀書架
+# =============================================================
+def _shelf_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _shelf_compact(book: dict) -> dict:
+    return {
+        "id": book.get("id", ""),
+        "title": book.get("title", ""),
+        "author": book.get("author", ""),
+        "status": book.get("status", ""),
+        "started_at": book.get("started_at", ""),
+        "finished_at": book.get("finished_at", ""),
+        "tags": book.get("tags", []),
+        "summary": book.get("summary", "")[:500],
+        "excerpt_count": len(book.get("excerpts", [])),
+        "updated_at": book.get("updated_at", ""),
+    }
+
+
+def _shelf_json(data) -> str:
+    return _json_lib.dumps(data, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def shelf(
+    action: str = "list",
+    book_id: str = "",
+    query: str = "",
+    title: str | None = None,
+    author: str | None = None,
+    status: str | None = None,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    cover_color: str | None = None,
+    summary: str | None = None,
+    ruby_notes: str | None = None,
+    cyan_notes: str | None = None,
+    tags: str | None = None,
+    source_bucket_ids: str | None = None,
+    excerpts_json: str | None = None,
+    quote: str = "",
+    page: str = "",
+    note: str = "",
+    added_by: str = "我們",
+    limit: int = 20,
+) -> str:
+    """共讀書架讀寫工具。action=list/get/search/create/update/add_excerpt/delete。list/search回傳書籍摘要；get回傳完整內容。create需title；update/delete/get需book_id；tags與source_bucket_ids用逗號分隔；excerpts_json是節錄陣列JSON。delete只在使用者明確要求刪除時使用。"""
+    action = (action or "list").strip().lower()
+    valid_actions = {"list", "get", "search", "create", "update", "add_excerpt", "delete"}
+    if action not in valid_actions:
+        return f"不支援的 action: {action}。可用: {', '.join(sorted(valid_actions))}"
+
+    try:
+        if action in {"list", "search"}:
+            books = reading_shelf.search_books(
+                query=query if action == "search" else "",
+                status=status or "",
+                limit=limit,
+            )
+            return _shelf_json({
+                "count": len(books),
+                "books": [_shelf_compact(book) for book in books],
+            })
+
+        if action == "get":
+            if not book_id.strip():
+                return "get 需要 book_id。"
+            book = reading_shelf.get_book(book_id.strip())
+            return _shelf_json(book) if book else f"找不到書籍: {book_id}"
+
+        if action == "delete":
+            if not book_id.strip():
+                return "delete 需要 book_id。"
+            deleted = reading_shelf.delete_book(book_id.strip())
+            return f"已刪除書籍: {book_id}" if deleted else f"找不到書籍: {book_id}"
+
+        if action == "add_excerpt":
+            if not book_id.strip():
+                return "add_excerpt 需要 book_id。"
+            if not quote.strip():
+                return "add_excerpt 需要 quote。"
+            book = reading_shelf.get_book(book_id.strip())
+            if not book:
+                return f"找不到書籍: {book_id}"
+            excerpts = list(book.get("excerpts", []))
+            excerpts.append({
+                "quote": quote,
+                "page": page,
+                "note": note,
+                "added_by": added_by,
+            })
+            updated = reading_shelf.update_book(book_id.strip(), {"excerpts": excerpts})
+            return _shelf_json(updated)
+
+        payload = {}
+        field_values = {
+            "title": title,
+            "author": author,
+            "status": status,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "cover_color": cover_color,
+            "summary": summary,
+            "ruby_notes": ruby_notes,
+            "cyan_notes": cyan_notes,
+        }
+        payload.update({key: value for key, value in field_values.items() if value is not None})
+        if tags is not None:
+            payload["tags"] = _shelf_csv(tags)
+        if source_bucket_ids is not None:
+            payload["source_bucket_ids"] = _shelf_csv(source_bucket_ids)
+        if excerpts_json is not None:
+            try:
+                excerpts = _json_lib.loads(excerpts_json)
+            except _json_lib.JSONDecodeError as exc:
+                return f"excerpts_json 不是有效 JSON: {exc}"
+            if not isinstance(excerpts, list):
+                return "excerpts_json 必須是 JSON 陣列。"
+            payload["excerpts"] = excerpts
+
+        if action == "create":
+            if not title or not title.strip():
+                return "create 需要 title。"
+            return _shelf_json(reading_shelf.create_book(payload))
+
+        if not book_id.strip():
+            return "update 需要 book_id。"
+        if not payload:
+            return "沒有任何欄位需要修改。"
+        return _shelf_json(reading_shelf.update_book(book_id.strip(), payload))
+    except ValueError as exc:
+        return f"書架資料不合法: {exc}"
+    except KeyError:
+        return f"找不到書籍: {book_id}"
+    except Exception as exc:
+        logger.exception("Reading shelf tool failed")
+        return f"共讀書架操作失敗: {exc}"
+
+
+# =============================================================
 # Dashboard API endpoints (for lightweight Web UI)
 # 仪表板 API（轻量 Web UI 用）
 # =============================================================
@@ -1316,6 +1479,71 @@ async def api_bucket_detail(request):
         "content": strip_wikilinks(bucket.get("content", "")),
         "score": decay_engine.calculate_score(meta),
     })
+
+
+@mcp.custom_route("/api/reading-shelf", methods=["GET"])
+async def api_reading_shelf(request):
+    """List books stored in the shared-reading shelf."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        return JSONResponse({"books": reading_shelf.list_books()})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading-shelf/books", methods=["POST"])
+async def api_reading_shelf_create(request):
+    """Create a shared-reading shelf entry."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    try:
+        return JSONResponse(reading_shelf.create_book(body), status_code=201)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading-shelf/books/{book_id}", methods=["PUT"])
+async def api_reading_shelf_update(request):
+    """Update a shared-reading shelf entry."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    try:
+        return JSONResponse(reading_shelf.update_book(request.path_params["book_id"], body))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except KeyError:
+        return JSONResponse({"error": "book not found"}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading-shelf/books/{book_id}", methods=["DELETE"])
+async def api_reading_shelf_delete(request):
+    """Delete a shared-reading shelf entry."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        deleted = reading_shelf.delete_book(request.path_params["book_id"])
+        if not deleted:
+            return JSONResponse({"error": "book not found"}, status_code=404)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @mcp.custom_route("/api/search", methods=["GET"])
@@ -1899,7 +2127,7 @@ async def api_system_status(request):
                 "total": stats.get("permanent_count", 0) + stats.get("dynamic_count", 0),
             },
             "using_env_password": bool(os.environ.get("OMBRE_DASHBOARD_PASSWORD", "")),
-            "version": "1.3.0",
+            "version": "1.4.0",
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)

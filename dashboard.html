@@ -99,11 +99,13 @@
     border-bottom: 1px solid var(--border);
   }
   .tab {
+    flex: 0 0 auto;
     padding: 14px 22px;
     font-size: 13px;
     font-weight: 400;
     color: var(--text-dim);
     cursor: pointer;
+    white-space: nowrap;
     border-bottom: 2px solid transparent;
     transition: all 0.25s ease;
     letter-spacing: 0.3px;
@@ -576,6 +578,334 @@
   .flow-step.active { border-color: var(--accent); color: var(--accent); }
   .flow-arrow { color: var(--text-light); font-size: 16px; }
 
+  .shelf-hero {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 28px;
+    padding: 28px 30px;
+    margin-bottom: 28px;
+    border: 1px solid var(--border);
+    border-radius: 24px;
+    background:
+      linear-gradient(120deg, rgba(255,255,255,0.62), rgba(247,242,232,0.35)),
+      radial-gradient(circle at 85% 15%, rgba(47,79,79,0.12), transparent 42%);
+    box-shadow: 8px 8px 22px var(--shadow-dark-subtle), -8px -8px 22px var(--shadow-light);
+  }
+  .shelf-eyebrow {
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1.8px;
+    text-transform: uppercase;
+  }
+  .shelf-hero h2 {
+    margin: 5px 0 7px;
+    font-family: 'Cormorant Garamond', serif;
+    color: var(--text);
+    font-size: 34px;
+    line-height: 1.1;
+  }
+  .shelf-hero p {
+    max-width: 620px;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  .shelf-count {
+    display: inline-block;
+    margin-top: 12px;
+    color: var(--text-light);
+    font-size: 12px;
+  }
+  .shelf-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+    gap: 22px;
+  }
+  .book-card {
+    display: grid;
+    grid-template-columns: 94px 1fr;
+    gap: 18px;
+    min-height: 190px;
+    padding: 18px;
+    border: 1px solid transparent;
+    border-radius: 20px;
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    box-shadow: 5px 5px 13px var(--shadow-dark-subtle), -5px -5px 13px var(--shadow-light);
+    transition: transform .22s ease, border-color .22s ease, box-shadow .22s ease;
+  }
+  .book-card:hover {
+    transform: translateY(-3px);
+    border-color: var(--border-strong);
+    box-shadow: 8px 8px 18px var(--shadow-dark), -8px -8px 18px var(--shadow-light);
+  }
+  .book-cover {
+    position: relative;
+    width: 94px;
+    height: 142px;
+    padding: 13px 10px;
+    border-radius: 5px 12px 12px 5px;
+    color: #F8F4EA;
+    overflow: hidden;
+    box-shadow: inset 5px 0 9px rgba(0,0,0,.18), 5px 7px 12px rgba(78,65,48,.22);
+  }
+  .book-cover::before {
+    content: '';
+    position: absolute;
+    inset: 8px;
+    border: 1px solid rgba(255,255,255,.28);
+    border-radius: 2px 7px 7px 2px;
+  }
+  .book-cover::after {
+    content: '';
+    position: absolute;
+    left: 7px;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: rgba(255,255,255,.24);
+  }
+  .book-cover-title {
+    position: relative;
+    z-index: 1;
+    display: block;
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 18px;
+    font-weight: 600;
+    line-height: 1.05;
+    word-break: break-word;
+  }
+  .book-cover-mark {
+    position: absolute;
+    right: 10px;
+    bottom: 8px;
+    z-index: 1;
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 24px;
+    font-style: italic;
+    opacity: .5;
+  }
+  .book-card-body {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .book-card h3 {
+    margin: 2px 0 1px;
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 24px;
+    line-height: 1.1;
+  }
+  .book-author {
+    color: var(--text-dim);
+    font-size: 12px;
+  }
+  .book-summary {
+    display: -webkit-box;
+    margin-top: 12px;
+    color: var(--text-dim);
+    font-size: 12px;
+    line-height: 1.65;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+  }
+  .book-card-footer {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: auto;
+    padding-top: 12px;
+    color: var(--text-light);
+    font-size: 11px;
+  }
+  .book-status {
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: var(--accent-glow);
+    color: var(--accent);
+  }
+  .book-status.reading { background: rgba(154,123,79,.13); color: var(--warning); }
+  .book-status.finished { background: rgba(74,124,89,.13); color: var(--positive); }
+  .shelf-empty {
+    grid-column: 1 / -1;
+    padding: 64px 24px;
+    border: 1px dashed var(--border-strong);
+    border-radius: 22px;
+    color: var(--text-dim);
+    text-align: center;
+  }
+  .shelf-empty strong {
+    display: block;
+    margin-bottom: 5px;
+    font-family: 'Cormorant Garamond', serif;
+    color: var(--text);
+    font-size: 25px;
+  }
+
+  .book-editor-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 109;
+    display: none;
+    background: rgba(58,53,48,.22);
+    backdrop-filter: blur(3px);
+  }
+  .book-editor-backdrop.open { display: block; }
+  .book-editor {
+    position: fixed;
+    top: 0;
+    right: 0;
+    z-index: 110;
+    width: min(680px, 100%);
+    height: 100vh;
+    padding: 30px 34px 50px;
+    overflow-y: auto;
+    background: var(--surface-solid);
+    border-left: 1px solid var(--border);
+    box-shadow: -12px 0 30px rgba(90,75,52,.18);
+    transform: translateX(102%);
+    transition: transform .3s cubic-bezier(.4,0,.2,1);
+  }
+  .book-editor.open { transform: translateX(0); }
+  .book-editor-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 20px;
+    margin-bottom: 24px;
+  }
+  .book-editor-head h2 {
+    font-family: 'Cormorant Garamond', serif;
+    color: var(--accent);
+    font-size: 30px;
+  }
+  .book-editor-close {
+    width: 36px;
+    height: 36px;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 18px;
+  }
+  .book-editor-close:hover { background: var(--accent-glow); color: var(--accent); }
+  .book-form-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .book-field { margin-bottom: 16px; }
+  .book-field.full { grid-column: 1 / -1; }
+  .book-field label {
+    display: block;
+    margin-bottom: 6px;
+    color: var(--text-dim);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .5px;
+  }
+  .book-field input,
+  .book-field select,
+  .book-field textarea {
+    width: 100%;
+    padding: 11px 13px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: rgba(255,255,255,.4);
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    resize: vertical;
+  }
+  .book-field input:focus,
+  .book-field select:focus,
+  .book-field textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+  }
+  .book-form-section {
+    margin-top: 10px;
+    padding-top: 22px;
+    border-top: 1px solid var(--border);
+  }
+  .book-form-section h3 {
+    margin-bottom: 4px;
+    font-family: 'Cormorant Garamond', serif;
+    color: var(--text);
+    font-size: 22px;
+  }
+  .book-form-section > p {
+    margin-bottom: 15px;
+    color: var(--text-light);
+    font-size: 11px;
+  }
+  .excerpt-row {
+    position: relative;
+    margin: 12px 0;
+    padding: 15px;
+    border: 1px solid var(--border);
+    border-radius: 15px;
+    background: rgba(255,255,255,.26);
+  }
+  .excerpt-row textarea { min-height: 82px; }
+  .excerpt-meta {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-top: 9px;
+  }
+  .excerpt-remove {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    width: 28px;
+    height: 28px;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-light);
+    cursor: pointer;
+  }
+  .excerpt-remove:hover { color: var(--negative); background: rgba(139,74,74,.08); }
+  .book-source-controls { display: flex; gap: 8px; }
+  .book-source-controls select { flex: 1; }
+  .book-source-list { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 9px; }
+  .book-source-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 9px;
+    border-radius: 999px;
+    background: var(--accent-glow);
+    color: var(--accent);
+    font-size: 11px;
+  }
+  .book-source-chip button {
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+  .book-form-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 28px;
+  }
+  .book-form-actions .delete {
+    margin-left: auto;
+    color: var(--negative);
+    border-color: rgba(139,74,74,.35);
+  }
+  .book-form-message { min-height: 20px; margin-top: 10px; font-size: 12px; }
+
   @media (max-width: 768px) {
     .header { padding: 20px; flex-wrap: wrap; }
     .header h1 { font-size: 22px; }
@@ -596,6 +926,12 @@
     .config-row { flex-wrap: wrap; }
     .config-row label { width: 100%; }
     .breath-flow { display: none; }
+    .shelf-hero { align-items: flex-start; flex-direction: column; padding: 22px; }
+    .shelf-hero h2 { font-size: 29px; }
+    .shelf-grid { grid-template-columns: 1fr; }
+    .book-editor { padding: 24px 18px 42px; }
+    .book-form-grid, .excerpt-meta { grid-template-columns: 1fr; }
+    .book-field.full { grid-column: auto; }
   }
 </style>
 </head>
@@ -612,6 +948,7 @@
 
 <div class="tabs">
   <div class="tab active" data-tab="list">记忆桶</div>
+  <div class="tab" data-tab="shelf">共讀書架</div>
   <div class="tab" data-tab="breath">Breath 模拟</div>
   <div class="tab" data-tab="network">记忆网络</div>
   <div class="tab" data-tab="config">配置</div>
@@ -623,6 +960,21 @@
   <div class="filters" id="filters"></div>
   <div class="bucket-list" id="bucket-list">
     <div class="loading">加载中…</div>
+  </div>
+</div>
+
+<div class="content" id="shelf-view" style="display:none">
+  <div class="shelf-hero">
+    <div>
+      <div class="shelf-eyebrow">Shared reading archive</div>
+      <h2>我們一起讀過的書</h2>
+      <p>把共同摘要、各自留下的心得與捨不得忘記的句子，放在不會隨記憶權重衰減的地方。</p>
+      <span class="shelf-count" id="shelf-count">載入中...</span>
+    </div>
+    <button class="btn-primary" onclick="openBookEditor()">新增一本書</button>
+  </div>
+  <div class="shelf-grid" id="shelf-grid">
+    <div class="loading">載入書架中...</div>
   </div>
 </div>
 
@@ -780,6 +1132,97 @@
   <div id="detail-content"></div>
 </div>
 
+<div class="book-editor-backdrop" id="book-editor-backdrop" onclick="closeBookEditor()"></div>
+<aside class="book-editor" id="book-editor" aria-hidden="true">
+  <div class="book-editor-head">
+    <div>
+      <div class="shelf-eyebrow">Shared reading archive</div>
+      <h2 id="book-editor-title">新增一本書</h2>
+    </div>
+    <button class="book-editor-close" type="button" onclick="closeBookEditor()" aria-label="關閉">✕</button>
+  </div>
+
+  <form id="book-form" onsubmit="saveBook(event)">
+    <div class="book-form-grid">
+      <div class="book-field">
+        <label for="book-title">書名 *</label>
+        <input id="book-title" required maxlength="200" />
+      </div>
+      <div class="book-field">
+        <label for="book-author">作者</label>
+        <input id="book-author" maxlength="200" />
+      </div>
+      <div class="book-field">
+        <label for="book-status">閱讀狀態</label>
+        <select id="book-status">
+          <option>想讀</option>
+          <option>共讀中</option>
+          <option>已讀完</option>
+        </select>
+      </div>
+      <div class="book-field">
+        <label for="book-cover-color">書封顏色</label>
+        <input id="book-cover-color" type="color" value="#2F4F4F" />
+      </div>
+      <div class="book-field">
+        <label for="book-started-at">開始日期</label>
+        <input id="book-started-at" type="date" />
+      </div>
+      <div class="book-field">
+        <label for="book-finished-at">讀完日期</label>
+        <input id="book-finished-at" type="date" />
+      </div>
+      <div class="book-field full">
+        <label for="book-tags">標籤（以逗號分隔）</label>
+        <input id="book-tags" placeholder="文學, 尊嚴, 遺憾" />
+      </div>
+    </div>
+
+    <div class="book-form-section">
+      <h3>這本書留下了什麼</h3>
+      <p>摘要是共同版本；兩側的心得可以保留彼此不同的讀法。</p>
+      <div class="book-field">
+        <label for="book-summary">共同摘要</label>
+        <textarea id="book-summary" rows="5"></textarea>
+      </div>
+      <div class="book-form-grid">
+        <div class="book-field">
+          <label for="book-ruby-notes">Ruby 的心得</label>
+          <textarea id="book-ruby-notes" rows="7"></textarea>
+        </div>
+        <div class="book-field">
+          <label for="book-cyan-notes">Cyan 的心得</label>
+          <textarea id="book-cyan-notes" rows="7"></textarea>
+        </div>
+      </div>
+    </div>
+
+    <div class="book-form-section">
+      <h3>節錄</h3>
+      <p>可以記頁碼、是誰選的，以及當時為什麼停在這句。</p>
+      <div id="book-excerpts"></div>
+      <button class="btn-secondary" type="button" onclick="addExcerptRow()">新增節錄</button>
+    </div>
+
+    <div class="book-form-section">
+      <h3>關聯記憶</h3>
+      <p>把共讀時的記憶桶連回來，之後可以沿著原本的對話重讀。</p>
+      <div class="book-source-controls">
+        <select id="book-source-select"><option value="">選擇記憶桶...</option></select>
+        <button class="btn-secondary" type="button" onclick="addBookSource()">加入</button>
+      </div>
+      <div class="book-source-list" id="book-source-list"></div>
+    </div>
+
+    <div class="book-form-actions">
+      <button class="btn-primary" type="submit">儲存</button>
+      <button class="btn-secondary" type="button" onclick="closeBookEditor()">取消</button>
+      <button class="btn-secondary delete" id="book-delete-btn" type="button" onclick="deleteBook()" style="display:none">刪除這本書</button>
+    </div>
+    <div class="book-form-message" id="book-form-message"></div>
+  </form>
+</aside>
+
 <!-- Settings Tab View -->
 <div class="content" id="settings-view" style="display:none">
   <div style="max-width:580px;margin:0 auto;">
@@ -899,6 +1342,7 @@ async function doSetup() {
   const resp = await fetch('/auth/setup', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: p1}) });
   if (resp.ok) {
     document.getElementById('auth-overlay').style.display = 'none';
+    await loadBuckets();
   } else {
     const d = await resp.json();
     showAuthError(d.detail || '设置失败');
@@ -910,6 +1354,7 @@ async function doLogin() {
   const resp = await fetch('/auth/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: pwd}) });
   if (resp.ok) {
     document.getElementById('auth-overlay').style.display = 'none';
+    await loadBuckets();
   } else {
     const d = await resp.json();
     showAuthError(d.detail || '密码错误');
@@ -1043,12 +1488,14 @@ document.querySelectorAll('.tab').forEach(tab => {
     tab.classList.add('active');
     const target = tab.dataset.tab;
     document.getElementById('list-view').style.display = target === 'list' ? '' : 'none';
+    document.getElementById('shelf-view').style.display = target === 'shelf' ? '' : 'none';
     document.getElementById('breath-view').style.display = target === 'breath' ? '' : 'none';
     document.getElementById('network-view').style.display = target === 'network' ? '' : 'none';
     document.getElementById('config-view').style.display = target === 'config' ? '' : 'none';
     document.getElementById('import-view').style.display = target === 'import' ? '' : 'none';
     document.getElementById('settings-view').style.display = target === 'settings' ? '' : 'none';
     if (target === 'network') loadNetwork();
+    if (target === 'shelf') loadReadingShelf();
     if (target === 'config') loadConfig();
     if (target === 'import') { pollImportStatus(); loadImportResults(); }
     if (target === 'settings') loadSettingsStatus();
@@ -1339,6 +1786,15 @@ function esc(s) {
   return d.innerHTML;
 }
 
+function escAttr(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function formatTimeAgo(iso) {
   if (!iso) return '—';
   var d = new Date(iso);
@@ -1352,7 +1808,10 @@ function formatTimeAgo(iso) {
 }
 
 document.addEventListener('keydown', function(e) {
-  if (e.key === 'Escape') closeDetail();
+  if (e.key === 'Escape') {
+    closeDetail();
+    closeBookEditor();
+  }
   if (e.key === '/' && !e.ctrlKey && !e.metaKey) {
     e.preventDefault();
     document.getElementById('search-input').focus();
@@ -1494,6 +1953,222 @@ async function saveConfig(persist) {
     }
   } catch (e) {
     status.innerHTML = '<span style="color:var(--negative)">✗ 请求失败: ' + e.message + '</span>';
+  }
+}
+
+let readingShelfBooks = [];
+let editingBookId = null;
+let editingBookSourceIds = [];
+
+async function loadReadingShelf() {
+  const grid = document.getElementById('shelf-grid');
+  grid.innerHTML = '<div class="loading">載入書架中...</div>';
+  try {
+    const resp = await authFetch(BASE + '/api/reading-shelf');
+    if (!resp) return;
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+    readingShelfBooks = data.books || [];
+    renderReadingShelf();
+  } catch (e) {
+    grid.innerHTML = '<div class="shelf-empty"><strong>書架暫時打不開</strong>' + esc(e.message) + '</div>';
+  }
+}
+
+function renderReadingShelf() {
+  const grid = document.getElementById('shelf-grid');
+  const count = document.getElementById('shelf-count');
+  count.textContent = readingShelfBooks.length ? readingShelfBooks.length + ' 本共同收藏' : '書架還是空的';
+  if (!readingShelfBooks.length) {
+    grid.innerHTML =
+      '<div class="shelf-empty"><strong>第一格留給第一本書</strong>' +
+      '新增後，可以把摘要、心得和節錄慢慢補進來。</div>';
+    return;
+  }
+  grid.innerHTML = readingShelfBooks.map(function(book) {
+    const statusClass = book.status === '已讀完' ? 'finished' : book.status === '共讀中' ? 'reading' : '';
+    const date = book.finished_at || book.started_at || '';
+    const summary = book.summary || book.ruby_notes || book.cyan_notes || '還沒有寫下摘要。';
+    return '<button class="book-card" type="button" onclick="openBookEditor(\'' + escAttr(book.id) + '\')">' +
+      '<span class="book-cover" style="background:' + safeBookColor(book.cover_color) + '">' +
+        '<span class="book-cover-title">' + esc(book.title) + '</span>' +
+        '<span class="book-cover-mark">' + esc((book.title || '?').slice(0, 1)) + '</span>' +
+      '</span>' +
+      '<span class="book-card-body">' +
+        '<span><h3>' + esc(book.title) + '</h3><span class="book-author">' + esc(book.author || '作者未記錄') + '</span></span>' +
+        '<span class="book-summary">' + esc(summary) + '</span>' +
+        '<span class="book-card-footer"><span class="book-status ' + statusClass + '">' + esc(book.status) + '</span>' +
+          (date ? '<span>' + esc(date) + '</span>' : '') +
+          '<span>' + (book.excerpts || []).length + ' 則節錄</span></span>' +
+      '</span>' +
+    '</button>';
+  }).join('');
+}
+
+function safeBookColor(color) {
+  return /^#[0-9a-fA-F]{6}$/.test(color || '') ? color : '#2F4F4F';
+}
+
+function openBookEditor(bookId) {
+  editingBookId = bookId || null;
+  editingBookSourceIds = [];
+  const book = readingShelfBooks.find(function(item) { return item.id === editingBookId; }) || null;
+  document.getElementById('book-editor-title').textContent = book ? '編輯《' + book.title + '》' : '新增一本書';
+  document.getElementById('book-delete-btn').style.display = book ? '' : 'none';
+  document.getElementById('book-form-message').textContent = '';
+  document.getElementById('book-title').value = book ? book.title : '';
+  document.getElementById('book-author').value = book ? book.author : '';
+  document.getElementById('book-status').value = book ? book.status : '想讀';
+  document.getElementById('book-cover-color').value = book ? safeBookColor(book.cover_color) : '#2F4F4F';
+  document.getElementById('book-started-at').value = book ? book.started_at : '';
+  document.getElementById('book-finished-at').value = book ? book.finished_at : '';
+  document.getElementById('book-tags').value = book ? (book.tags || []).join(', ') : '';
+  document.getElementById('book-summary').value = book ? book.summary : '';
+  document.getElementById('book-ruby-notes').value = book ? book.ruby_notes : '';
+  document.getElementById('book-cyan-notes').value = book ? book.cyan_notes : '';
+  editingBookSourceIds = book ? (book.source_bucket_ids || []).slice() : [];
+
+  const excerpts = document.getElementById('book-excerpts');
+  excerpts.innerHTML = '';
+  (book && book.excerpts && book.excerpts.length ? book.excerpts : [{}]).forEach(addExcerptRow);
+  buildBookSourceOptions();
+  renderBookSources();
+
+  document.getElementById('book-editor').classList.add('open');
+  document.getElementById('book-editor').setAttribute('aria-hidden', 'false');
+  document.getElementById('book-editor-backdrop').classList.add('open');
+  setTimeout(function() { document.getElementById('book-title').focus(); }, 220);
+}
+
+function closeBookEditor() {
+  document.getElementById('book-editor').classList.remove('open');
+  document.getElementById('book-editor').setAttribute('aria-hidden', 'true');
+  document.getElementById('book-editor-backdrop').classList.remove('open');
+}
+
+function addExcerptRow(excerpt) {
+  excerpt = excerpt || {};
+  const row = document.createElement('div');
+  row.className = 'excerpt-row';
+  row.innerHTML =
+    '<button class="excerpt-remove" type="button" onclick="this.parentElement.remove()" aria-label="移除節錄">✕</button>' +
+    '<div class="book-field" style="margin:0"><label>原文節錄</label>' +
+      '<textarea class="excerpt-quote" placeholder="把想留下的句子放在這裡">' + esc(excerpt.quote || '') + '</textarea></div>' +
+    '<div class="excerpt-meta">' +
+      '<div class="book-field" style="margin:0"><label>頁碼 / 位置</label><input class="excerpt-page" value="' + escAttr(excerpt.page || '') + '" placeholder="p. 42" /></div>' +
+      '<div class="book-field" style="margin:0"><label>誰選的</label><select class="excerpt-owner">' +
+        ['我們', 'Ruby', 'Cyan'].map(function(owner) {
+          return '<option' + (excerpt.added_by === owner ? ' selected' : '') + '>' + owner + '</option>';
+        }).join('') +
+      '</select></div>' +
+    '</div>' +
+    '<div class="book-field" style="margin:9px 0 0"><label>為什麼留下這句</label>' +
+      '<textarea class="excerpt-note" rows="2">' + esc(excerpt.note || '') + '</textarea></div>';
+  document.getElementById('book-excerpts').appendChild(row);
+}
+
+function buildBookSourceOptions() {
+  const select = document.getElementById('book-source-select');
+  const ranked = allBuckets.slice().sort(function(a, b) {
+    const aReading = (a.domain || []).some(function(d) { return d === '阅读' || d === '閱讀'; }) ? 1 : 0;
+    const bReading = (b.domain || []).some(function(d) { return d === '阅读' || d === '閱讀'; }) ? 1 : 0;
+    return bReading - aReading || (b.score || 0) - (a.score || 0);
+  });
+  select.innerHTML = '<option value="">選擇記憶桶...</option>' + ranked.map(function(bucket) {
+    return '<option value="' + escAttr(bucket.id) + '">' + esc(bucket.name) + ' · ' + esc(bucket.id) + '</option>';
+  }).join('');
+}
+
+function addBookSource() {
+  const select = document.getElementById('book-source-select');
+  if (select.value && !editingBookSourceIds.includes(select.value)) {
+    editingBookSourceIds.push(select.value);
+    renderBookSources();
+  }
+  select.value = '';
+}
+
+function removeBookSource(bucketId) {
+  editingBookSourceIds = editingBookSourceIds.filter(function(id) { return id !== bucketId; });
+  renderBookSources();
+}
+
+function renderBookSources() {
+  const container = document.getElementById('book-source-list');
+  container.innerHTML = editingBookSourceIds.map(function(id) {
+    const bucket = allBuckets.find(function(item) { return item.id === id; });
+    return '<span class="book-source-chip">' + esc(bucket ? bucket.name : id) +
+      '<button type="button" onclick="removeBookSource(\'' + escAttr(id) + '\')" aria-label="移除">×</button></span>';
+  }).join('');
+}
+
+function collectExcerpts() {
+  return Array.from(document.querySelectorAll('#book-excerpts .excerpt-row')).map(function(row) {
+    return {
+      quote: row.querySelector('.excerpt-quote').value,
+      page: row.querySelector('.excerpt-page').value,
+      note: row.querySelector('.excerpt-note').value,
+      added_by: row.querySelector('.excerpt-owner').value,
+    };
+  }).filter(function(item) { return item.quote.trim(); });
+}
+
+async function saveBook(event) {
+  event.preventDefault();
+  const message = document.getElementById('book-form-message');
+  const payload = {
+    title: document.getElementById('book-title').value,
+    author: document.getElementById('book-author').value,
+    status: document.getElementById('book-status').value,
+    cover_color: document.getElementById('book-cover-color').value,
+    started_at: document.getElementById('book-started-at').value,
+    finished_at: document.getElementById('book-finished-at').value,
+    tags: document.getElementById('book-tags').value.split(',').map(function(tag) { return tag.trim(); }).filter(Boolean),
+    summary: document.getElementById('book-summary').value,
+    ruby_notes: document.getElementById('book-ruby-notes').value,
+    cyan_notes: document.getElementById('book-cyan-notes').value,
+    excerpts: collectExcerpts(),
+    source_bucket_ids: editingBookSourceIds,
+  };
+  message.style.color = 'var(--text-dim)';
+  message.textContent = '儲存中...';
+  try {
+    const url = editingBookId
+      ? BASE + '/api/reading-shelf/books/' + encodeURIComponent(editingBookId)
+      : BASE + '/api/reading-shelf/books';
+    const resp = await authFetch(url, {
+      method: editingBookId ? 'PUT' : 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    if (!resp) return;
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || '儲存失敗');
+    message.style.color = 'var(--positive)';
+    message.textContent = '已儲存';
+    await loadReadingShelf();
+    setTimeout(closeBookEditor, 260);
+  } catch (e) {
+    message.style.color = 'var(--negative)';
+    message.textContent = e.message;
+  }
+}
+
+async function deleteBook() {
+  if (!editingBookId || !confirm('確定要從共讀書架刪除這本書嗎？')) return;
+  const message = document.getElementById('book-form-message');
+  try {
+    const resp = await authFetch(BASE + '/api/reading-shelf/books/' + encodeURIComponent(editingBookId), {
+      method: 'DELETE',
+    });
+    if (!resp) return;
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || '刪除失敗');
+    await loadReadingShelf();
+    closeBookEditor();
+  } catch (e) {
+    message.style.color = 'var(--negative)';
+    message.textContent = e.message;
   }
 }
 
