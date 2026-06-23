@@ -62,6 +62,8 @@ class EmbeddingEngine:
         """Create embeddings table if not exists."""
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         conn = sqlite3.connect(self.db_path)
+        # WAL 模式：大幅降低並發存取時 "database is locked" 機率（檔案層級設定，持久生效）
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS embeddings (
                 bucket_id TEXT PRIMARY KEY,

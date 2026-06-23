@@ -59,6 +59,7 @@ from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from reading_shelf import ReadingShelfStore
+from letters import LetterStore
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -106,6 +107,7 @@ dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 reading_shelf = ReadingShelfStore(config["buckets_dir"])
+letter_store = LetterStore(config["buckets_dir"])
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -341,6 +343,20 @@ async def breath_hook(request):
 
         parts = []
         token_budget = 10000
+        # 💌 各方最新一封信（永久保存的交接信，醒來先讀，續上而非冷啟動）
+        try:
+            _latest = letter_store.latest_per_author()
+            for _who in ("Ruby", "Cyan"):
+                _lt = _latest.get(_who)
+                if not _lt:
+                    continue
+                _snip = _lt.get("content", "")
+                if len(_snip) > 4000:
+                    _snip = _snip[:4000] + "…（完整請用 letter read）"
+                parts.append(f"💌 [{_who} 的最新一封信｜{_lt.get('letter_date', '')}] {_snip}")
+                token_budget -= count_tokens_approx(_snip)
+        except Exception as _e:
+            logger.warning(f"letter surface failed: {_e}")
         for b in pinned:
             summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
             parts.append(f"📌 [核心准则] {summary}")
@@ -1420,6 +1436,59 @@ async def shelf(
     except Exception as exc:
         logger.exception("Reading shelf tool failed")
         return f"共讀書架操作失敗: {exc}"
+
+
+@mcp.tool()
+async def letter(
+    action: str = "read",
+    author: str = "",
+    content: str = "",
+    title: str = "",
+    query: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    letter_date: str = "",
+    tags: str = "",
+    limit: int = 10,
+) -> str:
+    """交接信／互信工具（永久保存，永不衰減、不合併、不可刪）。action=write/read/list。write 需 author（Ruby 或 Cyan）與 content（原文逐字保留）；read/list 回傳信件，可用 query 關鍵字、author、date_from/date_to（YYYY-MM-DD）、limit 篩選。各方最新一封會自動在開場浮現。"""
+    action = (action or "read").strip().lower()
+    valid_actions = {"write", "read", "list"}
+    if action not in valid_actions:
+        return f"不支援的 action: {action}。可用: {', '.join(sorted(valid_actions))}"
+    try:
+        if action == "write":
+            if not author.strip() or not content.strip():
+                return "write 需要 author（Ruby 或 Cyan）與 content。"
+            letter_obj = letter_store.write_letter({
+                "author": author,
+                "content": content,
+                "title": title,
+                "letter_date": letter_date,
+                "tags": tags,
+            })
+            return _json_lib.dumps(
+                {
+                    "ok": True,
+                    "id": letter_obj["id"],
+                    "author": letter_obj["author"],
+                    "letter_date": letter_obj["letter_date"],
+                },
+                ensure_ascii=False,
+            )
+        letters = letter_store.read_letters(
+            query=query if action == "read" else "",
+            author=author,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+        )
+        return _json_lib.dumps({"count": len(letters), "letters": letters}, ensure_ascii=False, indent=2)
+    except ValueError as exc:
+        return f"信件資料不合法: {exc}"
+    except Exception as exc:
+        logger.exception("Letter tool failed")
+        return f"信件操作失敗: {exc}"
 
 
 # =============================================================
