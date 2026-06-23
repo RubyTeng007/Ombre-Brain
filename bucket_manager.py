@@ -304,6 +304,13 @@ class BucketManager:
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
             self._move_bucket(file_path, self.permanent_dir, domain)
+        elif "pinned" in kwargs and not kwargs["pinned"] and post.get("type") == "permanent" and not post.get("protected"):
+            # --- Reverse: unpin → demote permanent back to dynamic/ ---
+            # --- 反向：取消钉选 → 从 permanent/ 降回 dynamic/，让衰减引擎接手 ---
+            post["type"] = "dynamic"
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(frontmatter.dumps(post))
+            file_path = self._move_bucket(file_path, self.dynamic_dir, domain)
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
         return True
