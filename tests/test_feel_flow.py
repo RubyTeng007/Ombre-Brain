@@ -87,7 +87,7 @@ class TestFeelLifecycle:
 
     @pytest.mark.asyncio
     async def test_feel_in_feel_directory(self, isolated_tools):
-        """Feel bucket stored under feel/沉淀物/."""
+        """Feel bucket stored under feel/沉澱物/."""
         bm, dh, de, bd = isolated_tools
         import os
 
@@ -98,7 +98,7 @@ class TestFeelLifecycle:
             name=None, bucket_type="feel",
         )
 
-        feel_dir = os.path.join(bd, "feel", "沉淀物")
+        feel_dir = os.path.join(bd, "feel", "沉澱物")
         files = os.listdir(feel_dir)
         assert any(bid in f for f in files), f"Feel bucket {bid} not found in {feel_dir}"
 

@@ -1,12 +1,12 @@
 # ============================================================
 # Module: Common Utilities (utils.py)
-# 模块：通用工具函数
+# 模塊：通用工具函數
 #
 # Provides config loading, logging init, path safety, ID generation, etc.
-# 提供配置加载、日志初始化、路径安全校验、ID 生成等基础能力
+# 提供配置加載、日誌初始化、路徑安全校驗、ID 生成等基礎能力
 #
 # Depended on by: server.py, bucket_manager.py, dehydrator.py, decay_engine.py
-# 被谁依赖：server.py, bucket_manager.py, dehydrator.py, decay_engine.py
+# 被誰依賴：server.py, bucket_manager.py, dehydrator.py, decay_engine.py
 # ============================================================
 
 import os
@@ -21,13 +21,13 @@ from datetime import datetime
 def load_config(config_path: str = None) -> dict:
     """
     Load configuration file.
-    加载配置文件。
+    加載配置文件。
 
     Priority: environment variables > config.yaml > built-in defaults.
-    优先级：环境变量 > config.yaml > 内置默认值。
+    優先級：環境變量 > config.yaml > 內置默認值。
     """
     # --- Built-in defaults (fallback so it runs even without config.yaml) ---
-    # --- 内置默认配置（兜底，保证即使没有 config.yaml 也能跑）---
+    # --- 內置默認配置（兜底，保證即使沒有 config.yaml 也能跑）---
     defaults = {
         "transport": "stdio",
         "log_level": "INFO",
@@ -56,7 +56,7 @@ def load_config(config_path: str = None) -> dict:
     }
 
     # --- Load user config from YAML file ---
-    # --- 从 YAML 文件加载用户自定义配置 ---
+    # --- 從 YAML 文件加載用戶自定義配置 ---
     if config_path is None:
         config_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "config.yaml"
@@ -72,16 +72,16 @@ def load_config(config_path: str = None) -> dict:
             else:
                 logging.warning(
                     f"Config file is not a valid YAML dict, using defaults / "
-                    f"配置文件不是有效的 YAML 字典，使用默认配置: {config_path}"
+                    f"配置文件不是有效的 YAML 字典，使用默認配置: {config_path}"
                 )
         except yaml.YAMLError as e:
             logging.warning(
                 f"Failed to parse config file, using defaults / "
-                f"配置文件解析失败，使用默认配置: {e}"
+                f"配置文件解析失敗，使用默認配置: {e}"
             )
 
     # --- Environment variable overrides (highest priority) ---
-    # --- 环境变量覆盖敏感/运行时配置（优先级最高）---
+    # --- 環境變量覆蓋敏感/運行時配置（優先級最高）---
     env_api_key = os.environ.get("OMBRE_API_KEY", "")
     if env_api_key:
         config.setdefault("dehydration", {})["api_key"] = env_api_key
@@ -118,8 +118,22 @@ def load_config(config_path: str = None) -> dict:
     if env_embed_base_url:
         config.setdefault("embedding", {})["base_url"] = env_embed_base_url
 
+    # OMBRE_EMBEDDING_API_KEY lets embeddings use a separate Gemini key.
+    # If omitted, embedding_engine falls back to dehydration.api_key for
+    # backward compatibility.
+    env_embed_api_key = os.environ.get("OMBRE_EMBEDDING_API_KEY", "")
+    if env_embed_api_key:
+        config.setdefault("embedding", {})["api_key"] = env_embed_api_key
+
+    env_deepseek_low_balance = os.environ.get("OMBRE_DEEPSEEK_LOW_BALANCE_USD", "")
+    if env_deepseek_low_balance:
+        try:
+            config.setdefault("api_usage_guard", {})["deepseek_low_balance_usd"] = float(env_deepseek_low_balance)
+        except ValueError:
+            logging.warning("OMBRE_DEEPSEEK_LOW_BALANCE_USD is not a valid number; ignored")
+
     # --- Ensure bucket storage directories exist ---
-    # --- 确保记忆桶存储目录存在 ---
+    # --- 確保記憶桶存儲目錄存在 ---
     buckets_dir = config["buckets_dir"]
     for subdir in ["permanent", "dynamic", "archive"]:
         os.makedirs(os.path.join(buckets_dir, subdir), exist_ok=True)
@@ -130,7 +144,7 @@ def load_config(config_path: str = None) -> dict:
 def _deep_merge(base: dict, override: dict) -> dict:
     """
     Deep-merge two dicts; override values take precedence.
-    深度合并两个字典，override 的值覆盖 base。
+    深度合併兩個字典，override 的值覆蓋 base。
     """
     result = base.copy()
     for key, value in override.items():
@@ -144,11 +158,11 @@ def _deep_merge(base: dict, override: dict) -> dict:
 def setup_logging(level: str = "INFO") -> None:
     """
     Initialize logging system.
-    初始化日志系统。
+    初始化日誌系統。
 
     Note: In MCP stdio mode, stdout is occupied by the protocol;
     logs must go to stderr.
-    注意：MCP stdio 模式下 stdout 被协议占用，日志只能走 stderr。
+    注意：MCP stdio 模式下 stdout 被協議佔用，日誌只能走 stderr。
     """
     log_level = getattr(logging, level.upper(), None)
     if not isinstance(log_level, int):
@@ -165,7 +179,7 @@ def setup_logging(level: str = "INFO") -> None:
 def generate_bucket_id() -> str:
     """
     Generate a unique bucket ID (12-char short UUID for readability).
-    生成唯一的记忆桶 ID（12 位短 UUID，方便人类阅读）。
+    生成唯一的記憶桶 ID（12 位短 UUID，方便人類閱讀）。
     """
     return uuid.uuid4().hex[:12]
 
@@ -173,7 +187,7 @@ def generate_bucket_id() -> str:
 def strip_wikilinks(text: str) -> str:
     """
     Remove Obsidian wikilink brackets: [[word]] → word
-    去除 Obsidian 双链括号
+    去除 Obsidian 雙鏈括號
     """
     return re.sub(r"\[\[([^\]]+)\]\]", r"\1", text) if text else text
 
@@ -182,7 +196,7 @@ def sanitize_name(name: str) -> str:
     """
     Sanitize bucket name, keeping only safe characters.
     Prevents path traversal attacks (e.g. ../../etc/passwd).
-    清洗桶名称，只保留安全字符。防止路径遍历攻击。
+    清洗桶名稱，只保留安全字符。防止路徑遍歷攻擊。
     """
     if not isinstance(name, str):
         return "unnamed"
@@ -195,14 +209,14 @@ def safe_path(base_dir: str, filename: str) -> Path:
     """
     Construct a safe file path, ensuring it stays within base_dir.
     Prevents directory traversal.
-    构造安全的文件路径，确保最终路径始终在 base_dir 内部。
+    構造安全的文件路徑，確保最終路徑始終在 base_dir 內部。
     """
     base = Path(base_dir).resolve()
     target = (base / filename).resolve()
     if not str(target).startswith(str(base)):
         raise ValueError(
-            f"Path safety check failed / 路径安全检查失败: "
-            f"{target} is not inside / 不在 {base} 内"
+            f"Path safety check failed / 路徑安全檢查失敗: "
+            f"{target} is not inside / 不在 {base} 內"
         )
     return target
 
@@ -210,12 +224,12 @@ def safe_path(base_dir: str, filename: str) -> Path:
 def count_tokens_approx(text: str) -> int:
     """
     Rough token count estimate.
-    粗略估算 token 数。
+    粗略估算 token 數。
 
     Chinese ≈ 1 char = 1.5 tokens, English ≈ 1 word = 1.3 tokens.
     Used to decide whether dehydration is needed; precision not required.
-    中文 ≈ 1字=1.5token，英文 ≈ 1词=1.3token。
-    用于判断是否需要脱水压缩，不追求精确。
+    中文 ≈ 1字=1.5token，英文 ≈ 1詞=1.3token。
+    用於判斷是否需要脫水壓縮，不追求精確。
     """
     if not text:
         return 0
@@ -227,6 +241,6 @@ def count_tokens_approx(text: str) -> int:
 def now_iso() -> str:
     """
     Return current time as ISO format string.
-    返回当前时间的 ISO 格式字符串。
+    返回當前時間的 ISO 格式字符串。
     """
     return datetime.now().isoformat(timespec="seconds")

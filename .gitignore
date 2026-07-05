@@ -19,3 +19,7 @@ data/
 tests/integration/
 tests/regression/
 tests/unit/
+*.bak-*
+*.save
+*.save.*
+config.yaml

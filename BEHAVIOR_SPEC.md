@@ -23,7 +23,7 @@
 
 | 模块 | 核心职责 |
 |------|---------|
-| `server.py` | 注册 MCP 工具（`breath/hold/grow/trace/pulse/dream/shelf`）；路由 Dashboard HTTP 请求；`_merge_or_create()` 合并逻辑中枢 |
+| `server.py` | 注册 MCP 工具（`breath/hold/grow/trace/pulse/dream`）；路由 Dashboard HTTP 请求；`_merge_or_create()` 合并逻辑中枢 |
 | `bucket_manager.py` | 桶 CRUD；多维搜索（fuzzy + embedding 双通道）；`touch()` 激活刷新；`_time_ripple()` 时间波纹 |
 | `dehydrator.py` | `analyze()` 自动打标；`merge()` 内容融合；`digest()` 日记拆分；`dehydrate()` 内容压缩 |
 | `embedding_engine.py` | `generate_and_store()` 生成向量并存 SQLite；`search_similar()` 余弦相似度检索 |

@@ -308,7 +308,7 @@ breath(query="今天很累")
     返回 ≤20 条结果
 ```
 
-7 个 MCP 工具 / 7 MCP tools:
+6 个 MCP 工具 / 6 MCP tools:
 
 | 工具 Tool | 作用 Purpose |
 |-----------|-------------|
@@ -318,7 +318,6 @@ breath(query="今天很累")
 | `trace` | 修改元数据、标记已解决、删除 / Modify metadata, mark resolved, delete |
 | `pulse` | 系统状态 + 所有记忆桶列表 / System status + bucket listing |
 | `dream` | 对话开头自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve / Self-reflection at conversation start |
-| `shelf` | 读取、搜索、新增、修改、加节录或删除共读書架内容；网页与聊天端共用同一份资料 / Read, search, create, update, add excerpts, or delete shared-reading shelf entries |
 
 ## 安装 / Setup
 

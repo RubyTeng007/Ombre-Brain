@@ -72,6 +72,13 @@ embedding:
   # base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
   # api_key: ""                  
 
+# --- API usage guard / API 额度护栏 ---
+# DeepSeek has a balance endpoint; Gemini free-tier quota is checked by a
+# tiny embedding probe because there is no simple balance number.
+api_usage_guard:
+  deepseek_low_balance_usd: 1.0   # Warn when DeepSeek balance falls below this
+  cache_ttl_seconds: 900          # Avoid checking provider APIs on every call
+
 # --- Scoring weights / 检索权重参数 ---
 # total = topic(×4) + emotion(×2) + time(×1.5) + importance(×1)
 scoring_weights:

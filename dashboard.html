@@ -941,25 +941,25 @@
   <h1>◐ Ombre Brain</h1>
   <span class="stats" id="stats">loading...</span>
   <div class="search-bar">
-    <input type="text" id="search-input" placeholder="搜索记忆…" />
+    <input type="text" id="search-input" placeholder="搜索記憶…" />
   </div>
-  <button onclick="doLogout()" title="退出登录" style="margin-left:12px;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:20px;padding:6px 14px;font-size:12px;cursor:pointer;">退出</button>
+  <button onclick="doLogout()" title="退出登錄" style="margin-left:12px;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:20px;padding:6px 14px;font-size:12px;cursor:pointer;">退出</button>
 </div>
 
 <div class="tabs">
-  <div class="tab active" data-tab="list">记忆桶</div>
+  <div class="tab active" data-tab="list">記憶桶</div>
   <div class="tab" data-tab="shelf">共讀書架</div>
-  <div class="tab" data-tab="breath">Breath 模拟</div>
-  <div class="tab" data-tab="network">记忆网络</div>
+  <div class="tab" data-tab="breath">Breath 模擬</div>
+  <div class="tab" data-tab="network">記憶網絡</div>
   <div class="tab" data-tab="config">配置</div>
-  <div class="tab" data-tab="import">导入</div>
-  <div class="tab" data-tab="settings">设置</div>
+  <div class="tab" data-tab="import">導入</div>
+  <div class="tab" data-tab="settings">設置</div>
 </div>
 
 <div class="content" id="list-view">
   <div class="filters" id="filters"></div>
   <div class="bucket-list" id="bucket-list">
-    <div class="loading">加载中…</div>
+    <div class="loading">加載中…</div>
   </div>
 </div>
 
@@ -980,30 +980,30 @@
 
 <div class="content" id="breath-view" style="display:none">
   <div class="breath-flow" id="breath-flow">
-    <div class="flow-step" id="fs-input">① 输入<br><small>query / valence / arousal</small></div>
+    <div class="flow-step" id="fs-input">① 輸入<br><small>query / valence / arousal</small></div>
     <span class="flow-arrow">→</span>
-    <div class="flow-step" id="fs-candidates">② 候选池<br><small id="fs-cand-n">— 桶</small></div>
+    <div class="flow-step" id="fs-candidates">② 候選池<br><small id="fs-cand-n">— 桶</small></div>
     <span class="flow-arrow">→</span>
-    <div class="flow-step" id="fs-scoring">③ 四维评分<br><small>topic×4 + emotion×2 + time×2.5 + imp×1</small></div>
+    <div class="flow-step" id="fs-scoring">③ 四維評分<br><small>topic×4 + emotion×2 + time×2.5 + imp×1</small></div>
     <span class="flow-arrow">→</span>
-    <div class="flow-step" id="fs-threshold">④ 阈值过滤<br><small id="fs-thresh-n">≥50 → — 通过</small></div>
+    <div class="flow-step" id="fs-threshold">④ 閾值過濾<br><small id="fs-thresh-n">≥50 → — 通過</small></div>
     <span class="flow-arrow">→</span>
     <div class="flow-step" id="fs-sort">⑤ 降序排列<br><small>返回 top N</small></div>
   </div>
 
   <div class="breath-controls">
     <label>Query</label>
-    <input type="text" id="breath-query" placeholder="关键词…" style="width:220px" />
+    <input type="text" id="breath-query" placeholder="關鍵詞…" style="width:220px" />
     <label>Valence</label>
     <input type="number" id="breath-valence" placeholder="0~1" min="0" max="1" step="0.1" style="width:80px" />
     <label>Arousal</label>
     <input type="number" id="breath-arousal" placeholder="0~1" min="0" max="1" step="0.1" style="width:80px" />
-    <button onclick="runBreathDebug()">模拟 Breath</button>
+    <button onclick="runBreathDebug()">模擬 Breath</button>
   </div>
 
   <div class="breath-info" id="breath-info" style="display:none"></div>
   <div id="breath-results">
-    <div class="loading">输入 query 后点击「模拟 Breath」查看评分链路</div>
+    <div class="loading">輸入 query 後點擊「模擬 Breath」查看評分鏈路</div>
   </div>
 </div>
 
@@ -1019,49 +1019,49 @@
 
 <div class="content" id="import-view" style="display:none">
   <div style="max-width:720px;margin:0 auto;">
-    <h3>历史对话导入</h3>
-    <p style="color:var(--text-dim);font-size:13px;">支持 Claude JSON、ChatGPT 导出、DeepSeek、Markdown、纯文本格式</p>
+    <h3>歷史對話導入</h3>
+    <p style="color:var(--text-dim);font-size:13px;">支持 Claude JSON、ChatGPT 導出、DeepSeek、Markdown、純文本格式</p>
 
     <div id="import-upload-zone" style="border:2px dashed var(--border);border-radius:16px;padding:40px;text-align:center;cursor:pointer;margin:20px 0;transition:border-color .2s;">
       <div style="font-size:32px;margin-bottom:8px;">📁</div>
-      <div>拖拽文件到此处，或 <span style="color:var(--accent);text-decoration:underline;">点击选择</span></div>
+      <div>拖拽文件到此處，或 <span style="color:var(--accent);text-decoration:underline;">點擊選擇</span></div>
       <input type="file" id="import-file-input" accept=".json,.txt,.md,.jsonl" style="display:none" />
     </div>
 
     <div style="margin:12px 0;">
-      <label><input type="checkbox" id="import-preserve-raw" /> 保留原文模式（特殊情境/暗号/仪式性内容不摘要）</label>
+      <label><input type="checkbox" id="import-preserve-raw" /> 保留原文模式（特殊情境/暗號/儀式性內容不摘要）</label>
     </div>
 
     <div id="import-progress" style="display:none;margin:20px 0;">
       <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
-        <span id="import-status-text">准备中…</span>
+        <span id="import-status-text">準備中…</span>
         <span id="import-progress-text">0/0</span>
       </div>
       <div style="background:var(--surface);border-radius:8px;height:12px;overflow:hidden;">
         <div id="import-progress-bar" style="height:100%;background:var(--accent);border-radius:8px;transition:width .3s;width:0%;"></div>
       </div>
       <div style="display:flex;gap:16px;margin-top:8px;font-size:13px;color:var(--text-dim);">
-        <span>API调用: <b id="import-api-calls">0</b></span>
+        <span>API調用: <b id="import-api-calls">0</b></span>
         <span>新建: <b id="import-created">0</b></span>
-        <span>合并: <b id="import-merged">0</b></span>
+        <span>合併: <b id="import-merged">0</b></span>
         <span>原文: <b id="import-raw">0</b></span>
       </div>
       <div style="margin-top:12px;">
-        <button id="import-pause-btn" onclick="pauseImport()" style="display:none;">⏸ 暂停</button>
+        <button id="import-pause-btn" onclick="pauseImport()" style="display:none;">⏸ 暫停</button>
       </div>
     </div>
 
     <div id="import-errors" style="display:none;margin:12px 0;padding:12px;background:var(--surface);border-radius:8px;font-size:12px;color:var(--negative);max-height:120px;overflow-y:auto;"></div>
 
     <div id="import-results-section" style="margin:20px 0;">
-      <h3>已导入记忆 <button onclick="loadImportResults()" style="font-size:12px;padding:2px 10px;">刷新</button></h3>
+      <h3>已導入記憶 <button onclick="loadImportResults()" style="font-size:12px;padding:2px 10px;">刷新</button></h3>
       <div id="import-results-list" style="max-height:500px;overflow-y:auto;"></div>
     </div>
 
     <hr style="border-color:var(--border);margin:24px 0;" />
 
-    <h3>高频模式检测</h3>
-    <button onclick="detectPatterns()">🔍 检测高频模式</button>
+    <h3>高頻模式檢測</h3>
+    <button onclick="detectPatterns()">🔍 檢測高頻模式</button>
     <div id="import-patterns" style="margin-top:16px;"></div>
   </div>
 </div>
@@ -1069,7 +1069,7 @@
 <div class="content" id="config-view" style="display:none">
   <div style="max-width:640px;margin:0 auto;">
     <div class="config-section">
-      <h3>脱水 / 打标 API</h3>
+      <h3>脫水 / 打標 API</h3>
       <div class="config-row">
         <label>Model</label>
         <input type="text" id="cfg-dehy-model" placeholder="gemini-2.5-flash-lite" />
@@ -1080,9 +1080,9 @@
       </div>
       <div class="config-row">
         <label>API Key</label>
-        <input type="password" id="cfg-dehy-key" placeholder="当前: 加载中…" />
+        <input type="password" id="cfg-dehy-key" placeholder="當前: 加載中…" />
       </div>
-      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">留空不改。不会持久化到 yaml（请用环境变量）</div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">留空不改。不會持久化到 yaml（請用環境變量）</div>
       <div class="config-row">
         <label>Max Tokens</label>
         <input type="number" id="cfg-dehy-maxtokens" min="128" max="8192" />
@@ -1096,8 +1096,8 @@
     <div class="config-section">
       <h3>向量化 Embedding</h3>
       <div class="config-row">
-        <label>启用</label>
-        <select id="cfg-emb-enabled"><option value="true">开启</option><option value="false">关闭</option></select>
+        <label>啟用</label>
+        <select id="cfg-emb-enabled"><option value="true">開啟</option><option value="false">關閉</option></select>
       </div>
       <div class="config-row">
         <label>Model</label>
@@ -1106,23 +1106,23 @@
     </div>
 
     <div class="config-section">
-      <h3>其他参数</h3>
+      <h3>其他參數</h3>
       <div class="config-row">
-        <label>合并阈值</label>
+        <label>合併閾值</label>
         <input type="number" id="cfg-merge" min="0" max="100" />
       </div>
-      <div style="margin-top:-4px;padding-left:122px;font-size:11px;color:var(--text-light);">0-100，越高越难合并相似桶</div>
+      <div style="margin-top:-4px;padding-left:122px;font-size:11px;color:var(--text-light);">0-100，越高越難合併相似桶</div>
     </div>
 
     <div style="display:flex;gap:12px;margin-top:8px;">
-      <button class="btn-primary" onclick="saveConfig(false)">应用（仅运行时）</button>
-      <button class="btn-secondary" onclick="saveConfig(true)">应用并写入 config.yaml</button>
+      <button class="btn-primary" onclick="saveConfig(false)">應用（僅運行時）</button>
+      <button class="btn-secondary" onclick="saveConfig(true)">應用並寫入 config.yaml</button>
     </div>
     <div id="config-status" style="margin-top:16px;font-size:13px;"></div>
 
     <div class="config-section" style="margin-top:28px;">
-      <h3>系统信息</h3>
-      <div id="config-readonly" style="font-size:13px;color:var(--text-dim);line-height:1.8;">加载中…</div>
+      <h3>系統信息</h3>
+      <div id="config-readonly" style="font-size:13px;color:var(--text-dim);line-height:1.8;">加載中…</div>
     </div>
   </div>
 </div>
@@ -1228,55 +1228,55 @@
   <div style="max-width:580px;margin:0 auto;">
 
     <div class="config-section">
-      <h3>服务状态</h3>
-      <div id="settings-status" style="font-size:13px;color:var(--text-dim);line-height:2;">加载中…</div>
-      <button onclick="loadSettingsStatus()" style="margin-top:8px;font-size:12px;padding:4px 12px;">刷新状态</button>
+      <h3>服務狀態</h3>
+      <div id="settings-status" style="font-size:13px;color:var(--text-dim);line-height:2;">加載中…</div>
+      <button onclick="loadSettingsStatus()" style="margin-top:8px;font-size:12px;padding:4px 12px;">刷新狀態</button>
     </div>
 
     <div class="config-section">
-      <h3>修改密码</h3>
+      <h3>修改密碼</h3>
       <div id="settings-env-notice" style="display:none;font-size:12px;color:var(--warning);margin-bottom:10px;">
-        ⚠ 当前使用环境变量 OMBRE_DASHBOARD_PASSWORD，请直接修改环境变量。
+        ⚠ 當前使用環境變量 OMBRE_DASHBOARD_PASSWORD，請直接修改環境變量。
       </div>
       <div id="settings-pwd-form">
         <div class="config-row">
-          <label>当前密码</label>
-          <input type="password" id="settings-current-pwd" placeholder="当前密码" />
+          <label>當前密碼</label>
+          <input type="password" id="settings-current-pwd" placeholder="當前密碼" />
         </div>
         <div class="config-row">
-          <label>新密码</label>
-          <input type="password" id="settings-new-pwd" placeholder="新密码（至少6位）" />
+          <label>新密碼</label>
+          <input type="password" id="settings-new-pwd" placeholder="新密碼（至少6位）" />
         </div>
         <div class="config-row">
-          <label>确认新密码</label>
-          <input type="password" id="settings-new-pwd2" placeholder="再次输入新密码" />
+          <label>確認新密碼</label>
+          <input type="password" id="settings-new-pwd2" placeholder="再次輸入新密碼" />
         </div>
-        <button class="btn-primary" onclick="changePassword()" style="margin-top:4px;">修改密码</button>
+        <button class="btn-primary" onclick="changePassword()" style="margin-top:4px;">修改密碼</button>
         <div id="settings-pwd-msg" style="margin-top:10px;font-size:13px;"></div>
       </div>
     </div>
 
     <div class="config-section">
-      <h3>宿主机记忆桶目录 (Docker)</h3>
+      <h3>宿主機記憶桶目錄 (Docker)</h3>
       <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px;line-height:1.6;">
-        设置 docker-compose 中 <code>${OMBRE_HOST_VAULT_DIR:-./buckets}:/data</code> 的宿主机路径。
-        留空则使用项目内 <code>./buckets</code>。
-        <span style="color:var(--warning);">⚠ 修改后需在宿主机执行 <code>docker compose down && docker compose up -d</code> 才会生效。</span>
+        設置 docker-compose 中 <code>${OMBRE_HOST_VAULT_DIR:-./buckets}:/data</code> 的宿主機路徑。
+        留空則使用項目內 <code>./buckets</code>。
+        <span style="color:var(--warning);">⚠ 修改後需在宿主機執行 <code>docker compose down && docker compose up -d</code> 才會生效。</span>
       </div>
       <div class="config-row">
-        <label>路径</label>
+        <label>路徑</label>
         <input type="text" id="settings-host-vault" placeholder="例如 /Users/you/Obsidian/Ombre Brain" style="flex:1;" />
       </div>
       <div style="display:flex;gap:8px;align-items:center;margin-top:6px;">
         <button class="btn-primary" onclick="saveHostVault()">保存到 .env</button>
-        <button onclick="loadHostVault()" style="font-size:12px;padding:4px 12px;">重新加载</button>
+        <button onclick="loadHostVault()" style="font-size:12px;padding:4px 12px;">重新加載</button>
         <span id="settings-host-vault-msg" style="font-size:12px;"></span>
       </div>
     </div>
 
     <div class="config-section">
-      <h3>账号操作</h3>
-      <button onclick="doLogout()" style="color:var(--negative);border-color:var(--negative);">退出登录</button>
+      <h3>賬號操作</h3>
+      <button onclick="doLogout()" style="color:var(--negative);border-color:var(--negative);">退出登錄</button>
     </div>
 
   </div>
@@ -1286,20 +1286,20 @@
 <div id="auth-overlay" style="position:fixed;inset:0;z-index:9999;background:var(--bg-gradient);background-attachment:fixed;display:flex;align-items:center;justify-content:center;">
   <div style="background:var(--surface);backdrop-filter:blur(16px);border:1px solid var(--border);border-radius:24px;padding:48px 40px;max-width:400px;width:90%;text-align:center;box-shadow:0 8px 40px rgba(0,0,0,0.12);">
     <h2 style="font-family:'Cormorant Garamond',serif;font-size:28px;color:var(--accent);margin-bottom:8px;">◐ Ombre Brain</h2>
-    <p style="color:var(--text-dim);font-size:13px;margin-bottom:28px;" id="auth-subtitle">验证身份</p>
+    <p style="color:var(--text-dim);font-size:13px;margin-bottom:28px;" id="auth-subtitle">驗證身份</p>
 
     <!-- Setup form -->
     <div id="auth-setup-form" style="display:none;">
-      <p style="font-size:13px;color:var(--text-dim);margin-bottom:16px;">首次使用，请设置访问密码</p>
-      <input type="password" id="auth-setup-pwd" placeholder="设置密码（至少6位）" style="display:block;width:100%;padding:10px 16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);font-size:14px;margin-bottom:10px;" />
-      <input type="password" id="auth-setup-pwd2" placeholder="确认密码" style="display:block;width:100%;padding:10px 16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);font-size:14px;margin-bottom:16px;" onkeydown="if(event.key==='Enter')doSetup()" />
-      <button onclick="doSetup()" style="width:100%;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:10px;font-size:14px;cursor:pointer;">设置密码并进入</button>
+      <p style="font-size:13px;color:var(--text-dim);margin-bottom:16px;">首次使用，請設置訪問密碼</p>
+      <input type="password" id="auth-setup-pwd" placeholder="設置密碼（至少6位）" style="display:block;width:100%;padding:10px 16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);font-size:14px;margin-bottom:10px;" />
+      <input type="password" id="auth-setup-pwd2" placeholder="確認密碼" style="display:block;width:100%;padding:10px 16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);font-size:14px;margin-bottom:16px;" onkeydown="if(event.key==='Enter')doSetup()" />
+      <button onclick="doSetup()" style="width:100%;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:10px;font-size:14px;cursor:pointer;">設置密碼並進入</button>
     </div>
 
     <!-- Login form -->
     <div id="auth-login-form" style="display:none;">
-      <input type="password" id="auth-login-pwd" placeholder="输入访问密码" style="display:block;width:100%;padding:10px 16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);font-size:14px;margin-bottom:16px;" onkeydown="if(event.key==='Enter')doLogin()" />
-      <button onclick="doLogin()" style="width:100%;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:10px;font-size:14px;cursor:pointer;">登录</button>
+      <input type="password" id="auth-login-pwd" placeholder="輸入訪問密碼" style="display:block;width:100%;padding:10px 16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);font-size:14px;margin-bottom:16px;" onkeydown="if(event.key==='Enter')doLogin()" />
+      <button onclick="doLogin()" style="width:100%;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:10px;font-size:14px;cursor:pointer;">登錄</button>
     </div>
 
     <div id="auth-error" style="color:var(--negative);font-size:13px;margin-top:12px;display:none;"></div>
@@ -1308,19 +1308,19 @@
 
 <script>
 // ========================================
-// Auth system / 认证系统
+// Auth system / 認證系統
 // ========================================
 async function checkAuth() {
   try {
     const resp = await fetch('/auth/status');
     const data = await resp.json();
     if (data.setup_needed) {
-      document.getElementById('auth-subtitle').textContent = '首次设置';
+      document.getElementById('auth-subtitle').textContent = '首次設置';
       document.getElementById('auth-setup-form').style.display = 'block';
     } else if (data.authenticated) {
       document.getElementById('auth-overlay').style.display = 'none';
     } else {
-      document.getElementById('auth-subtitle').textContent = '请输入访问密码';
+      document.getElementById('auth-subtitle').textContent = '請輸入訪問密碼';
       document.getElementById('auth-login-form').style.display = 'block';
     }
   } catch {
@@ -1337,15 +1337,15 @@ function showAuthError(msg) {
 async function doSetup() {
   const p1 = document.getElementById('auth-setup-pwd').value;
   const p2 = document.getElementById('auth-setup-pwd2').value;
-  if (p1.length < 6) return showAuthError('密码至少6位');
-  if (p1 !== p2) return showAuthError('两次密码不一致');
+  if (p1.length < 6) return showAuthError('密碼至少6位');
+  if (p1 !== p2) return showAuthError('兩次密碼不一致');
   const resp = await fetch('/auth/setup', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: p1}) });
   if (resp.ok) {
     document.getElementById('auth-overlay').style.display = 'none';
     await loadBuckets();
   } else {
     const d = await resp.json();
-    showAuthError(d.detail || '设置失败');
+    showAuthError(d.detail || '設置失敗');
   }
 }
 
@@ -1357,7 +1357,7 @@ async function doLogin() {
     await loadBuckets();
   } else {
     const d = await resp.json();
-    showAuthError(d.detail || '密码错误');
+    showAuthError(d.detail || '密碼錯誤');
   }
 }
 
@@ -1366,7 +1366,7 @@ async function doLogout() {
   document.getElementById('auth-setup-form').style.display = 'none';
   document.getElementById('auth-login-form').style.display = 'none';
   document.getElementById('auth-login-form').style.display = 'block';
-  document.getElementById('auth-subtitle').textContent = '请输入访问密码';
+  document.getElementById('auth-subtitle').textContent = '請輸入訪問密碼';
   document.getElementById('auth-error').style.display = 'none';
   document.getElementById('auth-overlay').style.display = 'flex';
 }
@@ -1376,18 +1376,18 @@ async function changePassword() {
   const newPwd = document.getElementById('settings-new-pwd').value;
   const newPwd2 = document.getElementById('settings-new-pwd2').value;
   const msgEl = document.getElementById('settings-pwd-msg');
-  if (newPwd.length < 6) { msgEl.style.color = 'var(--negative)'; msgEl.textContent = '新密码至少6位'; return; }
-  if (newPwd !== newPwd2) { msgEl.style.color = 'var(--negative)'; msgEl.textContent = '两次密码不一致'; return; }
+  if (newPwd.length < 6) { msgEl.style.color = 'var(--negative)'; msgEl.textContent = '新密碼至少6位'; return; }
+  if (newPwd !== newPwd2) { msgEl.style.color = 'var(--negative)'; msgEl.textContent = '兩次密碼不一致'; return; }
   const resp = await authFetch('/auth/change-password', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({current: currentPwd, new: newPwd}) });
   if (!resp) return;
   if (resp.ok) {
-    msgEl.style.color = 'var(--accent)'; msgEl.textContent = '密码修改成功';
+    msgEl.style.color = 'var(--accent)'; msgEl.textContent = '密碼修改成功';
     document.getElementById('settings-current-pwd').value = '';
     document.getElementById('settings-new-pwd').value = '';
     document.getElementById('settings-new-pwd2').value = '';
   } else {
     const d = await resp.json();
-    msgEl.style.color = 'var(--negative)'; msgEl.textContent = d.detail || '修改失败';
+    msgEl.style.color = 'var(--negative)'; msgEl.textContent = d.detail || '修改失敗';
   }
 }
 
@@ -1402,12 +1402,12 @@ async function loadSettingsStatus() {
     else noticeEl.style.display = 'none';
     el.innerHTML = `
       <b>版本</b>：${d.version}<br>
-      <b>Bucket 总数</b>：${(d.buckets?.total ?? 0)} （永久:${d.buckets?.permanent ?? 0} / 动态:${d.buckets?.dynamic ?? 0} / 归档:${d.buckets?.archive ?? 0}）<br>
-      <b>衰减引擎</b>：${d.decay_engine}<br>
-      <b>向量搜索</b>：${d.embedding_enabled ? '已启用' : '未启用'}<br>
+      <b>Bucket 總數</b>：${(d.buckets?.total ?? 0)} （永久:${d.buckets?.permanent ?? 0} / 動態:${d.buckets?.dynamic ?? 0} / 歸檔:${d.buckets?.archive ?? 0}）<br>
+      <b>衰減引擎</b>：${d.decay_engine}<br>
+      <b>向量搜索</b>：${d.embedding_enabled ? '已啟用' : '未啟用'}<br>
     `;
   } catch(e) {
-    el.textContent = '加载失败: ' + e;
+    el.textContent = '加載失敗: ' + e;
   }
   // Also refresh the host-vault input whenever the settings tab is loaded.
   loadHostVault();
@@ -1425,16 +1425,16 @@ async function loadHostVault() {
     const d = await resp.json();
     input.value = d.value || '';
     if (d.source === 'env') {
-      msg.textContent = '当前由进程环境变量提供（修改 .env 不会立即覆盖）';
+      msg.textContent = '當前由進程環境變量提供（修改 .env 不會立即覆蓋）';
       msg.style.color = 'var(--warning)';
     } else if (d.source === 'file') {
-      msg.textContent = '当前来自 ' + (d.env_file || '.env');
+      msg.textContent = '當前來自 ' + (d.env_file || '.env');
     } else {
-      msg.textContent = '尚未设置（默认使用 ./buckets）';
+      msg.textContent = '尚未設置（默認使用 ./buckets）';
     }
   } catch(e) {
     msg.style.color = 'var(--negative)';
-    msg.textContent = '加载失败: ' + e;
+    msg.textContent = '加載失敗: ' + e;
   }
 }
 
@@ -1455,14 +1455,14 @@ async function saveHostVault() {
     const d = await resp.json();
     if (resp.ok) {
       msg.style.color = 'var(--accent)';
-      msg.textContent = '已保存 → ' + (d.env_file || '.env') + '（需重启容器生效）';
+      msg.textContent = '已保存 → ' + (d.env_file || '.env') + '（需重啟容器生效）';
     } else {
       msg.style.color = 'var(--negative)';
-      msg.textContent = d.error || '保存失败';
+      msg.textContent = d.error || '保存失敗';
     }
   } catch(e) {
     msg.style.color = 'var(--negative)';
-    msg.textContent = '保存失败: ' + e;
+    msg.textContent = '保存失敗: ' + e;
   }
 }
 
@@ -1524,7 +1524,7 @@ async function loadBuckets() {
     buildFilters();
     renderBuckets(allBuckets);
   } catch (e) {
-    document.getElementById('bucket-list').innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
+    document.getElementById('bucket-list').innerHTML = '<div class="loading">加載失敗: ' + e.message + '</div>';
   }
 }
 
@@ -1535,7 +1535,7 @@ function updateStats() {
   const resolved = allBuckets.filter(b => b.resolved).length;
   const digested = allBuckets.filter(b => b.digested).length;
   document.getElementById('stats').textContent =
-    total + ' 桶 · ' + pinned + ' 钉选 · ' + feels + ' feel · ' + resolved + ' 已解决 · ' + digested + ' 已消化';
+    total + ' 桶 · ' + pinned + ' 釘選 · ' + feels + ' feel · ' + resolved + ' 已解決 · ' + digested + ' 已消化';
 }
 
 function buildFilters() {
@@ -1544,11 +1544,11 @@ function buildFilters() {
   const filters = document.getElementById('filters');
   const types = [
     { key: 'all', label: '全部' },
-    { key: 'pinned', label: '📌 钉选' },
+    { key: 'pinned', label: '📌 釘選' },
     { key: 'feel', label: '🫧 Feel' },
-    { key: 'unresolved', label: '⚡ 未解决' },
+    { key: 'unresolved', label: '⚡ 未解決' },
     { key: 'digested', label: '🌿 已消化' },
-    { key: 'archived', label: '📦 归档' },
+    { key: 'archived', label: '📦 歸檔' },
   ];
   filters.innerHTML = types.map(function(t) {
     return '<button class="filter-btn ' + (t.key === 'all' ? 'active' : '') + '" data-filter="' + t.key + '">' + t.label + '</button>';
@@ -1583,7 +1583,7 @@ function filterBuckets(buckets) {
 function renderBuckets(buckets) {
   var list = document.getElementById('bucket-list');
   if (!buckets.length) {
-    list.innerHTML = '<div class="loading">没有记忆桶</div>';
+    list.innerHTML = '<div class="loading">沒有記憶桶</div>';
     return;
   }
   list.innerHTML = buckets.map(function(b) {
@@ -1616,7 +1616,7 @@ async function searchBuckets(query) {
 async function showDetail(id) {
   var panel = document.getElementById('detail-panel');
   var content = document.getElementById('detail-content');
-  content.innerHTML = '<div class="loading">加载中…</div>';
+  content.innerHTML = '<div class="loading">加載中…</div>';
   panel.classList.add('open');
 
   try {
@@ -1627,24 +1627,24 @@ async function showDetail(id) {
       '<h2>' + esc(meta.name || id) + '</h2>' +
       '<div class="detail-meta">' +
         '<div class="field"><label>ID</label>' + id + '</div>' +
-        '<div class="field"><label>类型</label>' + (meta.type || 'dynamic') + '</div>' +
+        '<div class="field"><label>類型</label>' + (meta.type || 'dynamic') + '</div>' +
         '<div class="field"><label>域</label>' + (meta.domain || []).join(', ') + '</div>' +
-        '<div class="field"><label>标签</label>' + (meta.tags || []).join(', ') + '</div>' +
-        '<div class="field"><label>事件效价</label>V' + (meta.valence || 0.5).toFixed(2) + '</div>' +
-        '<div class="field"><label>唤醒度</label>A' + (meta.arousal || 0.3).toFixed(2) + '</div>' +
-        '<div class="field"><label>模型视角</label>' + (meta.model_valence != null ? 'V' + meta.model_valence.toFixed(2) : '—') + '</div>' +
+        '<div class="field"><label>標籤</label>' + (meta.tags || []).join(', ') + '</div>' +
+        '<div class="field"><label>事件效價</label>V' + (meta.valence || 0.5).toFixed(2) + '</div>' +
+        '<div class="field"><label>喚醒度</label>A' + (meta.arousal || 0.3).toFixed(2) + '</div>' +
+        '<div class="field"><label>模型視角</label>' + (meta.model_valence != null ? 'V' + meta.model_valence.toFixed(2) : '—') + '</div>' +
         '<div class="field"><label>重要度</label>' + (meta.importance || 5) + '/10</div>' +
-        '<div class="field"><label>权重分</label>' + b.score.toFixed(4) + '</div>' +
-        '<div class="field"><label>激活次数</label>' + (meta.activation_count || 1) + '</div>' +
-        '<div class="field"><label>已解决</label>' + (meta.resolved ? '✓' : '—') + '</div>' +
+        '<div class="field"><label>權重分</label>' + b.score.toFixed(4) + '</div>' +
+        '<div class="field"><label>激活次數</label>' + (meta.activation_count || 1) + '</div>' +
+        '<div class="field"><label>已解決</label>' + (meta.resolved ? '✓' : '—') + '</div>' +
         '<div class="field"><label>已消化</label>' + (meta.digested ? '✓' : '—') + '</div>' +
-        '<div class="field"><label>钉选</label>' + (meta.pinned ? '✓' : '—') + '</div>' +
-        '<div class="field"><label>创建</label>' + (meta.created || '—') + '</div>' +
-        '<div class="field"><label>最后活跃</label>' + (meta.last_active || '—') + '</div>' +
+        '<div class="field"><label>釘選</label>' + (meta.pinned ? '✓' : '—') + '</div>' +
+        '<div class="field"><label>創建</label>' + (meta.created || '—') + '</div>' +
+        '<div class="field"><label>最後活躍</label>' + (meta.last_active || '—') + '</div>' +
       '</div>' +
       '<div class="detail-content">' + esc(b.content) + '</div>';
   } catch (e) {
-    content.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
+    content.innerHTML = '<div class="loading">加載失敗: ' + e.message + '</div>';
   }
 }
 
@@ -1666,14 +1666,14 @@ async function loadNetwork() {
   ctx.fillStyle = '#8A8070';
   ctx.font = '14px Inter, sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('加载记忆网络…', W/2, H/2);
+  ctx.fillText('加載記憶網絡…', W/2, H/2);
 
   try {
     var res = await fetch(BASE + '/api/network');
     networkData = await res.json();
     drawNetwork(ctx, W, H, networkData);
   } catch(e) {
-    ctx.fillText('加载失败: ' + e.message, W/2, H/2 + 24);
+    ctx.fillText('加載失敗: ' + e.message, W/2, H/2 + 24);
   }
 }
 
@@ -1681,7 +1681,7 @@ function drawNetwork(ctx, W, H, data) {
   var nodes = data.nodes, edges = data.edges;
   if (!nodes.length) {
     ctx.fillStyle = '#8A8070';
-    ctx.fillText('没有记忆桶', W/2, H/2);
+    ctx.fillText('沒有記憶桶', W/2, H/2);
     return;
   }
 
@@ -1800,7 +1800,7 @@ function formatTimeAgo(iso) {
   var d = new Date(iso);
   var now = new Date();
   var hours = Math.floor((now - d) / 3600000);
-  if (hours < 1) return '刚刚';
+  if (hours < 1) return '剛剛';
   if (hours < 24) return hours + 'h前';
   var days = Math.floor(hours / 24);
   if (days < 30) return days + 'd前';
@@ -1825,7 +1825,7 @@ async function runBreathDebug() {
   var results = document.getElementById('breath-results');
   var info = document.getElementById('breath-info');
 
-  results.innerHTML = '<div class="loading">计算中…</div>';
+  results.innerHTML = '<div class="loading">計算中…</div>';
 
   var url = BASE + '/api/breath-debug?q=' + encodeURIComponent(query);
   if (valence) url += '&valence=' + valence;
@@ -1839,23 +1839,23 @@ async function runBreathDebug() {
     document.getElementById('fs-cand-n').textContent = data.total_candidates + ' 桶';
     document.getElementById('fs-candidates').classList.add('active');
     document.getElementById('fs-scoring').classList.add('active');
-    document.getElementById('fs-thresh-n').textContent = '≥' + data.threshold + ' → ' + data.passed_count + ' 通过';
+    document.getElementById('fs-thresh-n').textContent = '≥' + data.threshold + ' → ' + data.passed_count + ' 通過';
     document.getElementById('fs-threshold').classList.add('active');
     document.getElementById('fs-sort').classList.add('active');
 
     var w = data.weights;
     info.style.display = '';
     info.innerHTML =
-      '<strong>权重配置</strong>&nbsp;' +
+      '<strong>權重配置</strong>&nbsp;' +
       'topic=<code>' + w.topic + '</code> emotion=<code>' + w.emotion + '</code> ' +
       'time=<code>' + w.time + '</code> importance=<code>' + w.importance + '</code>' +
-      ' &nbsp;|&nbsp; 阈值=<code>' + data.threshold + '</code>' +
-      ' &nbsp;|&nbsp; 候选=<code>' + data.total_candidates + '</code> 桶' +
-      ' → 通过=<code>' + data.passed_count + '</code> 桶' +
-      (query ? '' : ' &nbsp;|&nbsp; <em>未输入 query，topic 分数全为 0</em>');
+      ' &nbsp;|&nbsp; 閾值=<code>' + data.threshold + '</code>' +
+      ' &nbsp;|&nbsp; 候選=<code>' + data.total_candidates + '</code> 桶' +
+      ' → 通過=<code>' + data.passed_count + '</code> 桶' +
+      (query ? '' : ' &nbsp;|&nbsp; <em>未輸入 query，topic 分數全為 0</em>');
 
     if (!data.results.length) {
-      results.innerHTML = '<div class="loading">无结果</div>';
+      results.innerHTML = '<div class="loading">無結果</div>';
       return;
     }
 
@@ -1890,7 +1890,7 @@ async function runBreathDebug() {
       '</div>';
     }).join('');
   } catch (e) {
-    results.innerHTML = '<div class="loading">请求失败: ' + e.message + '</div>';
+    results.innerHTML = '<div class="loading">請求失敗: ' + e.message + '</div>';
   }
 }
 
@@ -1904,7 +1904,7 @@ async function loadConfig() {
     var cfg = await res.json();
     document.getElementById('cfg-dehy-model').value = cfg.dehydration.model || '';
     document.getElementById('cfg-dehy-url').value = cfg.dehydration.base_url || '';
-    document.getElementById('cfg-dehy-key').placeholder = '当前: ' + (cfg.dehydration.api_key_masked || '未设置');
+    document.getElementById('cfg-dehy-key').placeholder = '當前: ' + (cfg.dehydration.api_key_masked || '未設置');
     document.getElementById('cfg-dehy-key').value = '';
     document.getElementById('cfg-dehy-maxtokens').value = cfg.dehydration.max_tokens || 1024;
     document.getElementById('cfg-dehy-temp').value = cfg.dehydration.temperature || 0.1;
@@ -1915,7 +1915,7 @@ async function loadConfig() {
       'Transport: <strong>' + cfg.transport + '</strong><br>Buckets dir: <strong>' + cfg.buckets_dir + '</strong>';
   } catch (e) {
     document.getElementById('config-status').innerHTML =
-      '<span style="color:var(--negative)">加载失败: ' + e.message + '</span>';
+      '<span style="color:var(--negative)">加載失敗: ' + e.message + '</span>';
   }
 }
 
@@ -1949,10 +1949,10 @@ async function saveConfig(persist) {
       status.innerHTML = '<span style="color:var(--positive)">✓ 已更新: ' + result.updated.join(', ') + '</span>';
       loadConfig();
     } else {
-      status.innerHTML = '<span style="color:var(--negative)">✗ ' + (result.error || '未知错误') + '</span>';
+      status.innerHTML = '<span style="color:var(--negative)">✗ ' + (result.error || '未知錯誤') + '</span>';
     }
   } catch (e) {
-    status.innerHTML = '<span style="color:var(--negative)">✗ 请求失败: ' + e.message + '</span>';
+    status.innerHTML = '<span style="color:var(--negative)">✗ 請求失敗: ' + e.message + '</span>';
   }
 }
 
@@ -2070,8 +2070,8 @@ function addExcerptRow(excerpt) {
 function buildBookSourceOptions() {
   const select = document.getElementById('book-source-select');
   const ranked = allBuckets.slice().sort(function(a, b) {
-    const aReading = (a.domain || []).some(function(d) { return d === '阅读' || d === '閱讀'; }) ? 1 : 0;
-    const bReading = (b.domain || []).some(function(d) { return d === '阅读' || d === '閱讀'; }) ? 1 : 0;
+    const aReading = (a.domain || []).some(function(d) { return d === '閱讀' || d === '閱讀'; }) ? 1 : 0;
+    const bReading = (b.domain || []).some(function(d) { return d === '閱讀' || d === '閱讀'; }) ? 1 : 0;
     return bReading - aReading || (b.score || 0) - (a.score || 0);
   });
   select.innerHTML = '<option value="">選擇記憶桶...</option>' + ranked.map(function(bucket) {
@@ -2195,11 +2195,11 @@ async function startImport(file) {
   try {
     const res = await fetch(BASE + '/api/import/upload?preserve_raw=' + (preserveRaw ? '1' : '0'), { method: 'POST', body: fd });
     const data = await res.json();
-    if (data.error) { alert('导入失败: ' + data.error); return; }
+    if (data.error) { alert('導入失敗: ' + data.error); return; }
     document.getElementById('import-progress').style.display = '';
     document.getElementById('import-pause-btn').style.display = '';
     pollImportStatus();
-  } catch (e) { alert('上传失败: ' + e.message); }
+  } catch (e) { alert('上傳失敗: ' + e.message); }
 }
 
 let importPollTimer;
@@ -2231,7 +2231,7 @@ function updateImportUI(s) {
   document.getElementById('import-created').textContent = s.memories_created;
   document.getElementById('import-merged').textContent = s.memories_merged;
   document.getElementById('import-raw').textContent = s.memories_raw;
-  const statusMap = { running: '⏳ 导入中…', paused: '⏸ 已暂停', completed: '✅ 完成', error: '❌ 出错' };
+  const statusMap = { running: '⏳ 導入中…', paused: '⏸ 已暫停', completed: '✅ 完成', error: '❌ 出錯' };
   document.getElementById('import-status-text').textContent = statusMap[s.status] || s.status;
   document.getElementById('import-pause-btn').style.display = s.status === 'running' ? '' : 'none';
   if (s.status !== 'running') clearInterval(importPollTimer);
@@ -2249,12 +2249,12 @@ async function pauseImport() {
 
 async function loadImportResults() {
   const container = document.getElementById('import-results-list');
-  container.innerHTML = '<div class="loading">加载中…</div>';
+  container.innerHTML = '<div class="loading">加載中…</div>';
   try {
     const res = await fetch(BASE + '/api/import/results?limit=30');
     const data = await res.json();
     if (!data.buckets || !data.buckets.length) {
-      container.innerHTML = '<p style="color:var(--text-dim)">暂无记忆桶</p>';
+      container.innerHTML = '<p style="color:var(--text-dim)">暫無記憶桶</p>';
       return;
     }
     container.innerHTML = data.buckets.map(b => `
@@ -2266,38 +2266,38 @@ async function loadImportResults() {
         <p style="font-size:13px;margin:6px 0;white-space:pre-wrap;">${b.content}</p>
         <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;">${(b.tags||[]).map(t=>'#'+t).join(' ')}</div>
         <div style="display:flex;gap:8px;">
-          <button onclick="reviewAction('${b.id}','pin')" title="固定为永久记忆">📌 固定</button>
-          <button onclick="reviewAction('${b.id}','important')" title="标为重要">⭐ 重要</button>
-          <button onclick="reviewAction('${b.id}','noise')" title="标为噪声并resolve">🗑 噪声</button>
-          <button onclick="if(confirm('确定删除？'))reviewAction('${b.id}','delete')" title="彻底删除" style="color:var(--negative);">✕ 删除</button>
+          <button onclick="reviewAction('${b.id}','pin')" title="固定為永久記憶">📌 固定</button>
+          <button onclick="reviewAction('${b.id}','important')" title="標為重要">⭐ 重要</button>
+          <button onclick="reviewAction('${b.id}','noise')" title="標為噪聲並resolve">🗑 噪聲</button>
+          <button onclick="if(confirm('確定刪除？'))reviewAction('${b.id}','delete')" title="徹底刪除" style="color:var(--negative);">✕ 刪除</button>
         </div>
       </div>
     `).join('');
-  } catch(e) { container.innerHTML = '<p style="color:var(--negative)">加载失败: ' + e.message + '</p>'; }
+  } catch(e) { container.innerHTML = '<p style="color:var(--negative)">加載失敗: ' + e.message + '</p>'; }
 }
 
 async function detectPatterns() {
   const container = document.getElementById('import-patterns');
-  container.innerHTML = '<div class="loading">检测中…</div>';
+  container.innerHTML = '<div class="loading">檢測中…</div>';
   try {
     const res = await fetch(BASE + '/api/import/patterns');
     const data = await res.json();
-    if (!data.patterns || !data.patterns.length) { container.innerHTML = '<p style="color:var(--text-dim)">未检测到高频模式</p>'; return; }
+    if (!data.patterns || !data.patterns.length) { container.innerHTML = '<p style="color:var(--text-dim)">未檢測到高頻模式</p>'; return; }
     container.innerHTML = data.patterns.map(p => `
       <div style="background:var(--surface);border-radius:12px;padding:14px;margin:8px 0;">
         <div style="display:flex;justify-content:space-between;align-items:center;">
           <b>${p.pattern_name}</b>
-          <span style="font-size:12px;color:var(--text-dim);">出现 ${p.count} 次</span>
+          <span style="font-size:12px;color:var(--text-dim);">出現 ${p.count} 次</span>
         </div>
         <p style="font-size:13px;margin:6px 0;">${p.pattern_content}</p>
         <div style="display:flex;gap:8px;">
           <button onclick="reviewAction('${p.bucket_ids[0]}','pin')">📌 固定</button>
           <button onclick="reviewAction('${p.bucket_ids[0]}','important')">⭐ 重要</button>
-          <button onclick="batchReview('${JSON.stringify(p.bucket_ids).replace(/'/g, "\\'").replace(/"/g, '&quot;')}','noise')">🗑 噪声</button>
+          <button onclick="batchReview('${JSON.stringify(p.bucket_ids).replace(/'/g, "\\'").replace(/"/g, '&quot;')}','noise')">🗑 噪聲</button>
         </div>
       </div>
     `).join('');
-  } catch(e) { container.innerHTML = '<p style="color:var(--negative)">检测失败: ' + e.message + '</p>'; }
+  } catch(e) { container.innerHTML = '<p style="color:var(--negative)">檢測失敗: ' + e.message + '</p>'; }
 }
 
 async function reviewAction(bid, action) {

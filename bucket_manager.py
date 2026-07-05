@@ -1,32 +1,34 @@
 # ============================================================
 # Module: Memory Bucket Manager (bucket_manager.py)
-# 模块：记忆桶管理器
+# 模塊：記憶桶管理器
 #
 # CRUD operations, multi-dimensional index search, activation updates
 # for memory buckets.
-# 记忆桶的增删改查、多维索引搜索、激活更新。
+# 記憶桶的增刪改查、多維索引搜索、激活更新。
 #
 # Core design:
-# 核心逻辑：
+# 核心邏輯：
 #   - Each bucket = one Markdown file (YAML frontmatter + body)
-#     每个记忆桶 = 一个 Markdown 文件
+#     每個記憶桶 = 一個 Markdown 文件
 #   - Storage by type: permanent / dynamic / archive
-#     存储按类型分目录
+#     存儲按類型分目錄
 #   - Multi-dimensional soft index: domain + valence/arousal + fuzzy text
-#     多维软索引：主题域 + 情感坐标 + 文本模糊匹配
+#     多維軟索引：主題域 + 情感座標 + 文本模糊匹配
 #   - Search strategy: domain pre-filter → weighted multi-dim ranking
-#     搜索策略：主题域预筛 → 多维加权精排
+#     搜索策略：主題域預篩 → 多維加權精排
 #   - Emotion coordinates based on Russell circumplex model:
-#     情感坐标基于环形情感模型（Russell circumplex）：
+#     情感座標基於環形情感模型（Russell circumplex）：
 #       valence (0~1): 0=negative → 1=positive
 #       arousal (0~1): 0=calm → 1=excited
 #
 # Depended on by: server.py, decay_engine.py
-# 被谁依赖：server.py, decay_engine.py
+# 被誰依賴：server.py, decay_engine.py
 # ============================================================
 
 import os
 import math
+import random
+import secrets
 import logging
 import shutil
 from datetime import datetime
@@ -38,6 +40,86 @@ from rapidfuzz import fuzz
 
 from utils import generate_bucket_id, sanitize_name, safe_path, now_iso
 
+# --- Domain normalization: canonical form is Traditional Chinese (Ruby's call) ---
+# --- 主題域正規化：一律繁體（Ruby 拍板：全部繁體）。---
+# Prefer OpenCC at runtime (catches any simplified domain the LLM emits);
+# the static map is the no-dependency fallback for historically seen domains.
+# 執行期優先用 OpenCC（LLM 吐什麼簡體都接得住）；靜態表是無依賴保底。
+try:
+    from opencc import OpenCC as _OpenCC
+    _S2TW = _OpenCC("s2tw")
+except Exception:
+    _S2TW = None
+
+DOMAIN_NORMALIZE = {
+    "编程": "編程",
+    "恋爱": "戀愛",
+    "数字": "數字",
+    "计划": "計劃",
+    "事务": "事務",
+    "人际": "人際",
+    "兴趣": "興趣",
+    "内心": "內心",
+    "创作": "創作",
+    "友谊": "友誼",
+    "影视": "影視",
+    "待办": "待辦",
+    "情绪": "情緒",
+    "成长": "成長",
+    "游戏": "遊戲",
+    "阅读": "閱讀",
+    "音乐": "音樂",
+    "饮食": "飲食",
+    "网络": "網絡",
+    "未分类": "未分類",
+    "沉淀物": "沉澱物",
+    "学习": "學習",
+    "购物": "購物",
+    "运动": "運動",
+    "梦境": "夢境",
+    "回忆": "回憶",
+    "财务": "財務",
+    "健康": "健康",
+}
+
+# --- Activation cap: bounds time-ripple / touch inflation ---
+# --- 激活次數上限：防止 time_ripple/touch 無限通脹扭曲權重 ---
+ACTIVATION_CAP = 50
+
+
+def normalize_domains(domains: list[str]) -> list[str]:
+    """Map any simplified-variant domain onto Traditional Chinese, dedup preserving order."""
+    out = []
+    for d in domains or []:
+        if _S2TW is not None:
+            try:
+                c = _S2TW.convert(d)
+            except Exception:
+                c = DOMAIN_NORMALIZE.get(d, d)
+        else:
+            c = DOMAIN_NORMALIZE.get(d, d)
+        if c not in out:
+            out.append(c)
+    return out
+
+
+def atomic_write_text(file_path: str, text: str) -> None:
+    """Write file via tmp + fsync + rename so a crash never leaves a half-written bucket.
+    與 letters/self_concept 相同的原子寫入模式；桶是最重要的存儲，不該比它們脆。"""
+    tmp = f"{file_path}.{secrets.token_hex(4)}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, file_path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
 logger = logging.getLogger("ombre_brain.bucket")
 
 
@@ -46,13 +128,13 @@ class BucketManager:
     Memory bucket manager — entry point for all bucket CRUD operations.
     Buckets are stored as Markdown files with YAML frontmatter for metadata
     and body for content. Natively compatible with Obsidian browsing/editing.
-    记忆桶管理器 —— 所有桶的 CRUD 操作入口。
-    桶以 Markdown 文件存储，YAML frontmatter 存元数据，正文存内容。
-    天然兼容 Obsidian 直接浏览和编辑。
+    記憶桶管理器 —— 所有桶的 CRUD 操作入口。
+    桶以 Markdown 文件存儲，YAML frontmatter 存元數據，正文存內容。
+    天然兼容 Obsidian 直接瀏覽和編輯。
     """
 
     def __init__(self, config: dict, embedding_engine=None):
-        # --- Read storage paths from config / 从配置中读取存储路径 ---
+        # --- Read storage paths from config / 從配置中讀取存儲路徑 ---
         self.base_dir = config["buckets_dir"]
         self.permanent_dir = os.path.join(self.base_dir, "permanent")
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
@@ -61,7 +143,7 @@ class BucketManager:
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
 
-        # --- Wikilink config / 双链配置 ---
+        # --- Wikilink config / 雙鏈配置 ---
         wikilink_cfg = config.get("wikilink", {})
         self.wikilink_enabled = wikilink_cfg.get("enabled", True)
         self.wikilink_use_tags = wikilink_cfg.get("use_tags", False)
@@ -72,16 +154,16 @@ class BucketManager:
         self.wikilink_exclude_keywords = set(wikilink_cfg.get("exclude_keywords", []))
         self.wikilink_stopwords = {
             "的", "了", "在", "是", "我", "有", "和", "就", "不", "人",
-            "都", "一个", "上", "也", "很", "到", "说", "要", "去",
-            "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "她",
-            "我们", "你们", "他们", "然后", "今天", "昨天", "明天", "一下",
+            "都", "一個", "上", "也", "很", "到", "說", "要", "去",
+            "你", "會", "著", "沒有", "看", "好", "自己", "這", "他", "她",
+            "我們", "你們", "他們", "然後", "今天", "昨天", "明天", "一下",
             "the", "and", "for", "are", "but", "not", "you", "all", "can",
             "had", "her", "was", "one", "our", "out", "has", "have", "with",
             "this", "that", "from", "they", "been", "said", "will", "each",
         }
         self.wikilink_stopwords |= {w.lower() for w in self.wikilink_exclude_keywords}
 
-        # --- Search scoring weights / 检索权重配置 ---
+        # --- Search scoring weights / 檢索權重配置 ---
         scoring = config.get("scoring_weights", {})
         self.w_topic = scoring.get("topic_relevance", 4.0)
         self.w_emotion = scoring.get("emotion_resonance", 2.0)
@@ -89,14 +171,18 @@ class BucketManager:
         self.w_importance = scoring.get("importance", 1.0)
         self.content_weight = scoring.get("content_weight", 1.0)  # body×1, per spec
 
-        # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
+        # --- Optional embedding engine for pre-filtering / 可選 embedding 引擎，用於預篩候選集 ---
         self.embedding_engine = embedding_engine
+
+        # --- mtime-keyed bucket cache: list_all() re-parses only changed files ---
+        # --- 以 mtime 為鍵的桶緩存：list_all() 只重新解析有變化的文件 ---
+        self._bucket_cache: dict[str, tuple[float, dict]] = {}
 
     # ---------------------------------------------------------
     # Create a new bucket
-    # 创建新桶
+    # 創建新桶
     # Write content and metadata into a .md file
-    # 将内容和元数据写入一个 .md 文件
+    # 將內容和元數據寫入一個 .md 文件
     # ---------------------------------------------------------
     async def create(
         self,
@@ -113,28 +199,33 @@ class BucketManager:
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
-        创建一个新的记忆桶，返回桶 ID。
+        創建一個新的記憶桶，返回桶 ID。
 
         pinned/protected=True: bucket won't be merged, decayed, or have importance changed.
         Importance is locked to 10 for pinned/protected buckets.
-        pinned/protected 桶不参与合并与衰减，importance 强制锁定为 10。
+        pinned/protected 桶不參與合併與衰減，importance 強制鎖定為 10。
         """
         bucket_id = generate_bucket_id()
         bucket_name = sanitize_name(name) if name else bucket_id
-        # feel buckets are allowed to have empty domain; others default to ["未分类"]
+        # feel buckets are allowed to have empty domain; others default to ["未分類"]
         if bucket_type == "feel":
-            domain = domain if domain is not None else []
+            domain = normalize_domains(domain) if domain is not None else []
         else:
-            domain = domain or ["未分类"]
+            domain = normalize_domains(domain) or ["未分類"]
         tags = tags or []
+        # Pinned non-permanent must become permanent BEFORE metadata is built,
+        # otherwise the file lands in permanent/ with frontmatter still saying dynamic.
+        # 釘選桶必須在構建 metadata 之前就轉為 permanent，否則目錄與 type 不一致。
+        if pinned and bucket_type not in ("permanent",):
+            bucket_type = "permanent"
         linked_content = content  # wikilink injection disabled; LLM adds [[]] via prompt
 
         # --- Pinned/protected buckets: lock importance to 10 ---
-        # --- 钉选/保护桶：importance 强制锁定为 10 ---
+        # --- 釘選/保護桶：importance 強制鎖定為 10 ---
         if pinned or protected:
             importance = 10
 
-        # --- Build YAML frontmatter metadata / 构建元数据 ---
+        # --- Build YAML frontmatter metadata / 構建元數據 ---
         metadata = {
             "id": bucket_id,
             "name": bucket_name,
@@ -154,28 +245,26 @@ class BucketManager:
             metadata["protected"] = True
 
         # --- Assemble Markdown file (frontmatter + body) ---
-        # --- 组装 Markdown 文件 ---
+        # --- 組裝 Markdown 文件 ---
         post = frontmatter.Post(linked_content, **metadata)
 
         # --- Choose directory by type + primary domain ---
-        # --- 按类型 + 主题域选择存储目录 ---
+        # --- 按類型 + 主題域選擇存儲目錄 ---
         if bucket_type == "permanent" or pinned:
             type_dir = self.permanent_dir
-            if pinned and bucket_type != "permanent":
-                metadata["type"] = "permanent"
         elif bucket_type == "feel":
             type_dir = self.feel_dir
         else:
             type_dir = self.dynamic_dir
         if bucket_type == "feel":
-            primary_domain = "沉淀物"  # feel subfolder name
+            primary_domain = "沉澱物"  # feel subfolder name
         else:
-            primary_domain = sanitize_name(domain[0]) if domain else "未分类"
+            primary_domain = sanitize_name(domain[0]) if domain else "未分類"
         target_dir = os.path.join(type_dir, primary_domain)
         os.makedirs(target_dir, exist_ok=True)
 
         # --- Filename: readable_name_bucketID.md (Obsidian friendly) ---
-        # --- 文件名：可读名称_桶ID.md ---
+        # --- 文件名：可讀名稱_桶ID.md ---
         if bucket_name and bucket_name != bucket_id:
             filename = f"{bucket_name}_{bucket_id}.md"
         else:
@@ -183,27 +272,26 @@ class BucketManager:
         file_path = safe_path(target_dir, filename)
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            atomic_write_text(str(file_path), frontmatter.dumps(post))
         except OSError as e:
-            logger.error(f"Failed to write bucket file / 写入桶文件失败: {file_path}: {e}")
+            logger.error(f"Failed to write bucket file / 寫入桶文件失敗: {file_path}: {e}")
             raise
 
         logger.info(
-            f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
+            f"Created bucket / 創建記憶桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
             + (" [PINNED]" if pinned else "") + (" [PROTECTED]" if protected else "")
         )
         return bucket_id
 
     # ---------------------------------------------------------
     # Read bucket content
-    # 读取桶内容
+    # 讀取桶內容
     # Returns {"id", "metadata", "content", "path"} or None
     # ---------------------------------------------------------
     async def get(self, bucket_id: str) -> Optional[dict]:
         """
         Read a single bucket by ID.
-        根据 ID 读取单个桶。
+        根據 ID 讀取單個桶。
         """
         if not bucket_id or not isinstance(bucket_id, str):
             return None
@@ -214,21 +302,21 @@ class BucketManager:
 
     # ---------------------------------------------------------
     # Move bucket between directories
-    # 在目录间移动桶文件
+    # 在目錄間移動桶文件
     # ---------------------------------------------------------
     def _move_bucket(self, file_path: str, target_type_dir: str, domain: list[str] = None) -> str:
         """
         Move a bucket file to a new type directory, preserving domain subfolder.
         Returns new file path.
         """
-        primary_domain = sanitize_name(domain[0]) if domain else "未分类"
+        primary_domain = sanitize_name(domain[0]) if domain else "未分類"
         target_dir = os.path.join(target_type_dir, primary_domain)
         os.makedirs(target_dir, exist_ok=True)
         filename = os.path.basename(file_path)
         new_path = safe_path(target_dir, filename)
         if os.path.normpath(file_path) != os.path.normpath(new_path):
             os.rename(file_path, new_path)
-            logger.info(f"Moved bucket / 移动记忆桶: {filename} → {target_dir}/")
+            logger.info(f"Moved bucket / 移動記憶桶: {filename} → {target_dir}/")
         return new_path
 
     # ---------------------------------------------------------
@@ -239,7 +327,7 @@ class BucketManager:
     async def update(self, bucket_id: str, **kwargs) -> bool:
         """
         Update bucket content or metadata fields.
-        更新桶的内容或元数据字段。
+        更新桶的內容或元數據字段。
         """
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
@@ -248,16 +336,16 @@ class BucketManager:
         try:
             post = frontmatter.load(file_path)
         except Exception as e:
-            logger.warning(f"Failed to load bucket for update / 加载桶失败: {file_path}: {e}")
+            logger.warning(f"Failed to load bucket for update / 加載桶失敗: {file_path}: {e}")
             return False
 
         # --- Pinned/protected buckets: lock importance to 10, ignore importance changes ---
-        # --- 钉选/保护桶：importance 不可修改，强制保持 10 ---
+        # --- 釘選/保護桶：importance 不可修改，強制保持 10 ---
         is_pinned = post.get("pinned", False) or post.get("protected", False)
         if is_pinned:
             kwargs.pop("importance", None)  # silently ignore importance update
 
-        # --- Update only fields that were passed in / 只改传入的字段 ---
+        # --- Update only fields that were passed in / 只改傳入的字段 ---
         if "content" in kwargs:
             post.content = kwargs["content"]  # wikilink injection disabled; LLM adds [[]] via prompt
         if "tags" in kwargs:
@@ -265,7 +353,7 @@ class BucketManager:
         if "importance" in kwargs:
             post["importance"] = max(1, min(10, int(kwargs["importance"])))
         if "domain" in kwargs:
-            post["domain"] = kwargs["domain"]
+            post["domain"] = normalize_domains(kwargs["domain"])
         if "valence" in kwargs:
             post["valence"] = max(0.0, min(1.0, float(kwargs["valence"])))
         if "arousal" in kwargs:
@@ -275,44 +363,62 @@ class BucketManager:
         if "resolved" in kwargs:
             post["resolved"] = bool(kwargs["resolved"])
         if "pinned" in kwargs:
+            was_pinned = bool(post.get("pinned", False))
             post["pinned"] = bool(kwargs["pinned"])
             if kwargs["pinned"]:
+                # Remember pre-pin importance so unpin can restore it
+                # 記住釘選前的重要度，取消釘選時恢復
+                if not was_pinned and "importance_prepin" not in post.metadata:
+                    post["importance_prepin"] = int(post.get("importance", 5))
                 post["importance"] = 10  # pinned → lock importance to 10
+            elif was_pinned and "importance_prepin" in post.metadata:
+                post["importance"] = max(1, min(10, int(post.metadata.pop("importance_prepin"))))
         if "digested" in kwargs:
             post["digested"] = bool(kwargs["digested"])
         if "model_valence" in kwargs:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
 
-        # --- Auto-refresh activation time / 自动刷新激活时间 ---
+        # --- Auto-refresh activation time / 自動刷新激活時間 ---
         post["last_active"] = now_iso()
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            atomic_write_text(file_path, frontmatter.dumps(post))
         except OSError as e:
-            logger.error(f"Failed to write bucket update / 写入桶更新失败: {file_path}: {e}")
+            logger.error(f"Failed to write bucket update / 寫入桶更新失敗: {file_path}: {e}")
             return False
 
         # --- Auto-move: pinned → permanent/ ---
-        # --- 自动移动：钉选 → permanent/ ---
+        # --- 自動移動：釘選 → permanent/ ---
         # NOTE: resolved buckets are NOT auto-archived here.
         # They stay in dynamic/ and decay naturally until score < threshold.
-        # 注意：resolved 桶不在此自动归档，留在 dynamic/ 随衰减引擎自然归档。
-        domain = post.get("domain", ["未分类"])
+        # 注意：resolved 桶不在此自動歸檔，留在 dynamic/ 隨衰減引擎自然歸檔。
+        domain = post.get("domain", ["未分類"])
         if kwargs.get("pinned") and post.get("type") != "permanent":
             post["type"] = "permanent"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            atomic_write_text(file_path, frontmatter.dumps(post))
             self._move_bucket(file_path, self.permanent_dir, domain)
+        elif "pinned" in kwargs and not kwargs["pinned"] and post.get("type") == "permanent" and not post.get("protected"):
+            # --- Reverse: unpin → demote permanent back to dynamic/ ---
+            # --- 反向：取消釘選 → 從 permanent/ 降回 dynamic/，讓衰減引擎接手 ---
+            post["type"] = "dynamic"
+            atomic_write_text(file_path, frontmatter.dumps(post))
+            file_path = self._move_bucket(file_path, self.dynamic_dir, domain)
+        elif post.get("type") == "archived" and "resolved" in kwargs and not kwargs["resolved"]:
+            # --- Revive: re-activating an archived bucket pulls it back to dynamic/ ---
+            # --- 復活：對歸檔桶 resolved=0 視為喚回，搬回 dynamic/ 重新參與生命週期 ---
+            post["type"] = "dynamic"
+            atomic_write_text(file_path, frontmatter.dumps(post))
+            file_path = self._move_bucket(file_path, self.dynamic_dir, domain)
+            logger.info(f"Revived bucket from archive / 歸檔桶復活: {bucket_id}")
 
-        logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
+        logger.info(f"Updated bucket / 更新記憶桶: {bucket_id}")
         return True
 
     # ---------------------------------------------------------
     # Wikilink injection — DISABLED
-    # 自动添加 Obsidian 双链 — 已禁用
+    # 自動添加 Obsidian 雙鏈 — 已禁用
     # Now handled by LLM prompts (Gemini adds [[]] for proper nouns)
-    # 现在由 LLM prompt 处理（Gemini 对人名/地名/专有名词加 [[]]）
+    # 現在由 LLM prompt 處理（Gemini 對人名/地名/專有名詞加 [[]]）
     # ---------------------------------------------------------
     # def _apply_wikilinks(self, content, tags, domain, name): ...
     # def _collect_wikilink_keywords(self, content, tags, domain, name): ...
@@ -321,12 +427,12 @@ class BucketManager:
 
     # ---------------------------------------------------------
     # Delete bucket
-    # 删除桶
+    # 刪除桶
     # ---------------------------------------------------------
     async def delete(self, bucket_id: str) -> bool:
         """
         Delete a memory bucket file.
-        删除指定的记忆桶文件。
+        刪除指定的記憶桶文件。
         """
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
@@ -335,24 +441,25 @@ class BucketManager:
         try:
             os.remove(file_path)
         except OSError as e:
-            logger.error(f"Failed to delete bucket file / 删除桶文件失败: {file_path}: {e}")
+            logger.error(f"Failed to delete bucket file / 刪除桶文件失敗: {file_path}: {e}")
             return False
 
-        logger.info(f"Deleted bucket / 删除记忆桶: {bucket_id}")
+        logger.info(f"Deleted bucket / 刪除記憶桶: {bucket_id}")
         return True
 
     # ---------------------------------------------------------
     # Touch bucket (refresh activation time + increment count)
-    # 触碰桶（刷新激活时间 + 累加激活次数）
+    # 觸碰桶（刷新激活時間 + 累加激活次數）
     # Called on every recall hit; affects decay score.
-    # 每次检索命中时调用，影响衰减得分。
+    # 每次檢索命中時調用，影響衰減得分。
     # ---------------------------------------------------------
-    async def touch(self, bucket_id: str) -> None:
+    async def touch(self, bucket_id: str, ripple: bool = False) -> None:
         """
-        Update a bucket's last activation time and count.
-        Also triggers time ripple: nearby memories get a slight activation boost.
-        更新桶的最后激活时间和激活次数。
-        同时触发时间涟漪：时间上相邻的记忆轻微唤醒。
+        Update a bucket's last activation time and count (capped at ACTIVATION_CAP).
+        ripple=True additionally wakes a random sample of temporal neighbors —
+        callers should only ripple the strongest recall, not every search hit.
+        更新桶的最後激活時間和激活次數（封頂 ACTIVATION_CAP）。
+        ripple=True 才觸發時間漣漪；調用方只對最強的那次命中開漣漪，避免通脹。
         """
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
@@ -361,70 +468,77 @@ class BucketManager:
         try:
             post = frontmatter.load(file_path)
             post["last_active"] = now_iso()
-            post["activation_count"] = post.get("activation_count", 0) + 1
+            try:
+                current = float(post.get("activation_count", 0))
+            except (ValueError, TypeError):
+                current = 0.0
+            post["activation_count"] = min(round(current + 1, 1), ACTIVATION_CAP)
 
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            atomic_write_text(file_path, frontmatter.dumps(post))
 
-            # --- Time ripple: boost nearby memories within ±48h ---
-            # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
-            current_time = datetime.fromisoformat(str(post.get("created", post.get("last_active", ""))))
-            await self._time_ripple(bucket_id, current_time)
+            # --- Time ripple: boost memories created within ±48h of this one ---
+            # --- 時間漣漪：喚醒與本桶創建時間相鄰（±48h）的記憶 ---
+            created_str = post.get("created", "")
+            if ripple and created_str:
+                await self._time_ripple(bucket_id, datetime.fromisoformat(str(created_str)))
         except Exception as e:
-            logger.warning(f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}")
+            logger.warning(f"Failed to touch bucket / 觸碰桶失敗: {bucket_id}: {e}")
 
     async def _time_ripple(self, source_id: str, reference_time: datetime, hours: float = 48.0) -> None:
         """
-        Slightly boost activation_count of buckets created/activated near the reference time.
-        轻微提升时间相邻桶的激活次数（+0.3），不改 last_active 避免递归唤醒。
-        Max 5 buckets rippled per touch to bound I/O.
+        Slightly boost activation_count of buckets created near the reference time.
+        Samples up to 5 eligible neighbors at random (walk order would always feed
+        the same few buckets); counts stay capped at ACTIVATION_CAP.
+        輕微提升時間相鄰桶的激活次數（+0.3）：在全部合格鄰居中隨機取樣最多5個，
+        避免固定餵養目錄順序靠前的桶；封頂 ACTIVATION_CAP。
         """
         try:
             all_buckets = await self.list_all(include_archive=False)
         except Exception:
             return
 
-        rippled = 0
-        max_ripple = 5
+        eligible = []
         for bucket in all_buckets:
-            if rippled >= max_ripple:
-                break
             if bucket["id"] == source_id:
                 continue
             meta = bucket.get("metadata", {})
-            # Skip pinned/permanent/feel
+            # Skip pinned/permanent/feel and buckets already settled or digested
             if meta.get("pinned") or meta.get("protected") or meta.get("type") in ("permanent", "feel"):
                 continue
+            if meta.get("resolved") or meta.get("digested"):
+                continue
 
-            created_str = meta.get("created", meta.get("last_active", ""))
+            created_str = meta.get("created", "")
             try:
                 created = datetime.fromisoformat(str(created_str))
                 delta_hours = abs((reference_time - created).total_seconds()) / 3600
             except (ValueError, TypeError):
                 continue
-
             if delta_hours <= hours:
-                # Boost activation_count by 0.3 (fractional), don't change last_active
-                file_path = self._find_bucket_file(bucket["id"])
-                if not file_path:
-                    continue
+                eligible.append(bucket["id"])
+
+        for target_id in random.sample(eligible, min(5, len(eligible))):
+            file_path = self._find_bucket_file(target_id)
+            if not file_path:
+                continue
+            try:
+                post = frontmatter.load(file_path)
                 try:
-                    post = frontmatter.load(file_path)
-                    current_count = post.get("activation_count", 1)
-                    # Store as float for fractional increments; calculate_score handles it
-                    post["activation_count"] = round(current_count + 0.3, 1)
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(frontmatter.dumps(post))
-                    rippled += 1
-                except Exception:
-                    continue
+                    current_count = float(post.get("activation_count", 1))
+                except (ValueError, TypeError):
+                    current_count = 1.0
+                # Fractional boost, don't change last_active (avoids recursive wake)
+                post["activation_count"] = min(round(current_count + 0.3, 1), ACTIVATION_CAP)
+                atomic_write_text(file_path, frontmatter.dumps(post))
+            except Exception:
+                continue
 
     # ---------------------------------------------------------
     # Multi-dimensional search (core feature)
-    # 多维搜索（核心功能）
+    # 多維搜索（核心功能）
     #
     # Strategy: domain pre-filter → weighted multi-dim ranking
-    # 策略：主题域预筛 → 多维加权精排
+    # 策略：主題域預篩 → 多維加權精排
     #
     # Ranking formula:
     #   total = topic(×w_topic) + emotion(×w_emotion)
@@ -446,7 +560,7 @@ class BucketManager:
     ) -> list[dict]:
         """
         Multi-dimensional indexed search for memory buckets.
-        多维索引搜索记忆桶。
+        多維索引搜索記憶桶。
 
         domain_filter: pre-filter by domain (None = search all)
         query_valence/arousal: emotion coordinates for resonance scoring
@@ -457,11 +571,20 @@ class BucketManager:
         limit = limit or self.max_results
         all_buckets = await self.list_all(include_archive=False)
 
+        # --- Feels are a private channel (breath domain="feel" only), never search results ---
+        # --- feel 是獨立私人通道，永遠不進普通搜索 ---
+        all_buckets = [b for b in all_buckets if b["metadata"].get("type") != "feel"]
+
         if not all_buckets:
             return []
 
         # --- Layer 1: domain pre-filter (fast scope reduction) ---
-        # --- 第一层：主题域预筛（快速缩小范围）---
+        # --- 第一層：主題域預篩（快速縮小範圍）---
+        # Normalize the query side too: a simplified domain query must still
+        # match the (now Traditional) canonical domains.
+        # 查詢端也正規化：用簡體查 domain 也要能命中繁體正典域。
+        if domain_filter:
+            domain_filter = normalize_domains(domain_filter)
         if domain_filter:
             filter_set = {d.lower() for d in domain_filter}
             candidates = [
@@ -469,14 +592,14 @@ class BucketManager:
                 if {d.lower() for d in b["metadata"].get("domain", [])} & filter_set
             ]
             # Fall back to full search if pre-filter yields nothing
-            # 预筛为空则回退全量搜索
+            # 預篩為空則回退全量搜索
             if not candidates:
                 candidates = all_buckets
         else:
             candidates = all_buckets
 
         # --- Layer 1.5: embedding pre-filter (optional, reduces multi-dim ranking set) ---
-        # --- 第1.5层：embedding 预筛（可选，缩小精排候选集）---
+        # --- 第1.5層：embedding 預篩（可選，縮小精排候選集）---
         if self.embedding_engine and self.embedding_engine.enabled:
             try:
                 vector_results = await self.embedding_engine.search_similar(query, top_k=50)
@@ -487,10 +610,10 @@ class BucketManager:
                         candidates = emb_candidates
                     # else: keep original candidates as fallback
             except Exception as e:
-                logger.warning(f"Embedding pre-filter failed, using fuzzy only / embedding 预筛失败: {e}")
+                logger.warning(f"Embedding pre-filter failed, using fuzzy only / embedding 預篩失敗: {e}")
 
         # --- Layer 2: weighted multi-dim ranking ---
-        # --- 第二层：多维加权精排 ---
+        # --- 第二層：多維加權精排 ---
         scored = []
         for bucket in candidates:
             meta = bucket.get("metadata", {})
@@ -510,7 +633,7 @@ class BucketManager:
                 # Dim 4: importance (direct normalization)
                 importance_score = max(1, min(10, int(meta.get("importance", 5)))) / 10.0
 
-                # --- Weighted sum / 加权求和 ---
+                # --- Weighted sum / 加權求和 ---
                 total = (
                     topic_score * self.w_topic
                     + emotion_score * self.w_emotion
@@ -522,19 +645,19 @@ class BucketManager:
                 normalized = (total / weight_sum) * 100 if weight_sum > 0 else 0
 
                 # Threshold check uses raw (pre-penalty) score so resolved buckets
-                # 阈值用原始分数判定，确保 resolved 桶在关键词命中时仍可被搜出
+                # 閾值用原始分數判定，確保 resolved 桶在關鍵詞命中時仍可被搜出
                 # remain reachable by keyword (penalty applied only to ranking).
                 if normalized >= self.fuzzy_threshold:
-                    # Resolved buckets get ranking penalty (but still reachable by keyword)
-                    # 已解决的桶仅在排序时降权
-                    if meta.get("resolved", False):
+                    # Resolved/digested buckets get ranking penalty (still reachable by keyword)
+                    # 已解決/已消化的桶僅在排序時降權（關鍵詞仍可召回）
+                    if meta.get("resolved", False) or meta.get("digested", False):
                         normalized *= 0.3
                     bucket["score"] = round(normalized, 2)
                     scored.append(bucket)
             except Exception as e:
                 logger.warning(
                     f"Scoring failed for bucket {bucket.get('id', '?')} / "
-                    f"桶评分失败: {e}"
+                    f"桶評分失敗: {e}"
                 )
                 continue
 
@@ -544,12 +667,12 @@ class BucketManager:
     # ---------------------------------------------------------
     # Topic relevance sub-score:
     # name(×3) + domain(×2.5) + tags(×2) + body(×1)
-    # 文本相关性子分：桶名(×3) + 主题域(×2.5) + 标签(×2) + 正文(×1)
+    # 文本相關性子分：桶名(×3) + 主題域(×2.5) + 標籤(×2) + 正文(×1)
     # ---------------------------------------------------------
     def _calc_topic_score(self, query: str, bucket: dict) -> float:
         """
         Calculate text dimension relevance score (0~1).
-        计算文本维度的相关性得分。
+        計算文本維度的相關性得分。
         """
         meta = bucket.get("metadata", {})
 
@@ -575,7 +698,7 @@ class BucketManager:
     # ---------------------------------------------------------
     # Emotion resonance sub-score:
     # Based on Russell circumplex Euclidean distance
-    # 情感共鸣子分：基于环形情感模型的欧氏距离
+    # 情感共鳴子分：基於環形情感模型的歐氏距離
     # No emotion in query → neutral 0.5 (doesn't affect ranking)
     # ---------------------------------------------------------
     def _calc_emotion_score(
@@ -583,10 +706,10 @@ class BucketManager:
     ) -> float:
         """
         Calculate emotion resonance score (0~1, closer = higher).
-        计算情感共鸣度（0~1，越近越高）。
+        計算情感共鳴度（0~1，越近越高）。
         """
         if q_valence is None or q_arousal is None:
-            return 0.5  # No emotion coordinates → neutral / 无情感坐标时给中性分
+            return 0.5  # No emotion coordinates → neutral / 無情感座標時給中性分
 
         try:
             b_valence = float(meta.get("valence", 0.5))
@@ -601,12 +724,12 @@ class BucketManager:
     # ---------------------------------------------------------
     # Time proximity sub-score:
     # More recent activation → higher score
-    # 时间亲近子分：距上次激活越近分越高
+    # 時間親近子分：距上次激活越近分越高
     # ---------------------------------------------------------
     def _calc_time_score(self, meta: dict) -> float:
         """
         Calculate time proximity score (0~1, more recent = higher).
-        计算时间亲近度。
+        計算時間親近度。
         """
         last_active_str = meta.get("last_active", meta.get("created", ""))
         try:
@@ -623,7 +746,7 @@ class BucketManager:
     async def list_all(self, include_archive: bool = False) -> list[dict]:
         """
         Recursively walk directories (including domain subdirs), list all buckets.
-        递归遍历目录（含域子目录），列出所有记忆桶。
+        遞歸遍歷目錄（含域子目錄），列出所有記憶桶。
         """
         buckets = []
 
@@ -639,20 +762,35 @@ class BucketManager:
                     if not filename.endswith(".md"):
                         continue
                     file_path = os.path.join(root, filename)
+                    # mtime cache: only re-parse files that actually changed
+                    # mtime 緩存：只重新解析有變化的文件
+                    try:
+                        mtime = os.path.getmtime(file_path)
+                    except OSError:
+                        continue
+                    cached = self._bucket_cache.get(file_path)
+                    if cached and cached[0] == mtime:
+                        buckets.append({**cached[1]})
+                        continue
                     bucket = self._load_bucket(file_path)
                     if bucket:
-                        buckets.append(bucket)
+                        self._bucket_cache[file_path] = (mtime, bucket)
+                        buckets.append({**bucket})
+
+        # Bound cache growth (stale paths from moved/deleted files)
+        if len(self._bucket_cache) > 5000:
+            self._bucket_cache.clear()
 
         return buckets
 
     # ---------------------------------------------------------
     # Statistics (counts per category + total size)
-    # 统计信息（各分类桶数量 + 总体积）
+    # 統計信息（各分類桶數量 + 總體積）
     # ---------------------------------------------------------
     async def get_stats(self) -> dict:
         """
         Return memory bucket statistics (including domain subdirs).
-        返回记忆桶的统计数据。
+        返回記憶桶的統計數據。
         """
         stats = {
             "permanent_count": 0,
@@ -680,7 +818,7 @@ class BucketManager:
                             stats["total_size_kb"] += os.path.getsize(fpath) / 1024
                         except OSError:
                             pass
-                        # Per-domain counts / 每个域的桶数量
+                        # Per-domain counts / 每個域的桶數量
                         domain_name = os.path.basename(root)
                         if domain_name != os.path.basename(subdir):
                             stats["domains"][domain_name] = stats["domains"].get(domain_name, 0) + 1
@@ -689,55 +827,85 @@ class BucketManager:
 
     # ---------------------------------------------------------
     # Archive bucket (move from permanent/dynamic into archive)
-    # 归档桶（从 permanent/dynamic 移入 archive）
+    # 歸檔桶（從 permanent/dynamic 移入 archive）
     # Called by decay engine to simulate "forgetting"
-    # 由衰减引擎调用，模拟"遗忘"
+    # 由衰減引擎調用，模擬"遺忘"
     # ---------------------------------------------------------
     async def archive(self, bucket_id: str) -> bool:
         """
         Move a bucket into the archive directory (preserving domain subdirs).
-        将指定桶移入归档目录（保留域子目录结构）。
+        將指定桶移入歸檔目錄（保留域子目錄結構）。
         """
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
 
         try:
-            # Read once, get domain info and update type / 一次性读取
+            # Read once, get domain info and update type / 一次性讀取
             post = frontmatter.load(file_path)
-            domain = post.get("domain", ["未分类"])
-            primary_domain = sanitize_name(domain[0]) if domain else "未分类"
+            domain = post.get("domain", ["未分類"])
+            primary_domain = sanitize_name(domain[0]) if domain else "未分類"
             archive_subdir = os.path.join(self.archive_dir, primary_domain)
             os.makedirs(archive_subdir, exist_ok=True)
 
             dest = safe_path(archive_subdir, os.path.basename(file_path))
 
-            # Update type marker then move file / 更新类型标记后移动文件
+            # Update type marker then move file / 更新類型標記後移動文件
             post["type"] = "archived"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            atomic_write_text(file_path, frontmatter.dumps(post))
 
             # Use shutil.move for cross-filesystem safety
-            # 使用 shutil.move 保证跨文件系统安全
+            # 使用 shutil.move 保證跨文件系統安全
             shutil.move(file_path, str(dest))
         except Exception as e:
             logger.error(
-                f"Failed to archive bucket / 归档桶失败: {bucket_id}: {e}"
+                f"Failed to archive bucket / 歸檔桶失敗: {bucket_id}: {e}"
             )
             return False
 
-        logger.info(f"Archived bucket / 归档记忆桶: {bucket_id} → archive/{primary_domain}/")
+        logger.info(f"Archived bucket / 歸檔記憶桶: {bucket_id} → archive/{primary_domain}/")
         return True
 
     # ---------------------------------------------------------
+    # Revive bucket (move from archive back into dynamic)
+    # 復活桶（從 archive 搬回 dynamic）
+    # Called when the semantic channel recalls an archived memory:
+    # forgetting is reversible when something genuinely reminds us.
+    # 語義通道勾迴歸檔記憶時調用——真的被想起來，就回來。
+    # ---------------------------------------------------------
+    async def revive(self, bucket_id: str, resolved: bool = True) -> bool:
+        """
+        Move an archived bucket back to dynamic/. Comes back resolved by default
+        so a revival doesn't flood the surfacing pool.
+        默認以 resolved 狀態迴歸，避免復活桶立刻擠佔浮現位。
+        """
+        file_path = self._find_bucket_file(bucket_id)
+        if not file_path:
+            return False
+        try:
+            post = frontmatter.load(file_path)
+            if post.get("type") != "archived":
+                return False
+            post["type"] = "dynamic"
+            post["resolved"] = resolved
+            post["last_active"] = now_iso()
+            atomic_write_text(file_path, frontmatter.dumps(post))
+            self._move_bucket(file_path, self.dynamic_dir, post.get("domain", ["未分類"]))
+            logger.info(f"Revived bucket / 復活記憶桶: {bucket_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to revive bucket / 復活桶失敗: {bucket_id}: {e}")
+            return False
+
+    # ---------------------------------------------------------
     # Internal: find bucket file across all three directories
-    # 内部：在三个目录中查找桶文件
+    # 內部：在三個目錄中查找桶文件
     # ---------------------------------------------------------
     def _find_bucket_file(self, bucket_id: str) -> Optional[str]:
         """
         Recursively search permanent/dynamic/archive for a bucket file
         matching the given ID.
-        在 permanent/dynamic/archive 中递归查找指定 ID 的桶文件。
+        在 permanent/dynamic/archive 中遞歸查找指定 ID 的桶文件。
         """
         if not bucket_id:
             return None
@@ -749,7 +917,7 @@ class BucketManager:
                     if not fname.endswith(".md"):
                         continue
                     # Match by exact ID segment in filename
-                    # 通过文件名中的 ID 片段精确匹配
+                    # 通過文件名中的 ID 片段精確匹配
                     name_part = fname[:-3]  # remove .md
                     if name_part == bucket_id or name_part.endswith(f"_{bucket_id}"):
                         return os.path.join(root, fname)
@@ -757,12 +925,12 @@ class BucketManager:
 
     # ---------------------------------------------------------
     # Internal: load bucket data from .md file
-    # 内部：从 .md 文件加载桶数据
+    # 內部：從 .md 文件加載桶數據
     # ---------------------------------------------------------
     def _load_bucket(self, file_path: str) -> Optional[dict]:
         """
         Parse a Markdown file and return structured bucket data.
-        解析 Markdown 文件，返回桶的结构化数据。
+        解析 Markdown 文件，返回桶的結構化數據。
         """
         try:
             post = frontmatter.load(file_path)
@@ -774,6 +942,6 @@ class BucketManager:
             }
         except Exception as e:
             logger.warning(
-                f"Failed to load bucket file / 加载桶文件失败: {file_path}: {e}"
+                f"Failed to load bucket file / 加載桶文件失敗: {file_path}: {e}"
             )
             return None

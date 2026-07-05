@@ -5,8 +5,11 @@
 | `OMBRE_API_KEY` | 是 | — | Gemini / OpenAI-compatible API Key，用于脱水(dehydration)和向量嵌入 |
 | `OMBRE_BASE_URL` | 否 | `https://generativelanguage.googleapis.com/v1beta/openai/` | API Base URL（可替换为代理或兼容接口） |
 | `OMBRE_TRANSPORT` | 否 | `stdio` | MCP 传输模式：`stdio` / `sse` / `streamable-http` |
+| `OMBRE_HOST` | 否 | `127.0.0.1` | HTTP/SSE 模式监听地址；公开部署请通过 nginx/Caddy 反代，不要直接暴露端口 |
+| `OMBRE_MCP_HOST` | 否 | `0.0.0.0` | FastMCP 内部 host/反代相容值；实际监听地址由 `OMBRE_HOST` 控制 |
 | `OMBRE_PORT` | 否 | `8000` | HTTP/SSE 模式监听端口（仅 `sse` / `streamable-http` 生效） |
 | `OMBRE_BUCKETS_DIR` | 否 | `./buckets` | 记忆桶文件存放目录（绑定 Docker Volume 时务必设置） |
+| `OMBRE_HOOK_TOKEN` | 否 | — | 允许反代/非本机请求访问 `/breath-hook`、`/dream-hook` 的 `X-Ombre-Hook-Token` 值；本机直连无需设置 |
 | `OMBRE_HOOK_URL` | 否 | — | Breath/Dream Webhook 推送地址（POST JSON），留空则不推送 |
 | `OMBRE_HOOK_SKIP` | 否 | `false` | 设为 `true`/`1`/`yes` 跳过 Webhook 推送（即使 `OMBRE_HOOK_URL` 已设置） |
 | `OMBRE_DASHBOARD_PASSWORD` | 否 | — | 预设 Dashboard 访问密码；设置后覆盖文件存储的密码，首次访问不弹设置向导 |
@@ -15,11 +18,14 @@
 | `OMBRE_MODEL` | 否 | — | `OMBRE_DEHYDRATION_MODEL` 的别名（前者优先） |
 | `OMBRE_EMBEDDING_MODEL` | 否 | `gemini-embedding-001` | 向量嵌入模型名（覆盖 `embedding.model`） |
 | `OMBRE_EMBEDDING_BASE_URL` | 否 | — | 向量嵌入的 API Base URL（覆盖 `embedding.base_url`；留空则复用脱水配置） |
+| `OMBRE_EMBEDDING_API_KEY` | 否 | — | 向量嵌入独立 API Key；不设置则复用 `OMBRE_API_KEY` |
+| `OMBRE_DEEPSEEK_LOW_BALANCE_USD` | 否 | `1.0` | DeepSeek 余额低于此美元数时提醒 |
 
 ## 说明
 
 - `OMBRE_API_KEY` 也可在 `config.yaml` 的 `dehydration.api_key` / `embedding.api_key` 中设置，但**强烈建议**通过环境变量传入，避免密钥写入文件。
 - `OMBRE_DASHBOARD_PASSWORD` 设置后，Dashboard 的"修改密码"功能将被禁用（显示提示，建议直接修改环境变量）。未设置则密码存储在 `{buckets_dir}/.dashboard_auth.json`（SHA-256 + salt）。
+- `/breath-hook` 与 `/dream-hook` 只给同机 SessionStart/Dreaming hooks 使用。公开域名反代时应在 nginx/Caddy 层封锁这两个根路径；如需跨机访问，设置 `OMBRE_HOOK_TOKEN` 并传入 `X-Ombre-Hook-Token`。
 
 ## Webhook 推送格式 (`OMBRE_HOOK_URL`)
 

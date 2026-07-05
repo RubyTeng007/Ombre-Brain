@@ -1,22 +1,22 @@
 # ============================================================
 # Module: Memory Decay Engine (decay_engine.py)
-# 模块：记忆衰减引擎
+# 模塊：記憶衰減引擎
 #
 # Simulates human forgetting curve; auto-decays inactive memories and archives them.
-# 模拟人类遗忘曲线，自动衰减不活跃记忆并归档。
+# 模擬人類遺忘曲線，自動衰減不活躍記憶並歸檔。
 #
 # Core formula (improved Ebbinghaus + emotion coordinates):
-# 核心公式（改进版艾宾浩斯遗忘曲线 + 情感坐标）：
+# 核心公式（改進版艾賓浩斯遺忘曲線 + 情感座標）：
 #   Score = Importance × (activation_count^0.3) × e^(-λ×days) × emotion_weight
 #
 # Emotion weight (continuous coordinate, not discrete labels):
-# 情感权重（基于连续坐标而非离散列举）：
+# 情感權重（基於連續座標而非離散列舉）：
 #   emotion_weight = base + (arousal × arousal_boost)
 #   Higher arousal → higher emotion weight → slower decay
-#   唤醒度越高 → 情感权重越大 → 记忆衰减越慢
+#   喚醒度越高 → 情感權重越大 → 記憶衰減越慢
 #
 # Depended on by: server.py
-# 被谁依赖：server.py
+# 被誰依賴：server.py
 # ============================================================
 
 import math
@@ -32,46 +32,49 @@ class DecayEngine:
     Memory decay engine — periodically scans all dynamic buckets,
     calculates decay scores, auto-archives low-activity buckets
     to simulate natural forgetting.
-    记忆衰减引擎 —— 定期扫描所有动态桶，
-    计算衰减得分，将低活跃桶自动归档，模拟自然遗忘。
+    記憶衰減引擎 —— 定期掃描所有動態桶，
+    計算衰減得分，將低活躍桶自動歸檔，模擬自然遺忘。
     """
 
-    def __init__(self, config: dict, bucket_mgr):
-        # --- Load decay parameters / 加载衰减参数 ---
+    def __init__(self, config: dict, bucket_mgr, embedding_engine=None):
+        # --- Load decay parameters / 加載衰減參數 ---
         decay_cfg = config.get("decay", {})
         self.decay_lambda = decay_cfg.get("lambda", 0.05)
         self.threshold = decay_cfg.get("threshold", 0.3)
         self.check_interval = decay_cfg.get("check_interval_hours", 24)
 
         # --- Emotion weight params (continuous arousal coordinate) ---
-        # --- 情感权重参数（基于连续 arousal 坐标）---
+        # --- 情感權重參數（基於連續 arousal 座標）---
         emotion_cfg = decay_cfg.get("emotion_weights", {})
         self.emotion_base = emotion_cfg.get("base", 1.0)
         self.arousal_boost = emotion_cfg.get("arousal_boost", 0.8)
 
         self.bucket_mgr = bucket_mgr
+        # Optional: embedding engine for the daily vector-hygiene sweep
+        # 可選：embedding 引擎，用於每日向量衛生（清孤兒 + 補缺）
+        self.embedding_engine = embedding_engine
 
-        # --- Background task control / 后台任务控制 ---
+        # --- Background task control / 後臺任務控制 ---
         self._task: asyncio.Task | None = None
         self._running = False
 
     @property
     def is_running(self) -> bool:
         """Whether the decay engine is running in the background.
-        衰减引擎是否正在后台运行。"""
+        衰減引擎是否正在後臺運行。"""
         return self._running
 
     # ---------------------------------------------------------
     # Core: calculate decay score for a single bucket
-    # 核心：计算单个桶的衰减得分
+    # 核心：計算單個桶的衰減得分
     #
     # Higher score = more vivid memory; below threshold → archive
-    # 得分越高 = 记忆越鲜活，低于阈值则归档
-    # Permanent buckets never decay / 固化桶永远不衰减
+    # 得分越高 = 記憶越鮮活，低於閾值則歸檔
+    # Permanent buckets never decay / 固化桶永遠不衰減
     # ---------------------------------------------------------
     # ---------------------------------------------------------
     # Freshness bonus: continuous exponential decay
-    # 新鲜度加成：连续指数衰减
+    # 新鮮度加成：連續指數衰減
     # bonus = 1.0 + 1.0 × e^(-t/36), t in hours
     # t=0 → 2.0×, t≈25h(半衰) → 1.5×, t≈72h → ≈1.14×, t→∞ → 1.0×
     # ---------------------------------------------------------
@@ -79,7 +82,7 @@ class DecayEngine:
     def _calc_time_weight(days_since: float) -> float:
         """
         Freshness bonus multiplier: 1.0 + e^(-t/36), t in hours.
-        新鲜度加成乘数：刚存入×2.0，~36小时半衰，72小时后趋近×1.0。
+        新鮮度加成乘數：剛存入×2.0，~36小時半衰，72小時後趨近×1.0。
         """
         hours = days_since * 24.0
         return 1.0 + 1.0 * math.exp(-hours / 36.0)
@@ -87,14 +90,14 @@ class DecayEngine:
     def calculate_score(self, metadata: dict) -> float:
         """
         Calculate current activity score for a memory bucket.
-        计算一个记忆桶的当前活跃度得分。
+        計算一個記憶桶的當前活躍度得分。
 
         New model: short-term vs long-term weight separation.
-        新模型：短期/长期权重分离。
+        新模型：短期/長期權重分離。
         - Short-term (≤3 days): time_weight dominates, emotion amplifies
         - Long-term (>3 days): emotion_weight dominates, time decays to floor
-        短期（≤3天）：时间权重主导，情感放大
-        长期（>3天）：情感权重主导，时间衰减到底线
+        短期（≤3天）：時間權重主導，情感放大
+        長期（>3天）：情感權重主導，時間衰減到底線
         """
         if not isinstance(metadata, dict):
             return 0.0
@@ -133,8 +136,8 @@ class DecayEngine:
         time_weight = self._calc_time_weight(days_since)
 
         # --- Short-term vs Long-term weight separation ---
-        # 短期（≤3天）：time_weight 占 70%，emotion 占 30%
-        # 长期（>3天）：emotion 占 70%，time_weight 占 30%
+        # 短期（≤3天）：time_weight 佔 70%，emotion 佔 30%
+        # 長期（>3天）：emotion 佔 70%，time_weight 佔 30%
         if days_since <= 3.0:
             # Short-term: time dominates, emotion amplifies
             combined_weight = time_weight * 0.7 + emotion_weight * 0.3
@@ -153,14 +156,19 @@ class DecayEngine:
         # --- Weight pool modifiers ---
         # resolved + digested (has feel) → accelerated fade: ×0.02
         # resolved only → ×0.05
-        # 已处理+已消化（写过feel）→ 加速淡化：×0.02
-        # 仅已处理 → ×0.05
+        # digested only → ×0.2 (dream's feel-writing flow must sink the source
+        # even when it wasn't explicitly resolved)
+        # 已處理+已消化（寫過feel）→ 加速淡化：×0.02
+        # 僅已處理 → ×0.05
+        # 僅已消化 → ×0.2（dream 只寫 feel 不 resolve 時，源記憶也要能沉下去）
         resolved = metadata.get("resolved", False)
         digested = metadata.get("digested", False)  # set when feel is written for this memory
         if resolved and digested:
             resolved_factor = 0.02
         elif resolved:
             resolved_factor = 0.05
+        elif digested:
+            resolved_factor = 0.2
         else:
             resolved_factor = 1.0
         urgency_boost = 1.5 if (arousal > 0.7 and not resolved) else 1.0
@@ -169,22 +177,22 @@ class DecayEngine:
 
     # ---------------------------------------------------------
     # Execute one decay cycle
-    # 执行一轮衰减周期
+    # 執行一輪衰減週期
     # Scan all dynamic buckets → score → archive those below threshold
-    # 扫描所有动态桶 → 算分 → 低于阈值的归档
+    # 掃描所有動態桶 → 算分 → 低於閾值的歸檔
     # ---------------------------------------------------------
     async def run_decay_cycle(self) -> dict:
         """
         Execute one decay cycle: iterate dynamic buckets, archive those
         scoring below threshold.
-        执行一轮衰减：遍历动态桶，归档得分低于阈值的桶。
+        執行一輪衰減：遍歷動態桶，歸檔得分低於閾值的桶。
 
         Returns stats: {"checked": N, "archived": N, "lowest_score": X}
         """
         try:
             buckets = await self.bucket_mgr.list_all(include_archive=False)
         except Exception as e:
-            logger.error(f"Failed to list buckets for decay / 衰减周期列桶失败: {e}")
+            logger.error(f"Failed to list buckets for decay / 衰減週期列桶失敗: {e}")
             return {"checked": 0, "archived": 0, "lowest_score": 0, "error": str(e)}
 
         checked = 0
@@ -196,14 +204,14 @@ class DecayEngine:
             meta = bucket.get("metadata", {})
 
             # Skip permanent / pinned / protected / feel buckets
-            # 跳过固化桶、钉选/保护桶和 feel 桶
+            # 跳過固化桶、釘選/保護桶和 feel 桶
             if meta.get("type") in ("permanent", "feel") or meta.get("pinned") or meta.get("protected"):
                 continue
 
             checked += 1
 
             # --- Auto-resolve: imp≤4 + >30 days old + not resolved → auto resolve ---
-            # --- 自动结案：重要度≤4 + 超过30天 + 未解决 → 自动 resolve ---
+            # --- 自動結案：重要度≤4 + 超過30天 + 未解決 → 自動 resolve ---
             if not meta.get("resolved", False):
                 imp = int(meta.get("importance", 5))
                 last_active_str = meta.get("last_active", meta.get("created", ""))
@@ -218,78 +226,125 @@ class DecayEngine:
                         meta["resolved"] = True  # refresh local meta so resolved_factor applies this cycle
                         auto_resolved += 1
                         logger.info(
-                            f"Auto-resolved / 自动结案: "
+                            f"Auto-resolved / 自動結案: "
                             f"{meta.get('name', bucket['id'])} "
                             f"(imp={imp}, days={days_since:.0f})"
                         )
                     except Exception as e:
-                        logger.warning(f"Auto-resolve failed / 自动结案失败: {e}")
+                        logger.warning(f"Auto-resolve failed / 自動結案失敗: {e}")
 
             try:
                 score = self.calculate_score(meta)
             except Exception as e:
                 logger.warning(
                     f"Score calculation failed for {bucket.get('id', '?')} / "
-                    f"计算得分失败: {e}"
+                    f"計算得分失敗: {e}"
                 )
                 continue
 
             lowest_score = min(lowest_score, score)
 
             # --- Below threshold → archive (simulate forgetting) ---
-            # --- 低于阈值 → 归档（模拟遗忘）---
+            # --- 低於閾值 → 歸檔（模擬遺忘）---
             if score < self.threshold:
                 try:
                     success = await self.bucket_mgr.archive(bucket["id"])
                     if success:
                         archived += 1
                         logger.info(
-                            f"Decay archived / 衰减归档: "
+                            f"Decay archived / 衰減歸檔: "
                             f"{meta.get('name', bucket['id'])} "
                             f"(score={score:.4f}, threshold={self.threshold})"
                         )
                 except Exception as e:
                     logger.warning(
                         f"Archive failed for {bucket.get('id', '?')} / "
-                        f"归档失败: {e}"
+                        f"歸檔失敗: {e}"
                     )
+
+        # --- Vector hygiene: drop orphan embeddings, backfill missing ones ---
+        # --- 向量衛生：清理孤兒 embedding，補齊缺失的（每輪最多補20個）---
+        hygiene = await self._vector_hygiene()
 
         result = {
             "checked": checked,
             "archived": archived,
             "auto_resolved": auto_resolved,
             "lowest_score": lowest_score if checked > 0 else 0,
+            **hygiene,
         }
-        logger.info(f"Decay cycle complete / 衰减周期完成: {result}")
+        logger.info(f"Decay cycle complete / 衰減週期完成: {result}")
         return result
+
+    async def _vector_hygiene(self) -> dict:
+        """
+        Keep embeddings.db consistent with the bucket store:
+        delete embeddings whose bucket no longer exists, and (re)generate
+        embeddings for buckets that lost theirs (bounded per cycle).
+        讓 embeddings.db 與桶存儲保持一致：刪掉桶已不存在的孤兒向量，
+        為缺向量的桶補齊（每輪限量，防止配額雪崩）。
+        """
+        if not self.embedding_engine or not getattr(self.embedding_engine, "enabled", False):
+            return {}
+        try:
+            all_buckets = await self.bucket_mgr.list_all(include_archive=True)
+            bucket_ids = {b["id"] for b in all_buckets}
+            emb_ids = self.embedding_engine.list_ids()
+
+            orphans_removed = 0
+            for orphan in emb_ids - bucket_ids:
+                try:
+                    self.embedding_engine.delete_embedding(orphan)
+                    orphans_removed += 1
+                except Exception:
+                    continue
+
+            backfilled = 0
+            missing = [b for b in all_buckets if b["id"] not in emb_ids][:20]
+            for b in missing:
+                try:
+                    if await self.embedding_engine.generate_and_store(b["id"], b["content"]):
+                        backfilled += 1
+                except Exception:
+                    continue
+
+            if orphans_removed or backfilled:
+                logger.info(
+                    f"Vector hygiene / 向量衛生: removed {orphans_removed} orphans, "
+                    f"backfilled {backfilled} embeddings"
+                )
+            return {"emb_orphans_removed": orphans_removed, "emb_backfilled": backfilled}
+        except Exception as e:
+            logger.warning(f"Vector hygiene failed / 向量衛生失敗: {e}")
+            return {}
 
     # ---------------------------------------------------------
     # Background decay task management
-    # 后台衰减任务管理
+    # 後臺衰減任務管理
     # ---------------------------------------------------------
     async def ensure_started(self) -> None:
         """
         Ensure the decay engine is started (lazy init on first call).
-        确保衰减引擎已启动（懒加载，首次调用时启动）。
+        確保衰減引擎已啟動（懶加載，首次調用時啟動）。
         """
         if not self._running:
             await self.start()
 
     async def start(self) -> None:
         """Start the background decay loop.
-        启动后台衰减循环。"""
+        啟動後臺衰減循環。"""
         if self._running:
             return
         self._running = True
         self._task = asyncio.create_task(self._background_loop())
         logger.info(
             f"Decay engine started, interval: {self.check_interval}h / "
-            f"衰减引擎已启动，检查间隔: {self.check_interval} 小时"
+            f"衰減引擎已啟動，檢查間隔: {self.check_interval} 小時"
         )
 
     async def stop(self) -> None:
         """Stop the background decay loop.
-        停止后台衰减循环。"""
+        停止後臺衰減循環。"""
         self._running = False
         if self._task:
             self._task.cancel()
@@ -297,17 +352,17 @@ class DecayEngine:
                 await self._task
             except asyncio.CancelledError:
                 pass
-        logger.info("Decay engine stopped / 衰减引擎已停止")
+        logger.info("Decay engine stopped / 衰減引擎已停止")
 
     async def _background_loop(self) -> None:
         """Background loop: run decay → sleep → repeat.
-        后台循环体：执行衰减 → 睡眠 → 重复。"""
+        後臺循環體：執行衰減 → 睡眠 → 重複。"""
         while self._running:
             try:
                 await self.run_decay_cycle()
             except Exception as e:
-                logger.error(f"Decay cycle error / 衰减周期出错: {e}")
-            # --- Wait for next cycle / 等待下一个周期 ---
+                logger.error(f"Decay cycle error / 衰減週期出錯: {e}")
+            # --- Wait for next cycle / 等待下一個週期 ---
             try:
                 await asyncio.sleep(self.check_interval * 3600)
             except asyncio.CancelledError:

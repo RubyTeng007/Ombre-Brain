@@ -72,7 +72,7 @@
 
 ### 技术能力
 
-**7 个 MCP 工具**
+**6 个 MCP 工具**
 
 | 工具 | 关键参数 | 功能 |
 |---|---|---|
@@ -82,7 +82,6 @@
 | `trace` | bucket_id, name, domain, valence, arousal, importance, tags, resolved, pinned, digested, content, delete | 修改元数据/内容/删除 |
 | `pulse` | include_archive | 系统状态 |
 | `dream` | （无） | 做梦自省 |
-| `shelf` | action, book_id, query, title, author, status, summary, ruby_notes, cyan_notes, tags, excerpts_json, quote 等 | 共讀書架 CRUD 与搜索 |
 
 **工具详细行为**
 
@@ -199,7 +198,7 @@
 
 ```
                     ┌──────────────┐
-                    │  server.py   │  MCP 主入口，7 个工具 + Dashboard + Hook
+                    │  server.py   │  MCP 主入口，6 个工具 + Dashboard + Hook
                     └──────┬───────┘
            ┌───────────────┼───────────────┬────────────────┐
            ▼               ▼               ▼                ▼
@@ -214,8 +213,7 @@
 
 | 文件 | 职责 | 依赖（项目内） | 被谁调用 |
 |---|---|---|---|
-| `server.py` | MCP 服务器主入口，注册工具 + Dashboard API + 钩子端点 | `bucket_manager`, `dehydrator`, `decay_engine`, `embedding_engine`, `reading_shelf`, `utils` | `test_tools.py` |
-| `reading_shelf.py` | 共讀書架 JSON 持久化、查询与 CRUD | 无 | `server.py`, `tests/test_reading_shelf.py` |
+| `server.py` | MCP 服务器主入口，注册工具 + Dashboard API + 钩子端点 | `bucket_manager`, `dehydrator`, `decay_engine`, `embedding_engine`, `utils` | `test_tools.py` |
 | `bucket_manager.py` | 记忆桶 CRUD、多维索引搜索、wikilink 注入、激活更新 | `utils` | `server.py`, `check_buckets.py`, `backfill_embeddings.py` |
 | `decay_engine.py` | 衰减引擎：遗忘曲线计算、自动归档、自动结案 | 无（接收 `bucket_mgr` 实例） | `server.py` |
 | `dehydrator.py` | 数据脱水压缩 + 合并 + 自动打标（仅 LLM API，不可用时报 RuntimeError） | `utils` | `server.py` |

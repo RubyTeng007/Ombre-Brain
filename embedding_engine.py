@@ -1,14 +1,14 @@
 # ============================================================
 # Module: Embedding Engine (embedding_engine.py)
-# 模块：向量化引擎
+# 模塊：向量化引擎
 #
 # Generates embeddings via Gemini API (OpenAI-compatible),
 # stores them in SQLite, and provides cosine similarity search.
-# 通过 Gemini API（OpenAI 兼容）生成 embedding，
-# 存储在 SQLite 中，提供余弦相似度搜索。
+# 通過 Gemini API（OpenAI 兼容）生成 embedding，
+# 存儲在 SQLite 中，提供餘弦相似度搜索。
 #
 # Depended on by: server.py, bucket_manager.py
-# 被谁依赖：server.py, bucket_manager.py
+# 被誰依賴：server.py, bucket_manager.py
 # ============================================================
 
 import os
@@ -25,7 +25,7 @@ logger = logging.getLogger("ombre_brain.embedding")
 class EmbeddingEngine:
     """
     Embedding generation + SQLite vector storage + cosine search.
-    向量生成 + SQLite 向量存储 + 余弦搜索。
+    向量生成 + SQLite 向量存儲 + 餘弦搜索。
     """
 
     def __init__(self, config: dict):
@@ -40,6 +40,8 @@ class EmbeddingEngine:
         )
         self.model = embed_cfg.get("model", "gemini-embedding-001")
         self.enabled = bool(self.api_key) and embed_cfg.get("enabled", True)
+        self.last_error = ""
+        self.last_success = False
 
         # --- SQLite path: buckets_dir/embeddings.db ---
         db_path = os.path.join(config["buckets_dir"], "embeddings.db")
@@ -62,6 +64,8 @@ class EmbeddingEngine:
         """Create embeddings table if not exists."""
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         conn = sqlite3.connect(self.db_path)
+        # WAL 模式：大幅降低並發存取時 "database is locked" 機率（檔案層級設定，持久生效）
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS embeddings (
                 bucket_id TEXT PRIMARY KEY,
@@ -75,19 +79,29 @@ class EmbeddingEngine:
     async def generate_and_store(self, bucket_id: str, content: str) -> bool:
         """
         Generate embedding for content and store in SQLite.
-        为内容生成 embedding 并存入 SQLite。
+        為內容生成 embedding 並存入 SQLite。
         Returns True on success, False on failure.
         """
         if not self.enabled or not content or not content.strip():
+            self.last_success = False
+            if not self.enabled:
+                self.last_error = "embedding disabled or API key missing"
             return False
 
         try:
             embedding = await self._generate_embedding(content)
             if not embedding:
+                self.last_success = False
+                if not self.last_error:
+                    self.last_error = "embedding API returned no vector"
                 return False
             self._store_embedding(bucket_id, embedding)
+            self.last_success = True
+            self.last_error = ""
             return True
         except Exception as e:
+            self.last_success = False
+            self.last_error = str(e)
             logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
             return False
 
@@ -102,8 +116,10 @@ class EmbeddingEngine:
             )
             if response.data and len(response.data) > 0:
                 return response.data[0].embedding
+            self.last_error = "embedding API returned no data"
             return []
         except Exception as e:
+            self.last_error = str(e)
             logger.warning(f"Embedding API call failed: {e}")
             return []
 
@@ -125,6 +141,13 @@ class EmbeddingEngine:
         conn.commit()
         conn.close()
 
+    def list_ids(self) -> set[str]:
+        """All bucket_ids that currently have a stored embedding (for hygiene sweeps)."""
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute("SELECT bucket_id FROM embeddings").fetchall()
+        conn.close()
+        return {r[0] for r in rows}
+
     async def get_embedding(self, bucket_id: str) -> list[float] | None:
         """Retrieve stored embedding for a bucket. Returns None if not found."""
         conn = sqlite3.connect(self.db_path)
@@ -143,7 +166,7 @@ class EmbeddingEngine:
         """
         Search for buckets similar to query text.
         Returns list of (bucket_id, similarity_score) sorted by score desc.
-        搜索与查询文本相似的桶。返回 (bucket_id, 相似度分数) 列表。
+        搜索與查詢文本相似的桶。返回 (bucket_id, 相似度分數) 列表。
         """
         if not self.enabled:
             return []

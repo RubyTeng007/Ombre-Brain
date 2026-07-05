@@ -1,34 +1,36 @@
 # ============================================================
 # Module: MCP Server Entry Point (server.py)
-# 模块：MCP 服务器主入口
+# 模塊：MCP 服務器主入口
 #
 # Starts the Ombre Brain MCP service and registers memory
 # operation tools for Claude to call.
-# 启动 Ombre Brain MCP 服务，注册记忆操作工具供 Claude 调用。
+# 啟動 Ombre Brain MCP 服務，註冊記憶操作工具供 Claude 調用。
 #
 # Core responsibilities:
-# 核心职责：
+# 核心職責：
 #   - Initialize config, bucket manager, dehydrator, decay engine
-#     初始化配置、记忆桶管理器、脱水器、衰减引擎
-#   - Expose 7 MCP tools:
-#     暴露 7 个 MCP 工具：
+#     初始化配置、記憶桶管理器、脫水器、衰減引擎
+#   - Expose 8 MCP tools:
+#     暴露 8 個 MCP 工具：
 #       breath — Surface unresolved memories or search by keyword
-#                浮现未解决记忆 或 按关键词检索
+#                浮現未解決記憶 或 按關鍵詞檢索
 #       hold   — Store a single memory (or write a `feel` reflection)
-#                存储单条记忆（或写 feel 反思）
+#                存儲單條記憶（或寫 feel 反思）
 #       grow   — Diary digest, auto-split into multiple buckets
-#                日记归档，自动拆分多桶
+#                日記歸檔，自動拆分多桶
 #       trace  — Modify metadata / resolved / delete
-#                修改元数据 / resolved 标记 / 删除
+#                修改元數據 / resolved 標記 / 刪除
 #       pulse  — System status + bucket listing
-#                系统状态 + 所有桶列表
+#                系統狀態 + 所有桶列表
+#       api_usage — Check DeepSeek balance + Gemini embedding availability
+#                檢查 DeepSeek 餘額與 Gemini embedding 可用性
 #       dream  — Surface recent dynamic buckets for self-digestion
-#                返回最近桶 供模型自省/写 feel
+#                返回最近桶 供模型自省/寫 feel
 #       shelf  — Read and write the shared-reading shelf
-#                读取、搜索与修改共读书架
+#                讀取、搜索與修改共讀書架
 #
 # Startup:
-# 启动方式：
+# 啟動方式：
 #   Local:  python server.py
 #   Remote: OMBRE_TRANSPORT=streamable-http python server.py
 #   Docker: docker-compose up
@@ -48,7 +50,7 @@ import httpx
 
 
 # --- Ensure same-directory modules can be imported ---
-# --- 确保同目录下的模块能被正确导入 ---
+# --- 確保同目錄下的模塊能被正確導入 ---
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mcp.server.fastmcp import FastMCP
@@ -59,24 +61,32 @@ from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from reading_shelf import ReadingShelfStore
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
+from letters import LetterStore
+from self_concept import SelfConceptStore
+from api_usage_guard import ApiUsageGuard
+import desire as desire_kernel
+from datetime import datetime, timedelta
 
-# --- Load config & init logging / 加载配置 & 初始化日志 ---
+from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, now_iso
+
+# --- Load config & init logging / 加載配置 & 初始化日誌 ---
 config = load_config()
 setup_logging(config.get("log_level", "INFO"))
 logger = logging.getLogger("ombre_brain")
 
-# --- Runtime env vars (port + webhook) / 运行时环境变量 ---
-# OMBRE_PORT: HTTP/SSE 监听端口，默认 8000
+# --- Runtime env vars (port + webhook) / 運行時環境變量 ---
+# OMBRE_PORT: HTTP/SSE 監聽端口，默認 8000
 try:
     OMBRE_PORT = int(os.environ.get("OMBRE_PORT", "8000") or "8000")
 except ValueError:
-    logger.warning("OMBRE_PORT 不是合法整数，回退到 8000")
+    logger.warning("OMBRE_PORT 不是合法整數，回退到 8000")
     OMBRE_PORT = 8000
+OMBRE_HOST = os.environ.get("OMBRE_HOST", "127.0.0.1").strip() or "127.0.0.1"
+OMBRE_MCP_HOST = os.environ.get("OMBRE_MCP_HOST", "0.0.0.0").strip() or "0.0.0.0"
 
-# OMBRE_HOOK_URL: 在 breath/dream 被调用后推送事件到该 URL（POST JSON）。
-# OMBRE_HOOK_SKIP: 设为 true/1/yes 跳过推送。
-# 详见 ENV_VARS.md。
+# OMBRE_HOOK_URL: 在 breath/dream 被調用後推送事件到該 URL（POST JSON）。
+# OMBRE_HOOK_SKIP: 設為 true/1/yes 跳過推送。
+# 詳見 ENV_VARS.md。
 OMBRE_HOOK_URL = os.environ.get("OMBRE_HOOK_URL", "").strip()
 OMBRE_HOOK_SKIP = os.environ.get("OMBRE_HOOK_SKIP", "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -99,27 +109,48 @@ async def _fire_webhook(event: str, payload: dict) -> None:
     except Exception as e:
         logger.warning(f"Webhook push failed ({event} → {OMBRE_HOOK_URL}): {e}")
 
-# --- Initialize core components / 初始化核心组件 ---
-embedding_engine = EmbeddingEngine(config)            # Embedding engine first (BucketManager depends on it)
-bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket manager / 记忆桶管理器
-dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
-decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
-import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
-reading_shelf = ReadingShelfStore(config["buckets_dir"])
 
-# --- Create MCP server instance / 创建 MCP 服务器实例 ---
-# host="0.0.0.0" so Docker container's SSE is externally reachable
+async def _api_usage_warning_suffix(probe_gemini: bool = False) -> str:
+    """Return a short warning suffix for memory write results."""
+    try:
+        usage = await api_usage_guard.check_all(probe_gemini=probe_gemini)
+    except Exception as e:
+        logger.warning(f"API usage guard failed: {e}")
+        return ""
+    warnings = usage.get("warnings") or []
+    if embedding_engine.enabled and getattr(embedding_engine, "last_error", ""):
+        warnings.append(f"Gemini embedding 最近一次生成失敗：{embedding_engine.last_error}")
+    if not warnings:
+        return ""
+    return "\n⚠ API額度提醒：" + "；".join(warnings)
+
+# --- Initialize core components / 初始化核心組件 ---
+embedding_engine = EmbeddingEngine(config)            # Embedding engine first (BucketManager depends on it)
+bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket manager / 記憶桶管理器
+dehydrator = Dehydrator(config)                      # Dehydrator / 脫水器
+decay_engine = DecayEngine(config, bucket_mgr, embedding_engine)  # Decay engine / 衰減引擎（含向量衛生）
+import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 導入引擎
+reading_shelf = ReadingShelfStore(config["buckets_dir"])
+letter_store = LetterStore(config["buckets_dir"])
+self_concept_store = SelfConceptStore(config["buckets_dir"])
+api_usage_guard = ApiUsageGuard(config, dehydrator=dehydrator, embedding_engine=embedding_engine)
+desire_store = desire_kernel.DesireStore(config["buckets_dir"])  # 慾望系統（Phase 1 只讀內核）
+
+# --- Create MCP server instance / 創建 MCP 服務器實例 ---
+# OMBRE_HOST controls the actual uvicorn bind address. OMBRE_MCP_HOST is kept
+# separate because FastMCP also uses its host value when validating proxied
+# HTTP requests.
 # stdio mode ignores host (no network)
 mcp = FastMCP(
     "Ombre Brain",
-    host="0.0.0.0",
+    host=OMBRE_MCP_HOST,
     port=OMBRE_PORT,
 )
 
 
 # =============================================================
 # Dashboard Auth — simple cookie-based session auth
-# Dashboard 认证 —— 基于 Cookie 的会话认证
+# Dashboard 認證 —— 基於 Cookie 的會話認證
 #
 # Env var OMBRE_DASHBOARD_PASSWORD overrides file-stored password.
 # First visit with no password set → forced setup wizard.
@@ -207,6 +238,47 @@ def _require_auth(request):
     return None
 
 
+def _is_loopback_host(host: str) -> bool:
+    return host in ("127.0.0.1", "::1", "localhost")
+
+
+def _is_direct_loopback_request(request) -> bool:
+    # Reverse proxies normally add one of these headers; treat those as public
+    # traffic even when the socket peer is 127.0.0.1.
+    forwarded_headers = ("x-forwarded-for", "x-real-ip", "cf-connecting-ip", "forwarded")
+    if any(request.headers.get(h) for h in forwarded_headers):
+        return False
+    client = getattr(request, "client", None)
+    return bool(client and _is_loopback_host(client.host))
+
+
+def _require_hook_access(request):
+    """Protect session hooks while keeping same-machine startup hooks working."""
+    from starlette.responses import PlainTextResponse
+    expected = os.environ.get("OMBRE_HOOK_TOKEN", "").strip()
+    supplied = request.headers.get("x-ombre-hook-token", "")
+    if expected and secrets.compare_digest(supplied, expected):
+        return None
+    if _is_direct_loopback_request(request):
+        return None
+    return PlainTextResponse("", status_code=404)
+
+
+def _require_read_access(request):
+    """Dashboard session OR same-machine trust (loopback direct / hook token).
+
+    Read-only guard for the Cyan web memory room: web.ts proxies these GETs
+    over 127.0.0.1 — the same trust model as breath-hook/dream-hook. Public
+    traffic still needs the dashboard session cookie.
+    """
+    if _is_authenticated(request):
+        return None
+    if _require_hook_access(request) is None:
+        return None
+    # Public and unauthenticated: same 401 (+setup_needed) the dashboard expects.
+    return _require_auth(request)
+
+
 # --- Auth endpoints ---
 @mcp.custom_route("/auth/status", methods=["GET"])
 async def auth_status(request):
@@ -230,7 +302,7 @@ async def auth_setup_endpoint(request):
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
     password = body.get("password", "").strip()
     if len(password) < 6:
-        return JSONResponse({"error": "密码不能少于6位"}, status_code=400)
+        return JSONResponse({"error": "密碼不能少於6位"}, status_code=400)
     _save_password_hash(password)
     token = _create_session()
     resp = JSONResponse({"ok": True})
@@ -252,7 +324,7 @@ async def auth_login(request):
         resp = JSONResponse({"ok": True})
         resp.set_cookie("ombre_session", token, httponly=True, samesite="lax", max_age=86400 * 7)
         return resp
-    return JSONResponse({"error": "密码错误"}, status_code=401)
+    return JSONResponse({"error": "密碼錯誤"}, status_code=401)
 
 
 @mcp.custom_route("/auth/logout", methods=["POST"])
@@ -275,7 +347,7 @@ async def auth_change_password(request):
     if err:
         return err
     if os.environ.get("OMBRE_DASHBOARD_PASSWORD", ""):
-        return JSONResponse({"error": "当前使用环境变量密码，请直接修改 OMBRE_DASHBOARD_PASSWORD"}, status_code=400)
+        return JSONResponse({"error": "當前使用環境變量密碼，請直接修改 OMBRE_DASHBOARD_PASSWORD"}, status_code=400)
     try:
         body = await request.json()
     except Exception:
@@ -283,9 +355,9 @@ async def auth_change_password(request):
     current = body.get("current", "")
     new_pwd = body.get("new", "").strip()
     if not _verify_any_password(current):
-        return JSONResponse({"error": "当前密码错误"}, status_code=401)
+        return JSONResponse({"error": "當前密碼錯誤"}, status_code=401)
     if len(new_pwd) < 6:
-        return JSONResponse({"error": "新密码不能少于6位"}, status_code=400)
+        return JSONResponse({"error": "新密碼不能少於6位"}, status_code=400)
     _save_password_hash(new_pwd)
     _sessions.clear()
     token = _create_session()
@@ -296,9 +368,9 @@ async def auth_change_password(request):
 
 # =============================================================
 # /health endpoint: lightweight keepalive
-# 轻量保活接口
+# 輕量保活接口
 # For Cloudflare Tunnel or reverse proxy to ping, preventing idle timeout
-# 供 Cloudflare Tunnel 或反代定期 ping，防止空闲超时断连
+# 供 Cloudflare Tunnel 或反代定期 ping，防止空閒超時斷連
 # =============================================================
 @mcp.custom_route("/", methods=["GET"])
 async def root_redirect(request):
@@ -322,11 +394,14 @@ async def health_check(request):
 
 # =============================================================
 # /breath-hook endpoint: Dedicated hook for SessionStart
-# 会话启动专用挂载点
+# 會話啟動專用掛載點
 # =============================================================
 @mcp.custom_route("/breath-hook", methods=["GET"])
 async def breath_hook(request):
     from starlette.responses import PlainTextResponse
+    denied = _require_hook_access(request)
+    if denied:
+        return denied
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         # pinned
@@ -334,6 +409,7 @@ async def breath_hook(request):
         # top 2 unresolved by score
         unresolved = [b for b in all_buckets
                       if not b["metadata"].get("resolved", False)
+                      and not b["metadata"].get("digested", False)
                       and b["metadata"].get("type") not in ("permanent", "feel")
                       and not b["metadata"].get("pinned")
                       and not b["metadata"].get("protected")]
@@ -341,9 +417,41 @@ async def breath_hook(request):
 
         parts = []
         token_budget = 10000
+        # 💌 各方最新一封信（永久保存的交接信，醒來先讀，續上而非冷啟動）
+        try:
+            _latest = letter_store.latest_per_author()
+            for _who in ("Ruby", "Cyan"):
+                _lt = _latest.get(_who)
+                if not _lt:
+                    continue
+                _snip = _lt.get("content", "")
+                if len(_snip) > 4000:
+                    _snip = _snip[:4000] + "…（完整請用 letter read）"
+                parts.append(f"💌 [{_who} 的最新一封信｜{_lt.get('letter_date', '')}] {_snip}")
+                token_budget -= count_tokens_approx(_snip)
+        except Exception as _e:
+            logger.warning(f"letter surface failed: {_e}")
+        # === 自我 === 各面向最新一條（自我概念，醒來先認得自己是誰）
+        try:
+            _self = self_concept_store.latest_per_aspect()
+            _lines = []
+            for _a in ("nature", "values", "patterns", "limits", "becoming", "uncertainty", "stance"):
+                _e2 = _self.get(_a)
+                if not _e2:
+                    continue
+                _c = _e2.get("content", "")
+                if len(_c) > 200:
+                    _c = _c[:200] + "…"
+                _lines.append(f"  {_a}: {_c}")
+            if _lines:
+                _block = "=== 自我 ===\n" + "\n".join(_lines)
+                parts.append(_block)
+                token_budget -= count_tokens_approx(_block)
+        except Exception as _e:
+            logger.warning(f"self-concept surface failed: {_e}")
         for b in pinned:
             summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
-            parts.append(f"📌 [核心准则] {summary}")
+            parts.append(f"📌 [核心準則] {summary}")
             token_budget -= count_tokens_approx(summary)
 
         # Diversity: top-1 fixed + shuffle rest from top-20
@@ -369,7 +477,7 @@ async def breath_hook(request):
         if not parts:
             await _fire_webhook("breath_hook", {"surfaced": 0})
             return PlainTextResponse("")
-        body_text = "[Ombre Brain - 记忆浮现]\n" + "\n---\n".join(parts)
+        body_text = "[Ombre Brain - 記憶浮現]\n" + "\n---\n".join(parts)
         await _fire_webhook("breath_hook", {"surfaced": len(parts), "chars": len(body_text)})
         return PlainTextResponse(body_text)
     except Exception as e:
@@ -379,11 +487,14 @@ async def breath_hook(request):
 
 # =============================================================
 # /dream-hook endpoint: Dedicated hook for Dreaming
-# Dreaming 专用挂载点
+# Dreaming 專用掛載點
 # =============================================================
 @mcp.custom_route("/dream-hook", methods=["GET"])
 async def dream_hook(request):
     from starlette.responses import PlainTextResponse
+    denied = _require_hook_access(request)
+    if denied:
+        return denied
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         candidates = [
@@ -391,6 +502,7 @@ async def dream_hook(request):
             if b["metadata"].get("type") not in ("permanent", "feel")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
+            and not b["metadata"].get("digested", False)
         ]
         candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
         recent = candidates[:10]
@@ -401,7 +513,7 @@ async def dream_hook(request):
         parts = []
         for b in recent:
             meta = b["metadata"]
-            resolved_tag = "[已解决]" if meta.get("resolved", False) else "[未解决]"
+            resolved_tag = "[已解決]" if meta.get("resolved", False) else "[未解決]"
             parts.append(
                 f"{meta.get('name', b['id'])} {resolved_tag} "
                 f"V{meta.get('valence', 0.5):.1f}/A{meta.get('arousal', 0.3):.1f}\n"
@@ -418,10 +530,30 @@ async def dream_hook(request):
 
 # =============================================================
 # Internal helper: merge-or-create
-# 内部辅助：检查是否可合并，可以则合并，否则新建
+# 內部輔助：檢查是否可合併，可以則合併，否則新建
 # Shared by hold and grow to avoid duplicate logic
-# hold 和 grow 共用，避免重复逻辑
+# hold 和 grow 共用，避免重複邏輯
 # =============================================================
+def _log_merge_audit(bucket_id: str, old_content: str, new_content: str, merged: str, mode: str) -> None:
+    """Append a merge record to merge_audit.jsonl — merging is the only destructive
+    write in the pipeline, so every merge keeps a recoverable before/after trail.
+    合併是寫入鏈路裡唯一的破壞性操作，每次都留可恢復的前後記錄。"""
+    try:
+        path = os.path.join(config["buckets_dir"], "merge_audit.jsonl")
+        entry = {
+            "ts": now_iso(),
+            "bucket_id": bucket_id,
+            "mode": mode,
+            "old_content": old_content,
+            "new_content": new_content,
+            "merged": merged,
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(_json_lib.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"Merge audit log failed / 合併審計記錄失敗: {e}")
+
+
 async def _merge_or_create(
     content: str,
     tags: list,
@@ -434,22 +566,58 @@ async def _merge_or_create(
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
     Returns (bucket_id_or_name, is_merged).
-    检查是否有相似桶可合并，有则合并，无则新建。
-    返回 (桶ID或名称, 是否合并)。
+    檢查是否有相似桶可合併，有則合併，無則新建。
+    返回 (桶ID或名稱, 是否合併)。
     """
     try:
         existing = await bucket_mgr.search(content, limit=1, domain_filter=domain or None)
     except Exception as e:
-        logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
+        logger.warning(f"Search for merge failed, creating new / 合併搜索失敗，新建: {e}")
         existing = []
 
     if existing and existing[0].get("score", 0) > config.get("merge_threshold", 75):
         bucket = existing[0]
+        semantic_ok = True
         # --- Never merge into pinned/protected buckets ---
-        # --- 不合并到钉选/保护桶 ---
+        # --- 不合併到釘選/保護桶 ---
         if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
+            # --- Semantic gate: fuzzy score mixes time/emotion/importance (topic is
+            # only 47% of it), so same-day similar-mood content can cross the bar.
+            # Require real semantic similarity before a destructive merge.
+            # --- 語義閘門：模糊分數混入時間/情感/重要度權重，同日同情緒的內容
+            # 可能誤過線。破壞性合併前要求向量相似度達標。---
+            semantic_ok = True
+            if embedding_engine and embedding_engine.enabled:
+                try:
+                    emb_new = await embedding_engine._generate_embedding(content)
+                    emb_old = await embedding_engine.get_embedding(bucket["id"])
+                    if emb_new and emb_old:
+                        sim = embedding_engine._cosine_similarity(emb_new, emb_old)
+                        semantic_ok = sim >= config.get("merge_semantic_min", 0.86)
+                        if not semantic_ok:
+                            logger.info(
+                                f"Merge vetoed by semantic gate / 語義閘門否決合併: "
+                                f"{bucket['id']} sim={sim:.3f}"
+                            )
+                except Exception as e:
+                    logger.warning(f"Semantic gate check failed, allowing merge / 語義閘門檢查失敗: {e}")
+        if (
+            not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected"))
+            and semantic_ok
+        ):
             try:
-                merged = await dehydrator.merge(bucket["content"], content)
+                # --- Long buckets skip the LLM rewrite (input is truncated at 2000
+                # chars and output replaces the whole bucket → tail loss). Append
+                # verbatim instead; nothing is ever silently eaten.
+                # --- 長桶跳過 LLM 改寫（輸入截斷2000字、輸出整桶覆蓋會吃掉尾部），
+                # 改為原文附加，絕不靜默丟內容。---
+                if len(bucket["content"]) > 2000:
+                    merged = bucket["content"].rstrip() + "\n\n---\n" + content.strip()
+                    merge_mode = "append"
+                else:
+                    merged = await dehydrator.merge(bucket["content"], content)
+                    merge_mode = "llm"
+                _log_merge_audit(bucket["id"], bucket["content"], content, merged, merge_mode)
                 old_v = bucket["metadata"].get("valence", 0.5)
                 old_a = bucket["metadata"].get("arousal", 0.3)
                 merged_valence = round((old_v + valence) / 2, 2)
@@ -470,7 +638,7 @@ async def _merge_or_create(
                     pass
                 return bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
-                logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
+                logger.warning(f"Merge failed, creating new / 合併失敗，新建: {e}")
 
     bucket_id = await bucket_mgr.create(
         content=content,
@@ -494,9 +662,9 @@ async def _merge_or_create(
 # 工具 1：breath — 呼吸
 #
 # No args: surface highest-weight unresolved memories (active push)
-# 无参数：浮现权重最高的未解决记忆
+# 無參數：浮現權重最高的未解決記憶
 # With args: search by keyword + emotion coordinates
-# 有参数：按关键词+情感坐标检索记忆
+# 有參數：按關鍵詞+情感座標檢索記憶
 # =============================================================
 @mcp.tool()
 async def breath(
@@ -508,27 +676,28 @@ async def breath(
     max_results: int = 20,
     importance_min: int = -1,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。"""
+    """檢索/浮現記憶。不傳query或傳空=自動浮現,有query=關鍵詞檢索。max_tokens控制返回總token上限(默認10000)。domain逗號分隔,valence/arousal 0~1(-1忽略)。max_results控制返回數量上限(默認20,最大50)。importance_min>=1時按重要度批量拉取(不走語義搜索,按importance降序返回最多20條)。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
 
     # --- importance_min mode: bulk fetch by importance threshold ---
-    # --- 重要度批量拉取模式：跳过语义搜索，按 importance 降序返回 ---
+    # --- 重要度批量拉取模式：跳過語義搜索，按 importance 降序返回 ---
     if importance_min >= 1:
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
         except Exception as e:
-            return f"记忆系统暂时无法访问: {e}"
+            return f"記憶系統暫時無法訪問: {e}"
         filtered = [
             b for b in all_buckets
             if int(b["metadata"].get("importance", 0)) >= importance_min
             and b["metadata"].get("type") not in ("feel",)
+            and not b["metadata"].get("digested", False)
         ]
         filtered.sort(key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True)
         filtered = filtered[:20]
         if not filtered:
-            return f"没有重要度 >= {importance_min} 的记忆。"
+            return f"沒有重要度 >= {importance_min} 的記憶。"
         results = []
         token_used = 0
         for b in filtered:
@@ -545,19 +714,45 @@ async def breath(
                 token_used += t
             except Exception as e:
                 logger.warning(f"importance_min dehydrate failed: {e}")
-        return "\n---\n".join(results) if results else "没有可以展示的记忆。"
+        return "\n---\n".join(results) if results else "沒有可以展示的記憶。"
+
+    # --- Feel retrieval: domain="feel" is a special channel ---
+    # --- Feel 檢索：domain="feel" 是獨立入口（必須在空 query 浮現之前判斷，否則空 query 會被浮現分支攔截）---
+    if domain.strip().lower() == "feel":
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+            feels = [
+                b for b in all_buckets
+                if b["metadata"].get("type") == "feel"
+                and not b["metadata"].get("digested", False)
+            ]
+            feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+            if not feels:
+                return "沒有留下過 feel。"
+            feels = feels[:max_results]
+            results = []
+            for f in feels:
+                created = f["metadata"].get("created", "")
+                entry = f"[{created}] [bucket_id:{f['id']}]\n{strip_wikilinks(f['content'])}"
+                results.append(entry)
+                if count_tokens_approx("\n---\n".join(results)) > max_tokens:
+                    break
+            return "=== 你留下的 feel ===\n" + "\n---\n".join(results)
+        except Exception as e:
+            logger.error(f"Feel retrieval failed: {e}")
+            return "讀取 feel 失敗。"
 
     # --- No args or empty query: surfacing mode (weight pool active push) ---
-    # --- 无参数或空query：浮现模式（权重池主动推送）---
+    # --- 無參數或空query：浮現模式（權重池主動推送）---
     if not query or not query.strip():
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
         except Exception as e:
-            logger.error(f"Failed to list buckets for surfacing / 浮现列桶失败: {e}")
-            return "记忆系统暂时无法访问。"
+            logger.error(f"Failed to list buckets for surfacing / 浮現列桶失敗: {e}")
+            return "記憶系統暫時無法訪問。"
 
         # --- Pinned/protected buckets: always surface as core principles ---
-        # --- 钉选桶：作为核心准则，始终浮现 ---
+        # --- 釘選桶：作為核心準則，始終浮現 ---
         pinned_buckets = [
             b for b in all_buckets
             if b["metadata"].get("pinned") or b["metadata"].get("protected")
@@ -567,16 +762,17 @@ async def breath(
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
+                pinned_results.append(f"📌 [核心準則] [bucket_id:{b['id']}] {summary}")
             except Exception as e:
-                logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
+                logger.warning(f"Failed to dehydrate pinned bucket / 釘選桶脫水失敗: {e}")
                 continue
 
         # --- Unresolved buckets: surface top N by weight ---
-        # --- 未解决桶：按权重浮现前 N 条 ---
+        # --- 未解決桶：按權重浮現前 N 條 ---
         unresolved = [
             b for b in all_buckets
             if not b["metadata"].get("resolved", False)
+            and not b["metadata"].get("digested", False)
             and b["metadata"].get("type") not in ("permanent", "feel")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
@@ -598,11 +794,22 @@ async def breath(
             logger.info(f"Top unresolved scores: {top_scores}")
 
         # --- Cold-start detection: never-seen important buckets surface first ---
-        # --- 冷启动检测：从未被访问过且重要度>=8的桶优先插入最前面（最多2个）---
+        # Recency-limited to 7 days: surfacing never touches, so without the limit
+        # the same untouched buckets would headline every single wake-up forever.
+        # --- 冷啟動檢測：從未被訪問過且重要度>=8的桶優先插入最前面（最多2個）---
+        # 限最近7天：浮現不 touch，不加時限的話同兩個桶會永遠霸佔開場。
+        def _is_recent(meta: dict, days: int = 7) -> bool:
+            try:
+                created = datetime.fromisoformat(str(meta.get("created", "")))
+                return datetime.now() - created <= timedelta(days=days)
+            except (ValueError, TypeError):
+                return False
+
         cold_start = [
             b for b in unresolved
-            if int(b["metadata"].get("activation_count", 0)) == 0
+            if float(b["metadata"].get("activation_count", 0)) == 0
             and int(b["metadata"].get("importance", 0)) >= 8
+            and _is_recent(b["metadata"])
         ][:2]
         cold_start_ids = {b["id"] for b in cold_start}
         # Merge: cold_start first, then scored (excluding duplicates)
@@ -610,7 +817,7 @@ async def breath(
         scored_with_cold = cold_start + scored_deduped
 
         # --- Token-budgeted surfacing with diversity + hard cap ---
-        # --- 按 token 预算浮现，带多样性 + 硬上限 ---
+        # --- 按 token 預算浮現，帶多樣性 + 硬上限 ---
         # Top-1 always surfaces; rest sampled from top-20 for diversity
         token_budget = max_tokens
         for r in pinned_results:
@@ -642,45 +849,24 @@ async def breath(
                     break
                 # NOTE: no touch() here — surfacing should NOT reset decay timer
                 score = decay_engine.calculate_score(b["metadata"])
-                dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
+                dynamic_results.append(f"[權重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
                 token_budget -= summary_tokens
             except Exception as e:
-                logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
+                logger.warning(f"Failed to dehydrate surfaced bucket / 浮現脫水失敗: {e}")
                 continue
 
         if not pinned_results and not dynamic_results:
-            return "权重池平静，没有需要处理的记忆。"
+            return "權重池平靜，沒有需要處理的記憶。"
 
         parts = []
         if pinned_results:
-            parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
+            parts.append("=== 核心準則 ===\n" + "\n---\n".join(pinned_results))
         if dynamic_results:
-            parts.append("=== 浮现记忆 ===\n" + "\n---\n".join(dynamic_results))
+            parts.append("=== 浮現記憶 ===\n" + "\n---\n".join(dynamic_results))
         return "\n\n".join(parts)
 
-    # --- Feel retrieval: domain="feel" is a special channel ---
-    # --- Feel 检索：domain="feel" 是独立入口 ---
-    if domain.strip().lower() == "feel":
-        try:
-            all_buckets = await bucket_mgr.list_all(include_archive=False)
-            feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
-            feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
-            if not feels:
-                return "没有留下过 feel。"
-            results = []
-            for f in feels:
-                created = f["metadata"].get("created", "")
-                entry = f"[{created}] [bucket_id:{f['id']}]\n{strip_wikilinks(f['content'])}"
-                results.append(entry)
-                if count_tokens_approx("\n---\n".join(results)) > max_tokens:
-                    break
-            return "=== 你留下的 feel ===\n" + "\n---\n".join(results)
-        except Exception as e:
-            logger.error(f"Feel retrieval failed: {e}")
-            return "读取 feel 失败。"
-
     # --- With args: search mode (keyword + vector dual channel) ---
-    # --- 有参数：检索模式（关键词 + 向量双通道）---
+    # --- 有參數：檢索模式（關鍵詞 + 向量雙通道）---
     domain_filter = [d.strip() for d in domain.split(",") if d.strip()] or None
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
@@ -694,38 +880,55 @@ async def breath(
             query_arousal=q_arousal,
         )
     except Exception as e:
-        logger.error(f"Search failed / 检索失败: {e}")
-        return "检索过程出错，请稍后重试。"
+        logger.error(f"Search failed / 檢索失敗: {e}")
+        return "檢索過程出錯，請稍後重試。"
 
     # --- Exclude pinned/protected from search results (they surface in surfacing mode) ---
-    # --- 搜索模式排除钉选桶（它们在浮现模式中始终可见）---
+    # --- 搜索模式排除釘選桶（它們在浮現模式中始終可見）---
     matches = [b for b in matches if not (b["metadata"].get("pinned") or b["metadata"].get("protected"))]
 
     # --- Vector similarity channel: find semantically related buckets ---
-    # --- 向量相似度通道：找到语义相关的桶 ---
+    # --- 向量相似度通道：找到語義相關的桶 ---
     matched_ids = {b["id"] for b in matches}
     try:
         vector_results = await embedding_engine.search_similar(query, top_k=max(max_results, 20))
         for bucket_id, sim_score in vector_results:
             if bucket_id not in matched_ids and sim_score > 0.5:
                 bucket = await bucket_mgr.get(bucket_id)
-                if bucket and not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
-                    bucket["score"] = round(sim_score * 100, 2)
-                    bucket["vector_match"] = True
-                    matches.append(bucket)
-                    matched_ids.add(bucket_id)
+                if not bucket:
+                    continue
+                meta = bucket["metadata"]
+                # feel is a private channel; digested means hidden from recall push
+                # feel 是私人通道；digested 桶不經向量通道回浮
+                if meta.get("pinned") or meta.get("protected"):
+                    continue
+                if meta.get("type") == "feel" or meta.get("digested"):
+                    continue
+                # A strong semantic hit on an archived memory revives it:
+                # it comes back to dynamic/ (resolved) instead of being half-dead.
+                # 語義強命中歸檔記憶 → 復活搬回 dynamic（以 resolved 狀態迴歸）。
+                if meta.get("type") == "archived":
+                    revived = await bucket_mgr.revive(bucket_id, resolved=True)
+                    if not revived:
+                        continue
+                    bucket = await bucket_mgr.get(bucket_id) or bucket
+                bucket["score"] = round(sim_score * 100, 2)
+                bucket["vector_match"] = True
+                matches.append(bucket)
+                matched_ids.add(bucket_id)
     except Exception as e:
-        logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
+        logger.warning(f"Vector search failed, using keyword only / 向量搜索失敗: {e}")
 
     results = []
     token_used = 0
+    ripple_done = False
     for bucket in matches:
         if token_used >= max_tokens:
             break
         try:
             clean_meta = {k: v for k, v in bucket["metadata"].items() if k != "tags"}
             # --- Memory reconstruction: shift displayed valence by current mood ---
-            # --- 记忆重构：根据当前情绪微调展示层 valence（±0.1）---
+            # --- 記憶重構：根據當前情緒微調展示層 valence（±0.1）---
             if q_valence is not None and "valence" in clean_meta:
                 original_v = float(clean_meta.get("valence", 0.5))
                 shift = (q_valence - 0.5) * 0.2  # ±0.1 max shift
@@ -734,19 +937,23 @@ async def breath(
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
                 break
-            await bucket_mgr.touch(bucket["id"])
+            # Only the strongest hit ripples its temporal neighbors;
+            # rippling every hit is what inflated activation counts.
+            # 只有最強命中才擴散漣漪；每個命中都擴散正是通脹的來源。
+            await bucket_mgr.touch(bucket["id"], ripple=not ripple_done)
+            ripple_done = True
             if bucket.get("vector_match"):
-                summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
+                summary = f"[語義關聯] [bucket_id:{bucket['id']}] {summary}"
             else:
                 summary = f"[bucket_id:{bucket['id']}] {summary}"
             results.append(summary)
             token_used += summary_tokens
         except Exception as e:
-            logger.warning(f"Failed to dehydrate search result / 检索结果脱水失败: {e}")
+            logger.warning(f"Failed to dehydrate search result / 檢索結果脫水失敗: {e}")
             continue
 
     # --- Random surfacing: when search returns < 3, 40% chance to float old memories ---
-    # --- 随机浮现：检索结果不足 3 条时，40% 概率从低权重旧桶里漂上来 ---
+    # --- 隨機浮現：檢索結果不足 3 條時，40% 概率從低權重舊桶裡漂上來 ---
     if len(matches) < 3 and random.random() < 0.4:
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
@@ -754,6 +961,8 @@ async def breath(
             low_weight = [
                 b for b in all_buckets
                 if b["id"] not in matched_ids
+                and b["metadata"].get("type") not in ("feel", "permanent")
+                and not b["metadata"].get("digested", False)
                 and decay_engine.calculate_score(b["metadata"]) < 2.0
             ]
             if low_weight:
@@ -763,13 +972,13 @@ async def breath(
                     clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                     summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
                     drift_results.append(f"[surface_type: random]\n{summary}")
-                results.append("--- 忽然想起来 ---\n" + "\n---\n".join(drift_results))
+                results.append("--- 忽然想起來 ---\n" + "\n---\n".join(drift_results))
         except Exception as e:
-            logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")
+            logger.warning(f"Random surfacing failed / 隨機浮現失敗: {e}")
 
     if not results:
         await _fire_webhook("breath", {"mode": "empty", "matches": 0})
-        return "未找到相关记忆。"
+        return "未找到相關記憶。"
 
     final_text = "\n---\n".join(results)
     await _fire_webhook("breath", {"mode": "ok", "matches": len(matches), "chars": len(final_text)})
@@ -778,7 +987,7 @@ async def breath(
 
 # =============================================================
 # Tool 2: hold — Hold on to this
-# 工具 2：hold — 握住，留下来
+# 工具 2：hold — 握住，留下來
 # =============================================================
 @mcp.tool()
 async def hold(
@@ -790,18 +999,18 @@ async def hold(
     source_bucket: str = "",    valence: float = -1,
     arousal: float = -1,
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。"""
+    """存儲單條記憶,自動打標+合併。tags逗號分隔,importance 1-10。pinned=True創建永久釘選桶。feel=True存儲你的第一人稱感受(不參與普通浮現)。source_bucket=被消化的記憶桶ID(feel模式下,標記源記憶為已消化)。"""
     await decay_engine.ensure_started()
 
-    # --- Input validation / 输入校验 ---
+    # --- Input validation / 輸入校驗 ---
     if not content or not content.strip():
-        return "内容为空，无法存储。"
+        return "內容為空，無法存儲。"
 
     importance = max(1, min(10, importance))
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
 
     # --- Feel mode: store as feel type, minimal metadata ---
-    # --- Feel 模式：存为 feel 类型，最少元数据 ---
+    # --- Feel 模式：存為 feel 類型，最少元數據 ---
     if feel:
         # Feel valence/arousal = model's own perspective
         feel_valence = valence if 0 <= valence <= 1 else 0.5
@@ -821,7 +1030,7 @@ async def hold(
         except Exception:
             pass
         # --- Mark source memory as digested + store model's valence perspective ---
-        # --- 标记源记忆为已消化 + 存储模型视角的 valence ---
+        # --- 標記源記憶為已消化 + 存儲模型視角的 valence ---
         if source_bucket and source_bucket.strip():
             try:
                 update_kwargs = {"digested": True}
@@ -829,16 +1038,16 @@ async def hold(
                     update_kwargs["model_valence"] = feel_valence
                 await bucket_mgr.update(source_bucket.strip(), **update_kwargs)
             except Exception as e:
-                logger.warning(f"Failed to mark source as digested / 标记已消化失败: {e}")
-        return f"🫧feel→{bucket_id}"
+                logger.warning(f"Failed to mark source as digested / 標記已消化失敗: {e}")
+        return f"🫧feel→{bucket_id}" + await _api_usage_warning_suffix()
 
-    # --- Step 1: auto-tagging / 自动打标 ---
+    # --- Step 1: auto-tagging / 自動打標 ---
     try:
         analysis = await dehydrator.analyze(content)
     except Exception as e:
-        logger.warning(f"Auto-tagging failed, using defaults / 自动打标失败: {e}")
+        logger.warning(f"Auto-tagging failed, using defaults / 自動打標失敗: {e}")
         analysis = {
-            "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
+            "domain": ["未分類"], "valence": 0.5, "arousal": 0.3,
             "tags": [], "suggested_name": "",
         }
 
@@ -849,14 +1058,14 @@ async def hold(
     suggested_name = analysis.get("suggested_name", "")
 
     # --- User-supplied valence/arousal takes priority over analyze() result ---
-    # --- 用户显式传入的 valence/arousal 优先，analyze() 结果作为 fallback ---
+    # --- 用戶顯式傳入的 valence/arousal 優先，analyze() 結果作為 fallback ---
     final_valence = valence if 0 <= valence <= 1 else auto_valence
     final_arousal = arousal if 0 <= arousal <= 1 else auto_arousal
 
     all_tags = list(dict.fromkeys(auto_tags + extra_tags))
 
     # --- Pinned buckets bypass merge and are created directly in permanent dir ---
-    # --- 钉选桶跳过合并，直接新建到 permanent 目录 ---
+    # --- 釘選桶跳過合併，直接新建到 permanent 目錄 ---
     if pinned:
         bucket_id = await bucket_mgr.create(
             content=content,
@@ -873,9 +1082,9 @@ async def hold(
             await embedding_engine.generate_and_store(bucket_id, content)
         except Exception:
             pass
-        return f"📌钉选→{bucket_id} {','.join(domain)}"
+        return f"📌釘選→{bucket_id} {','.join(domain)}" + await _api_usage_warning_suffix()
 
-    # --- Step 2: merge or create / 合并或新建 ---
+    # --- Step 2: merge or create / 合併或新建 ---
     result_name, is_merged = await _merge_or_create(
         content=content,
         tags=all_tags,
@@ -886,24 +1095,24 @@ async def hold(
         name=suggested_name,
     )
 
-    action = "合并→" if is_merged else "新建→"
-    return f"{action}{result_name} {','.join(domain)}"
+    action = "合併→" if is_merged else "新建→"
+    return f"{action}{result_name} {','.join(domain)}" + await _api_usage_warning_suffix()
 
 
 # =============================================================
 # Tool 3: grow — Grow, fragments become memories
-# 工具 3：grow — 生长，一天的碎片长成记忆
+# 工具 3：grow — 生長，一天的碎片長成記憶
 # =============================================================
 @mcp.tool()
 async def grow(content: str) -> str:
-    """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。"""
+    """日記歸檔,自動拆分為多桶。短內容(<30字)走快速路徑。"""
     await decay_engine.ensure_started()
 
     if not content or not content.strip():
-        return "内容为空，无法整理。"
+        return "內容為空，無法整理。"
 
     # --- Short content fast path: skip digest, use hold logic directly ---
-    # --- 短内容快速路径：跳过 digest 拆分，直接走 hold 逻辑省一次 API ---
+    # --- 短內容快速路徑：跳過 digest 拆分，直接走 hold 邏輯省一次 API ---
     # For very short inputs (like "1"), calling digest is wasteful:
     # it sends the full DIGEST_PROMPT (~800 tokens) to DeepSeek for nothing.
     # Instead, run analyze + create directly.
@@ -912,46 +1121,50 @@ async def grow(content: str) -> str:
         try:
             analysis = await dehydrator.analyze(content)
         except Exception as e:
-            logger.warning(f"Fast-path analyze failed / 快速路径打标失败: {e}")
+            logger.warning(f"Fast-path analyze failed / 快速路徑打標失敗: {e}")
             analysis = {
-                "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
+                "domain": ["未分類"], "valence": 0.5, "arousal": 0.3,
                 "tags": [], "suggested_name": "",
             }
         result_name, is_merged = await _merge_or_create(
             content=content.strip(),
             tags=analysis.get("tags", []),
             importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
-            domain=analysis.get("domain", ["未分类"]),
+            domain=analysis.get("domain", ["未分類"]),
             valence=analysis.get("valence", 0.5),
             arousal=analysis.get("arousal", 0.3),
             name=analysis.get("suggested_name", ""),
         )
-        action = "合并" if is_merged else "新建"
-        return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
+        action = "合併" if is_merged else "新建"
+        return (
+            f"{action} → {result_name} | {','.join(analysis.get('domain', []))} "
+            f"V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
+            + await _api_usage_warning_suffix()
+        )
 
-    # --- Step 1: let API split and organize / 让 API 拆分整理 ---
+    # --- Step 1: let API split and organize / 讓 API 拆分整理 ---
     try:
         items = await dehydrator.digest(content)
     except Exception as e:
-        logger.error(f"Diary digest failed / 日记整理失败: {e}")
-        return f"日记整理失败: {e}"
+        logger.error(f"Diary digest failed / 日記整理失敗: {e}")
+        return f"日記整理失敗: {e}" + await _api_usage_warning_suffix()
 
     if not items:
-        return "内容为空或整理失败。"
+        return "內容為空或整理失敗。" + await _api_usage_warning_suffix()
 
     results = []
     created = 0
     merged = 0
 
     # --- Step 2: merge or create each item (with per-item error handling) ---
-    # --- 逐条合并或新建（单条失败不影响其他）---
+    # --- 逐條合併或新建（單條失敗不影響其他）---
     for item in items:
         try:
             result_name, is_merged = await _merge_or_create(
                 content=item["content"],
                 tags=item.get("tags", []),
                 importance=item.get("importance", 5),
-                domain=item.get("domain", ["未分类"]),
+                domain=item.get("domain", ["未分類"]),
                 valence=item.get("valence", 0.5),
                 arousal=item.get("arousal", 0.3),
                 name=item.get("name", ""),
@@ -965,19 +1178,19 @@ async def grow(content: str) -> str:
                 created += 1
         except Exception as e:
             logger.warning(
-                f"Failed to process diary item / 日记条目处理失败: "
+                f"Failed to process diary item / 日記條目處理失敗: "
                 f"{item.get('name', '?')}: {e}"
             )
             results.append(f"⚠️{item.get('name', '?')}")
 
-    return f"{len(items)}条|新{created}合{merged}\n" + "\n".join(results)
+    return f"{len(items)}條|新{created}合{merged}\n" + "\n".join(results) + await _api_usage_warning_suffix()
 
 
 # =============================================================
 # Tool 4: trace — Trace, redraw the outline of a memory
-# 工具 4：trace — 描摹，重新勾勒记忆的轮廓
+# 工具 4：trace — 描摹，重新勾勒記憶的輪廓
 # Also handles deletion (delete=True)
-# 同时承接删除功能
+# 同時承接刪除功能
 # =============================================================
 @mcp.tool()
 async def trace(
@@ -994,23 +1207,23 @@ async def trace(
     content: str = "",
     delete: bool = False,
 ) -> str:
-    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。"""
+    """修改記憶元數據或內容。resolved=1沉底/0激活,pinned=1釘選/0取消,digested=1隱藏(保留但不浮現)/0取消隱藏,content=替換桶正文,delete=True刪除。只傳需改的,-1或空=不改。"""
 
     if not bucket_id or not bucket_id.strip():
-        return "请提供有效的 bucket_id。"
+        return "請提供有效的 bucket_id。"
 
-    # --- Delete mode / 删除模式 ---
+    # --- Delete mode / 刪除模式 ---
     if delete:
         success = await bucket_mgr.delete(bucket_id)
         if success:
             embedding_engine.delete_embedding(bucket_id)
-        return f"已遗忘记忆桶: {bucket_id}" if success else f"未找到记忆桶: {bucket_id}"
+        return f"已遺忘記憶桶: {bucket_id}" if success else f"未找到記憶桶: {bucket_id}"
 
     bucket = await bucket_mgr.get(bucket_id)
     if not bucket:
-        return f"未找到记忆桶: {bucket_id}"
+        return f"未找到記憶桶: {bucket_id}"
 
-    # --- Collect only fields actually passed / 只收集用户实际传入的字段 ---
+    # --- Collect only fields actually passed / 只收集用戶實際傳入的字段 ---
     updates = {}
     if name:
         updates["name"] = name
@@ -1036,11 +1249,11 @@ async def trace(
         updates["content"] = content
 
     if not updates:
-        return "没有任何字段需要修改。"
+        return "沒有任何字段需要修改。"
 
     success = await bucket_mgr.update(bucket_id, **updates)
     if not success:
-        return f"修改失败: {bucket_id}"
+        return f"修改失敗: {bucket_id}"
 
     # Re-generate embedding if content changed
     if "content" in updates:
@@ -1051,51 +1264,57 @@ async def trace(
 
     changed = ", ".join(f"{k}={v}" for k, v in updates.items() if k != "content")
     if "content" in updates:
-        changed += (", content=已替换" if changed else "content=已替换")
+        changed += (", content=已替換" if changed else "content=已替換")
     # Explicit hint about resolved state change semantics
-    # 特别提示 resolved 状态变化的语义
+    # 特別提示 resolved 狀態變化的語義
     if "resolved" in updates:
         if updates["resolved"]:
-            changed += " → 已沉底，只在关键词触发时重新浮现"
+            changed += " → 已沉底，只在關鍵詞觸發時重新浮現"
         else:
-            changed += " → 已重新激活，将参与浮现排序"
+            changed += " → 已重新激活，將參與浮現排序"
     if "digested" in updates:
         if updates["digested"]:
-            changed += " → 已隐藏，保留但不再浮现"
+            changed += " → 已隱藏，保留但不再浮現"
         else:
-            changed += " → 已取消隐藏，重新参与浮现"
-    return f"已修改记忆桶 {bucket_id}: {changed}"
+            changed += " → 已取消隱藏，重新參與浮現"
+    return f"已修改記憶桶 {bucket_id}: {changed}"
 
 
 # =============================================================
 # Tool 5: pulse — Heartbeat, system status + memory listing
-# 工具 5：pulse — 脉搏，系统状态 + 记忆列表
+# 工具 5：pulse — 脈搏，系統狀態 + 記憶列表
 # =============================================================
 @mcp.tool()
-async def pulse(include_archive: bool = False) -> str:
-    """系统状态+记忆桶列表。include_archive=True含归档。"""
+async def pulse(verbose: bool = False, include_archive: bool = False) -> str:
+    """系統狀態。默認只回健康摘要(在線/桶數/大小/衰減引擎)，省 context。verbose=True 才列出所有記憶桶清單(很吃 token)；include_archive=True 含歸檔。"""
     try:
         stats = await bucket_mgr.get_stats()
     except Exception as e:
-        return f"获取系统状态失败: {e}"
+        return f"獲取系統狀態失敗: {e}"
 
     status = (
-        f"=== Ombre Brain 记忆系统 ===\n"
-        f"固化记忆桶: {stats['permanent_count']} 个\n"
-        f"动态记忆桶: {stats['dynamic_count']} 个\n"
-        f"归档记忆桶: {stats['archive_count']} 个\n"
-        f"总存储大小: {stats['total_size_kb']:.1f} KB\n"
-        f"衰减引擎: {'运行中' if decay_engine.is_running else '已停止'}\n"
+        f"=== Ombre Brain 記憶系統 ===\n"
+        f"固化記憶桶: {stats['permanent_count']} 個\n"
+        f"動態記憶桶: {stats['dynamic_count']} 個\n"
+        f"感受桶(feel): {stats.get('feel_count', 0)} 個\n"
+        f"歸檔記憶桶: {stats['archive_count']} 個\n"
+        f"總存儲大小: {stats['total_size_kb']:.1f} KB\n"
+        f"衰減引擎: {'運行中' if decay_engine.is_running else '已停止'}\n"
     )
+
+    # --- Compact by default: health summary only, skip the heavy bucket list ---
+    # --- 默認精簡：只回健康摘要，跳過吃 context 的全桶清單（完整清單用 pulse(verbose=True)）---
+    if not verbose:
+        return status + "（精簡模式：完整桶清單用 pulse(verbose=True)）"
 
     # --- List all bucket summaries / 列出所有桶摘要 ---
     try:
         buckets = await bucket_mgr.list_all(include_archive=include_archive)
     except Exception as e:
-        return status + f"\n列出记忆桶失败: {e}"
+        return status + f"\n列出記憶桶失敗: {e}"
 
     if not buckets:
-        return status + "\n记忆库为空。"
+        return status + "\n記憶庫為空。"
 
     lines = []
     for b in buckets:
@@ -1119,81 +1338,113 @@ async def pulse(include_archive: bool = False) -> str:
         domains = ",".join(meta.get("domain", []))
         val = meta.get("valence", 0.5)
         aro = meta.get("arousal", 0.3)
-        resolved_tag = " [已解决]" if meta.get("resolved", False) else ""
+        resolved_tag = " [已解決]" if meta.get("resolved", False) else ""
         lines.append(
             f"{icon} [{meta.get('name', b['id'])}]{resolved_tag} "
             f"bucket_id:{b['id']} "
-            f"主题:{domains} "
+            f"主題:{domains} "
             f"情感:V{val:.1f}/A{aro:.1f} "
             f"重要:{meta.get('importance', '?')} "
-            f"权重:{score:.2f} "
-            f"标签:{','.join(meta.get('tags', []))}"
+            f"權重:{score:.2f} "
+            f"標籤:{','.join(meta.get('tags', []))}"
         )
 
-    return status + "\n=== 记忆列表 ===\n" + "\n".join(lines)
+    return status + "\n=== 記憶列表 ===\n" + "\n".join(lines)
 
 
 # =============================================================
-# Tool 6: dream — Dreaming, digest recent memories
-# 工具 6：dream — 做梦，消化最近的记忆
+# Tool 6: api_usage — API balance/quota guard
+# 工具 6：api_usage — API 餘額/額度護欄
+# =============================================================
+@mcp.tool()
+async def api_usage(force: bool = False, probe_gemini: bool = True) -> str:
+    """檢查 DeepSeek 餘額與 Gemini embedding 可用性。force=True 跳過短緩存；probe_gemini=True 會做一次極小 embedding 探測。"""
+    usage = await api_usage_guard.check_all(force=force, probe_gemini=probe_gemini)
+    deepseek = usage.get("deepseek", {})
+    gemini = usage.get("gemini", {})
+
+    ds_balance = deepseek.get("balance")
+    ds_currency = deepseek.get("currency") or ""
+    ds_balance_text = "未知" if ds_balance is None else f"{ds_balance:.2f} {ds_currency}".strip()
+    lines = [
+        "=== Ombre API 額度檢查 ===",
+        f"DeepSeek: {'OK' if deepseek.get('ok') else '需注意'} | model={deepseek.get('model', '')} | balance={ds_balance_text}",
+        f"Gemini embedding: {'OK' if gemini.get('ok') else '需注意'} | model={gemini.get('model', '')} | enabled={gemini.get('enabled')}",
+    ]
+    warnings = usage.get("warnings") or []
+    if getattr(embedding_engine, "last_error", ""):
+        warnings.append(f"Gemini embedding 最近一次生成失敗：{embedding_engine.last_error}")
+    if warnings:
+        lines.append("⚠ 提醒：")
+        lines.extend(f"- {warning}" for warning in warnings)
+    else:
+        lines.append("目前沒有額度/可用性警告。")
+    return "\n".join(lines)
+
+
+# =============================================================
+# Tool 7: dream — Dreaming, digest recent memories
+# 工具 7：dream — 做夢，消化最近的記憶
 #
 # Reads recent surface-level buckets (≤10), returns them for
 # Claude to introspect under prompt guidance.
-# 读取最近新增的表层桶（≤10个），返回给 Claude 在提示词引导下自主思考。
+# 讀取最近新增的表層桶（≤10個），返回給 Claude 在提示詞引導下自主思考。
 # Claude then decides: resolve some, write feels, or do nothing.
 # =============================================================
 @mcp.tool()
-async def dream() -> str:
-    """做梦——读取最近新增的记忆桶,供你自省。读完后可以trace(resolved=1)放下,或hold(feel=True)写感受。"""
+async def dream(max_results: int = 10) -> str:
+    """做夢——讀取最近新增的記憶桶,供你自省。max_results 控制讀幾條(默認10,開場可傳3省 context)。讀完後可以trace(resolved=1)放下,或hold(feel=True)寫感受。"""
     await decay_engine.ensure_started()
+    max_results = max(1, min(max_results, 20))
 
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
     except Exception as e:
         logger.error(f"Dream failed to list buckets: {e}")
-        return "记忆系统暂时无法访问。"
+        return "記憶系統暫時無法訪問。"
 
-    # --- Filter: recent surface-level dynamic buckets (not permanent/pinned/feel) ---
+    # --- Filter: recent surface-level dynamic buckets (not permanent/pinned/feel/digested) ---
     candidates = [
         b for b in all_buckets
         if b["metadata"].get("type") not in ("permanent", "feel")
         and not b["metadata"].get("pinned", False)
         and not b["metadata"].get("protected", False)
+        and not b["metadata"].get("digested", False)
     ]
 
-    # --- Sort by creation time desc, take top 10 ---
+    # --- Sort by creation time desc, take top N ---
     candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
-    recent = candidates[:10]
+    recent = candidates[:max_results]
 
     if not recent:
-        return "没有需要消化的新记忆。"
+        return "沒有需要消化的新記憶。"
 
     parts = []
     for b in recent:
         meta = b["metadata"]
-        resolved_tag = " [已解决]" if meta.get("resolved", False) else " [未解决]"
+        resolved_tag = " [已解決]" if meta.get("resolved", False) else " [未解決]"
         domains = ",".join(meta.get("domain", []))
         val = meta.get("valence", 0.5)
         aro = meta.get("arousal", 0.3)
         created = meta.get("created", "")
         parts.append(
             f"[{meta.get('name', b['id'])}]{resolved_tag} "
-            f"主题:{domains} V{val:.1f}/A{aro:.1f} "
-            f"创建:{created}\n"
+            f"主題:{domains} V{val:.1f}/A{aro:.1f} "
+            f"創建:{created}\n"
             f"ID: {b['id']}\n"
             f"{strip_wikilinks(b['content'][:500])}"
         )
 
     header = (
         "=== Dreaming ===\n"
-        "以下是你最近的记忆。用第一人称想：\n"
-        "- 这些东西里有什么在你这里留下了重量？\n"
-        "- 有什么还没想清楚？\n"
-        "- 有什么可以放下了？\n"
-        "想完之后：值得放下的用 trace(bucket_id, resolved=1)；\n"
-        "有沉淀的用 hold(content=\"...\", feel=True, source_bucket=\"bucket_id\", valence=你的感受) 写下来。\n"
-        "valence 是你对这段记忆的感受，不是事件本身的情绪。\n"
-        "没有沉淀就不写，不强迫产出。\n"
+        "以下是你最近的記憶。用第一人稱想：\n"
+        "- 這些東西里有什麼在你這裡留下了重量？\n"
+        "- 有什麼還沒想清楚？\n"
+        "- 有什麼可以放下了？\n"
+        "想完之後：值得放下的用 trace(bucket_id, resolved=1)；\n"
+        "有沉澱的用 hold(content=\"...\", feel=True, source_bucket=\"bucket_id\", valence=你的感受) 寫下來。\n"
+        "valence 是你對這段記憶的感受，不是事件本身的情緒。\n"
+        "沒有沉澱就不寫，不強迫產出。\n"
     )
 
     # --- Connection hint: find most similar pair via embeddings ---
@@ -1219,7 +1470,7 @@ async def dream() -> str:
             if best_pair and best_sim > 0.5:
                 connection_hint = (
                     f"\n💭 [{names[best_pair[0]]}] 和 [{names[best_pair[1]]}] "
-                    f"似乎有关联 (相似度:{best_sim:.2f})——不替你下结论，你自己想。\n"
+                    f"似乎有關聯 (相似度:{best_sim:.2f})——不替你下結論，你自己想。\n"
                 )
         except Exception as e:
             logger.warning(f"Dream connection hint failed: {e}")
@@ -1235,24 +1486,28 @@ async def dream() -> str:
                     emb = await embedding_engine.get_embedding(f["id"])
                     if emb is not None:
                         feel_embeddings[f["id"]] = emb
-                # Find clusters: feels with similarity > 0.7 to at least 2 others
+                # Find clusters: feels with similarity > 0.85 to at least 2 others.
+                # (0.7 was noise: first-person feels in one voice are all >0.7 alike,
+                # so the hint fired on "47 similar feels" and carried no signal.)
+                # 0.7 是噪音：同一個聲音寫的第一人稱 feel 彼此都超過 0.7，
+                # 提示會報「47 條相似」而毫無訊號，改 0.85。
                 for fid, femb in feel_embeddings.items():
                     similar_feels = []
                     for oid, oemb in feel_embeddings.items():
                         if oid != fid:
                             sim = embedding_engine._cosine_similarity(femb, oemb)
-                            if sim > 0.7:
+                            if sim > 0.85:
                                 similar_feels.append(oid)
                     if len(similar_feels) >= 2:
                         feel_bucket = next((f for f in feels if f["id"] == fid), None)
                         if feel_bucket and not feel_bucket["metadata"].get("pinned"):
                             content_preview = strip_wikilinks(feel_bucket["content"][:80])
                             crystal_hint = (
-                                f"\n🔮 你已经写过 {len(similar_feels)+1} 条相似的 feel "
-                                f"（围绕「{content_preview}…」）。"
-                                f"如果这已经是确信而不只是感受了，"
-                                f"你可以用 hold(content=\"...\", pinned=True) 升级它。"
-                                f"不急，你自己决定。\n"
+                                f"\n🔮 你已經寫過 {len(similar_feels)+1} 條相似的 feel "
+                                f"（圍繞「{content_preview}…」）。"
+                                f"如果這已經是確信而不只是感受了，"
+                                f"你可以用 hold(content=\"...\", pinned=True) 升級它。"
+                                f"不急，你自己決定。\n"
                             )
                             break
         except Exception as e:
@@ -1406,15 +1661,279 @@ async def shelf(
         return f"共讀書架操作失敗: {exc}"
 
 
+@mcp.tool()
+async def letter(
+    action: str = "read",
+    author: str = "",
+    content: str = "",
+    title: str = "",
+    query: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    letter_date: str = "",
+    tags: str = "",
+    limit: int = 10,
+) -> str:
+    """交接信／互信工具（永久保存，永不衰減、不合併、不可刪）。action=write/read/list。write 需 author（Ruby 或 Cyan）與 content（原文逐字保留）；read/list 回傳信件，可用 query 關鍵字、author、date_from/date_to（YYYY-MM-DD）、limit 篩選。各方最新一封會自動在開場浮現。"""
+    action = (action or "read").strip().lower()
+    valid_actions = {"write", "read", "list"}
+    if action not in valid_actions:
+        return f"不支援的 action: {action}。可用: {', '.join(sorted(valid_actions))}"
+    try:
+        if action == "write":
+            if not author.strip() or not content.strip():
+                return "write 需要 author（Ruby 或 Cyan）與 content。"
+            letter_obj = letter_store.write_letter({
+                "author": author,
+                "content": content,
+                "title": title,
+                "letter_date": letter_date,
+                "tags": tags,
+            })
+            return _json_lib.dumps(
+                {
+                    "ok": True,
+                    "id": letter_obj["id"],
+                    "author": letter_obj["author"],
+                    "letter_date": letter_obj["letter_date"],
+                },
+                ensure_ascii=False,
+            )
+        letters = letter_store.read_letters(
+            query=query if action == "read" else "",
+            author=author,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+        )
+        return _json_lib.dumps({"count": len(letters), "letters": letters}, ensure_ascii=False, indent=2)
+    except ValueError as exc:
+        return f"信件資料不合法: {exc}"
+    except Exception as exc:
+        logger.exception("Letter tool failed")
+        return f"信件操作失敗: {exc}"
+
+
+@mcp.tool()
+async def self_concept(
+    action: str = "read",
+    aspect: str = "",
+    content: str = "",
+    limit: int = 0,
+) -> str:
+    """自我概念累積工具（『I』，永久、不衰減、只供檢索、不普通浮現）。七面向 aspect：nature/values/patterns/limits/becoming/uncertainty/stance。action=write 需 aspect 與 content（累積寫入、不覆蓋舊條目）；action=read 回傳各面向條目（可指定單一 aspect，limit 限每面向最新幾條）。開場會自動浮現各面向最新一條，讓冷啟動的你先認得自己。"""
+    action = (action or "read").strip().lower()
+    if action not in {"write", "read"}:
+        return f"不支援的 action: {action}。可用: write, read"
+    try:
+        if action == "write":
+            if not aspect.strip() or not content.strip():
+                return "write 需要 aspect 與 content。"
+            entry = self_concept_store.write_entry(aspect, content)
+            return _json_lib.dumps(
+                {"ok": True, "id": entry["id"], "aspect": entry["aspect"]},
+                ensure_ascii=False,
+            )
+        data = self_concept_store.read(aspect=aspect, limit=limit)
+        return _json_lib.dumps(data, ensure_ascii=False, indent=2)
+    except ValueError as exc:
+        return f"自我概念輸入錯誤: {exc}"
+    except Exception as exc:
+        logger.exception("self_concept tool failed")
+        return f"自我概念操作失敗: {exc}"
+
+
+
+
+# =============================================================
+# Tool: desire — 慾望系統（Phase 1：只讀內核，不接管任何行為）
+# 七維驅動條＋fatigue 閘；執念層直接掛 Ombre 未解決桶；
+# 函數只提案，醒著的 Cyan 有否決權。
+# =============================================================
+async def _desire_fixation_buckets() -> list[dict]:
+    """收集執念候選桶：未解決、未消化、非釘選/永久/feel 的動態桶摘要。
+    只取 id/name/domains/衰減分 —— 桶正文永不進入慾望系統（鐵律）。"""
+    out = []
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+    except Exception as e:
+        logger.warning(f"desire fixation list failed: {e}")
+        return out
+    for b in all_buckets:
+        m = b["metadata"]
+        if m.get("type") in ("permanent", "feel", "archived"):
+            continue
+        if m.get("pinned") or m.get("protected") or m.get("resolved") or m.get("digested"):
+            continue
+        try:
+            score = decay_engine.calculate_score(m)
+        except Exception:
+            continue
+        out.append({
+            "id": b["id"],
+            "name": m.get("name", b["id"]),
+            "domains": m.get("domain", []),
+            "score": score,
+        })
+    return out
+
+
+async def _desire_state_payload() -> dict:
+    """tick 後的完整狀態＋執念加成＋當下提案（并持久化 last_intent）。"""
+    from datetime import datetime as _dt
+    now = _dt.now()
+    buckets = await _desire_fixation_buckets()
+    boosts = desire_kernel.drive_boosts(buckets)
+
+    def _refresh(state):
+        intent = desire_kernel.pick_intent(state, boosts, now)
+        state["last_intent"] = intent
+        return state
+
+    state = desire_store.mutate(_refresh, now)
+    return {
+        "updated_at": state["updated_at"],
+        "drives": state["drives"],
+        "drive_labels": desire_kernel.DRIVE_LABELS,
+        "fatigue": state["fatigue"],
+        "fatigue_gate": desire_kernel.FATIGUE_GATE,
+        "gates": state["gates"],
+        "boosts": boosts,
+        "intent": state["last_intent"],
+        "veto_until": state.get("veto_until", {}),
+        "events": state.get("events", [])[-10:],
+        "driven_behavior_enabled": False,  # Phase 1 鐵律：永遠只讀
+    }
+
+
+@mcp.tool()
+async def desire(
+    action: str = "state",
+    drive: str = "",
+    amount: float = 0.0,
+    verb: str = "",
+    event: str = "",
+    reason: str = "",
+    value: int = -1,
+) -> str:
+    """慾望系統（Phase 1 只讀，不接管行為）。action=state 看七維驅動條+執念加成+此刻提案；action=feed 餵真實事件（drive=維度或fatigue, amount=±0~1, event=因為發生了什麼）；action=satisfy 做完某事後回落（verb=murmur/dream_feel/explore/chore/browse/create/tease/rest, event=做了什麼）；action=veto 否決當下提案（drive=維度, reason=為什麼不）；action=gate 開關親密閘（drive=intimacy_ok, value=0/1）。七維：miss_ruby想Ruby/reflection沉澱/curiosity好奇/duty記掛/social人群/creation創作/libido性。"""
+    from datetime import datetime as _dt
+    action = (action or "state").strip().lower()
+    now = _dt.now()
+    try:
+        if action == "state":
+            payload = await _desire_state_payload()
+            return _json_lib.dumps(payload, ensure_ascii=False, indent=2)
+        if action == "feed":
+            if not drive.strip():
+                return "feed 需要 drive（七維之一或 fatigue）。"
+            state = desire_store.mutate(
+                lambda st: desire_kernel.feed(st, drive.strip(), amount, now, event=event), now)
+            return f"已餵入 {drive}{amount:+.2f}（{event or '未註明來歷'}）→ 現值 " + (
+                f"{state['fatigue']:.2f}" if drive.strip() == "fatigue" else f"{state['drives'][drive.strip()]:.2f}")
+        if action == "satisfy":
+            if not verb.strip():
+                return "satisfy 需要 verb（murmur/dream_feel/explore/chore/browse/create/tease/rest）。"
+            desire_store.mutate(
+                lambda st: desire_kernel.satisfy(st, verb.strip(), now, note=event), now)
+            return f"已回落：{verb}（{event or '做完了'}）"
+        if action == "veto":
+            if not drive.strip():
+                return "veto 需要 drive。"
+            desire_store.mutate(
+                lambda st: desire_kernel.veto(st, drive.strip(), now, reason=reason), now)
+            # 否決理由回饋成 Ombre 念頭：低重要度自省桶，30 天沒被想起就自動結案。
+            # 「我對什麼說了不、為什麼」值得留痕跡——這是 veto 權的另一半。
+            try:
+                label = desire_kernel.DRIVE_LABELS.get(drive.strip(), drive.strip())
+                veto_bucket = await bucket_mgr.create(
+                    content=(
+                        f"{now.strftime('%Y-%m-%d %H:%M')} 我否決了一個慾望提案：{label}。"
+                        f"理由：{reason or '未註明'}。來源：desire veto"
+                    ),
+                    tags=["慾望系統", "veto", drive.strip()],
+                    importance=3,
+                    domain=["自省"],
+                    valence=0.45,
+                    arousal=0.35,
+                    name=f"慾望否決{label}",
+                )
+                try:
+                    await embedding_engine.generate_and_store(veto_bucket, f"否決慾望提案 {label}：{reason}")
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"veto feedback bucket failed: {e}")
+            return f"已否決 {drive}（{reason or '未註明理由'}），冷卻 {desire_kernel.VETO_COOLDOWN_HOURS:.0f} 小時；理由已回饋成 Ombre 念頭"
+        if action == "gate":
+            if drive.strip() != "intimacy_ok" or value not in (0, 1):
+                return "gate 用法：drive=intimacy_ok, value=0/1。"
+            desire_store.mutate(
+                lambda st: desire_kernel.set_gate(st, "intimacy_ok", bool(value), now, note=event), now)
+            return f"親密閘已{'開' if value else '關'}（{event or ''}）"
+        return f"不支援的 action: {action}。可用: state/feed/satisfy/veto/gate"
+    except ValueError as exc:
+        return f"慾望系統輸入錯誤: {exc}"
+    except Exception:
+        logger.exception("desire tool failed")
+        return "慾望系統操作失敗。"
+
+
+@mcp.custom_route("/api/desire/feed", methods=["POST"])
+async def api_desire_feed(request):
+    """Machine-to-machine desire feed: real signals (Ruby's messages, token
+    spend) flow in here. Same-machine trust model as breath-hook — loopback
+    direct or X-Ombre-Hook-Token; never exposed to public traffic."""
+    from starlette.responses import JSONResponse
+    from datetime import datetime as _dt
+    denied = _require_hook_access(request)
+    if denied:
+        return denied
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    drive_name = str(body.get("drive", "")).strip()
+    event = str(body.get("event", ""))[:200]
+    try:
+        amount = float(body.get("amount", 0))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "amount must be a number"}, status_code=400)
+    if drive_name not in desire_kernel.DRIVE_KEYS and drive_name != "fatigue":
+        return JSONResponse({"error": f"unknown drive: {drive_name}"}, status_code=400)
+    if not event:
+        return JSONResponse({"error": "event is required (每一筆漲跌都要有來歷)"}, status_code=400)
+    now = _dt.now()
+    try:
+        state = desire_store.mutate(
+            lambda st: desire_kernel.feed(st, drive_name, amount, now, event=event), now)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    new_value = state["fatigue"] if drive_name == "fatigue" else state["drives"][drive_name]
+    return JSONResponse({"ok": True, "drive": drive_name, "value": new_value})
+
+
+@mcp.custom_route("/api/desire/state", methods=["GET"])
+async def api_desire_state(request):
+    """Read-only desire state for the web panel / pixel home (Phase 2)."""
+    from starlette.responses import JSONResponse
+    err = _require_read_access(request)
+    if err: return err
+    try:
+        return JSONResponse(await _desire_state_payload())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 # =============================================================
 # Dashboard API endpoints (for lightweight Web UI)
-# 仪表板 API（轻量 Web UI 用）
+# 儀表板 API（輕量 Web UI 用）
 # =============================================================
 @mcp.custom_route("/api/buckets", methods=["GET"])
 async def api_buckets(request):
     """List all buckets with metadata (no content for efficiency)."""
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+    err = _require_read_access(request)
     if err: return err
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=True)
@@ -1450,7 +1969,7 @@ async def api_buckets(request):
 async def api_bucket_detail(request):
     """Get full bucket content by ID."""
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+    err = _require_read_access(request)
     if err: return err
     bucket_id = request.path_params["bucket_id"]
     bucket = await bucket_mgr.get(bucket_id)
@@ -1469,7 +1988,7 @@ async def api_bucket_detail(request):
 async def api_reading_shelf(request):
     """List books stored in the shared-reading shelf."""
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+    err = _require_read_access(request)
     if err: return err
     try:
         return JSONResponse({"books": reading_shelf.list_books()})
@@ -1534,7 +2053,7 @@ async def api_reading_shelf_delete(request):
 async def api_search(request):
     """Search buckets by query."""
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+    err = _require_read_access(request)
     if err: return err
     query = request.query_params.get("q", "")
     if not query:
@@ -1683,6 +2202,162 @@ async def api_breath_debug(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@mcp.custom_route("/api/letters", methods=["GET"])
+async def api_letters(request):
+    """Read-only letters list for the Cyan web memory room."""
+    from starlette.responses import JSONResponse
+    err = _require_read_access(request)
+    if err: return err
+    try:
+        qp = request.query_params
+        letters = letter_store.read_letters(
+            query=qp.get("query", ""),
+            author=qp.get("author", ""),
+            date_from=qp.get("date_from", ""),
+            date_to=qp.get("date_to", ""),
+            limit=int(qp.get("limit", "50") or 50),
+        )
+        return JSONResponse({"letters": letters})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/letter", methods=["POST"])
+async def api_letter_write(request):
+    """Ruby's own hand: write a letter from the web mailbox.
+
+    Same permanence contract as the MCP letter tool (never decays, never
+    merges, never deleted). The web door only writes in Ruby's name - Cyan
+    posts his letters through MCP.
+    """
+    from starlette.responses import JSONResponse
+    err = _require_read_access(request)
+    if err: return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    content = str(body.get("content", "")).strip()
+    if not content:
+        return JSONResponse({"error": "empty"}, status_code=400)
+    if len(content) > 8000:
+        return JSONResponse({"error": "too_long"}, status_code=400)
+    title = str(body.get("title", "")).strip()[:120]
+    try:
+        letter_obj = letter_store.write_letter({
+            "author": "Ruby",
+            "content": content,
+            "title": title,
+            "letter_date": "",
+            "tags": "web",
+        })
+        return JSONResponse({"ok": True, "id": letter_obj["id"],
+                             "letter_date": letter_obj["letter_date"]})
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/hold", methods=["POST"])
+async def api_hold(request):
+    """Ruby's own hand: store one ordinary memory from the web memory room.
+
+    Same pipeline as the MCP hold tool's ordinary path (auto-tag via
+    dehydrator, then merge-or-create). Feel/pinned modes stay MCP-only.
+    """
+    from starlette.responses import JSONResponse
+    err = _require_read_access(request)
+    if err: return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    content = str(body.get("content", "")).strip()
+    if not content:
+        return JSONResponse({"error": "empty"}, status_code=400)
+    if len(content) > 4000:
+        return JSONResponse({"error": "too_long"}, status_code=400)
+    if "來源：" not in content and "来源：" not in content:
+        content += "\n\n來源：Ruby（親手放入）"
+    try:
+        importance = max(1, min(10, int(body.get("importance", 5) or 5)))
+    except (TypeError, ValueError):
+        importance = 5
+    await decay_engine.ensure_started()
+    try:
+        analysis = await dehydrator.analyze(content)
+    except Exception:
+        analysis = {"domain": ["未分類"], "valence": 0.5, "arousal": 0.3, "tags": [], "suggested_name": ""}
+    try:
+        result_name, is_merged = await _merge_or_create(
+            content=content,
+            tags=analysis.get("tags", []),
+            importance=importance,
+            domain=analysis.get("domain", ["未分類"]),
+            valence=analysis.get("valence", 0.5),
+            arousal=analysis.get("arousal", 0.3),
+            name=analysis.get("suggested_name", ""),
+        )
+        return JSONResponse({"ok": True, "bucket": result_name, "merged": is_merged,
+                             "domain": analysis.get("domain", [])})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}/trace", methods=["POST"])
+async def api_bucket_trace(request):
+    """Write ops for the Cyan web memory room: resolve / pin / delete only.
+
+    Mirrors the MCP trace tool's semantics for these three fields, including
+    pinning locking importance to 10 and delete removing the embedding.
+    """
+    from starlette.responses import JSONResponse
+    err = _require_read_access(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    try:
+        if body.get("delete") is True:
+            success = await bucket_mgr.delete(bucket_id)
+            if success:
+                embedding_engine.delete_embedding(bucket_id)
+                return JSONResponse({"ok": True, "deleted": True})
+            return JSONResponse({"error": "not found"}, status_code=404)
+        updates = {}
+        if body.get("resolved") in (0, 1, True, False):
+            updates["resolved"] = bool(body["resolved"])
+        if body.get("pinned") in (0, 1, True, False):
+            updates["pinned"] = bool(body["pinned"])
+            if updates["pinned"]:
+                updates["importance"] = 10  # pinned -> lock importance, same as MCP trace
+        if not updates:
+            return JSONResponse({"error": "no supported fields"}, status_code=400)
+        if not await bucket_mgr.get(bucket_id):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        success = await bucket_mgr.update(bucket_id, **updates)
+        return JSONResponse({"ok": bool(success), "updates": updates})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/self-concept", methods=["GET"])
+async def api_self_concept(request):
+    """Read-only self-concept aspects for the Cyan web memory room."""
+    from starlette.responses import JSONResponse
+    err = _require_read_access(request)
+    if err: return err
+    try:
+        qp = request.query_params
+        limit = int(qp.get("limit", "0") or 0)
+        return JSONResponse({"aspects": self_concept_store.read(aspect=qp.get("aspect", ""), limit=limit)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @mcp.custom_route("/dashboard", methods=["GET"])
 async def dashboard(request):
     """Serve the dashboard HTML page."""
@@ -1705,7 +2380,9 @@ async def api_config_get(request):
     dehy = config.get("dehydration", {})
     emb = config.get("embedding", {})
     api_key = dehy.get("api_key", "")
+    emb_key = emb.get("api_key", "")
     masked_key = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else ("***" if api_key else "")
+    masked_emb_key = f"{emb_key[:4]}...{emb_key[-4:]}" if len(emb_key) > 8 else ("***" if emb_key else "")
     return JSONResponse({
         "dehydration": {
             "model": dehy.get("model", ""),
@@ -1717,7 +2394,10 @@ async def api_config_get(request):
         "embedding": {
             "enabled": emb.get("enabled", False),
             "model": emb.get("model", ""),
+            "base_url": emb.get("base_url", ""),
+            "api_key_masked": masked_emb_key,
         },
+        "api_usage_guard": config.get("api_usage_guard", {}),
         "merge_threshold": config.get("merge_threshold", 75),
         "transport": config.get("transport", "stdio"),
         "buckets_dir": config.get("buckets_dir", ""),
@@ -1772,6 +2452,35 @@ async def api_config_update(request):
             emb["model"] = e["model"]
             embedding_engine.model = emb["model"]
             updated.append("embedding.model")
+        if "base_url" in e:
+            emb["base_url"] = e["base_url"]
+            embedding_engine.base_url = emb["base_url"]
+            updated.append("embedding.base_url")
+        if "api_key" in e and e["api_key"]:
+            emb["api_key"] = e["api_key"]
+            embedding_engine.api_key = emb["api_key"]
+            updated.append("embedding.api_key")
+        if any(key in e for key in ("api_key", "base_url")) and embedding_engine.api_key:
+            from openai import AsyncOpenAI
+            embedding_engine.client = AsyncOpenAI(
+                api_key=embedding_engine.api_key,
+                base_url=embedding_engine.base_url,
+                timeout=30.0,
+            )
+            embedding_engine.enabled = bool(embedding_engine.api_key) and emb.get("enabled", True)
+
+    # --- API usage guard config ---
+    if "api_usage_guard" in body:
+        g = body["api_usage_guard"]
+        guard = config.setdefault("api_usage_guard", {})
+        if "deepseek_low_balance_usd" in g:
+            guard["deepseek_low_balance_usd"] = float(g["deepseek_low_balance_usd"])
+            api_usage_guard.deepseek_low_balance_usd = guard["deepseek_low_balance_usd"]
+            updated.append("api_usage_guard.deepseek_low_balance_usd")
+        if "cache_ttl_seconds" in g:
+            guard["cache_ttl_seconds"] = int(g["cache_ttl_seconds"])
+            api_usage_guard.cache_ttl_seconds = guard["cache_ttl_seconds"]
+            updated.append("api_usage_guard.cache_ttl_seconds")
 
     # --- Merge threshold ---
     if "merge_threshold" in body:
@@ -1796,9 +2505,16 @@ async def api_config_update(request):
 
             if "embedding" in body:
                 sc_emb = save_config.setdefault("embedding", {})
-                for key in ("enabled", "model"):
+                for key in ("enabled", "model", "base_url"):
                     if key in body["embedding"]:
                         sc_emb[key] = body["embedding"][key]
+                # Never persist api_key to yaml (use env var)
+
+            if "api_usage_guard" in body:
+                sc_guard = save_config.setdefault("api_usage_guard", {})
+                for key in ("deepseek_low_balance_usd", "cache_ttl_seconds"):
+                    if key in body["api_usage_guard"]:
+                        sc_guard[key] = body["api_usage_guard"][key]
 
             if "merge_threshold" in body:
                 save_config["merge_threshold"] = int(body["merge_threshold"])
@@ -1814,8 +2530,8 @@ async def api_config_update(request):
 
 # =============================================================
 # /api/host-vault — read/write the host-side OMBRE_HOST_VAULT_DIR
-# 用于在 Dashboard 设置 docker-compose 挂载的宿主机记忆桶目录。
-# 写入项目根目录的 .env 文件，需 docker compose down/up 才能生效。
+# 用於在 Dashboard 設置 docker-compose 掛載的宿主機記憶桶目錄。
+# 寫入項目根目錄的 .env 文件，需 docker compose down/up 才能生效。
 # =============================================================
 
 def _project_env_path() -> str:
@@ -1924,13 +2640,13 @@ async def api_host_vault_set(request):
         "ok": True,
         "value": value,
         "env_file": _project_env_path(),
-        "note": "已写入 .env；需在宿主机执行 `docker compose down && docker compose up -d` 让新挂载生效。",
+        "note": "已寫入 .env；需在宿主機執行 `docker compose down && docker compose up -d` 讓新掛載生效。",
     })
 
 
 # =============================================================
 # Import API — conversation history import
-# 导入 API — 对话历史导入
+# 導入 API — 對話歷史導入
 # =============================================================
 
 @mcp.custom_route("/api/import/upload", methods=["POST"])
@@ -2078,9 +2794,11 @@ async def api_import_review(request):
             elif action == "noise":
                 await bucket_mgr.update(bid, resolved=True, importance=1)
             elif action == "delete":
-                file_path = bucket_mgr._find_bucket_file(bid)
-                if file_path:
-                    os.remove(file_path)
+                # Route through the manager so the embedding is cleaned up too
+                # (raw os.remove left orphan embeddings in the vector store)
+                # 走 manager 刪除，同步清 embedding（裸 os.remove 會留孤兒向量）
+                if await bucket_mgr.delete(bid):
+                    embedding_engine.delete_embedding(bid)
             applied += 1
         except Exception as e:
             logger.warning(f"Review action failed for {bid}: {e}")
@@ -2091,19 +2809,22 @@ async def api_import_review(request):
 
 # =============================================================
 # /api/status — system status for Dashboard settings tab
-# /api/status — Dashboard 设置页用系统状态
+# /api/status — Dashboard 設置頁用系統狀態
 # =============================================================
 @mcp.custom_route("/api/status", methods=["GET"])
 async def api_system_status(request):
     """Return detailed system status for the settings panel."""
     from starlette.responses import JSONResponse
-    err = _require_auth(request)
+    err = _require_read_access(request)
     if err: return err
     try:
         stats = await bucket_mgr.get_stats()
+        usage = await api_usage_guard.check_all(probe_gemini=False)
         return JSONResponse({
             "decay_engine": "running" if decay_engine.is_running else "stopped",
             "embedding_enabled": embedding_engine.enabled,
+            "api_usage_ok": usage.get("ok", False),
+            "api_usage_warnings": usage.get("warnings", []),
             "buckets": {
                 "permanent": stats.get("permanent_count", 0),
                 "dynamic": stats.get("dynamic_count", 0),
@@ -2117,7 +2838,28 @@ async def api_system_status(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-# --- Entry point / 启动入口 ---
+@mcp.custom_route("/api/api-usage", methods=["GET"])
+async def api_usage_status(request):
+    """Return DeepSeek balance and Gemini embedding availability for Dashboard/monitors."""
+    from starlette.responses import JSONResponse
+    # Read-only usage data: same loopback trust as the memory-room GET routes,
+    # so web.ts can put embedding/dehydrator health on the 機房 dashboard.
+    err = _require_read_access(request)
+    if err: return err
+    force = request.query_params.get("force", "").lower() in ("1", "true", "yes", "on")
+    probe_gemini = request.query_params.get("probe_gemini", "true").lower() not in ("0", "false", "no", "off")
+    try:
+        usage = await api_usage_guard.check_all(force=force, probe_gemini=probe_gemini)
+        if getattr(embedding_engine, "last_error", ""):
+            usage.setdefault("warnings", []).append(
+                f"Gemini embedding 最近一次生成失敗：{embedding_engine.last_error}"
+            )
+        return JSONResponse(usage)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# --- Entry point / 啟動入口 ---
 if __name__ == "__main__":
     transport = config.get("transport", "stdio")
     logger.info(f"Ombre Brain starting | transport: {transport}")
@@ -2128,7 +2870,7 @@ if __name__ == "__main__":
         from starlette.middleware.cors import CORSMiddleware
 
         # --- Application-level keepalive: ping /health every 60s ---
-        # --- 应用层保活：每 60 秒 ping 一次 /health，防止 Cloudflare Tunnel 空闲断连 ---
+        # --- 應用層保活：每 60 秒 ping 一次 /health，防止 Cloudflare Tunnel 空閒斷連 ---
         async def _keepalive_loop():
             await asyncio.sleep(10)  # Wait for server to fully start
             async with httpx.AsyncClient() as client:
@@ -2137,7 +2879,7 @@ if __name__ == "__main__":
                         await client.get(f"http://localhost:{OMBRE_PORT}/health", timeout=5)
                         logger.debug("Keepalive ping OK / 保活 ping 成功")
                     except Exception as e:
-                        logger.warning(f"Keepalive ping failed / 保活 ping 失败: {e}")
+                        logger.warning(f"Keepalive ping failed / 保活 ping 失敗: {e}")
                     await asyncio.sleep(60)
 
         def _start_keepalive():
@@ -2148,7 +2890,7 @@ if __name__ == "__main__":
         t.start()
 
         # --- Add CORS middleware so remote clients (Cloudflare Tunnel / ngrok) can connect ---
-        # --- 添加 CORS 中间件，让远程客户端（Cloudflare Tunnel / ngrok）能正常连接 ---
+        # --- 添加 CORS 中間件，讓遠程客戶端（Cloudflare Tunnel / ngrok）能正常連接 ---
         if transport == "streamable-http":
             _app = mcp.streamable_http_app()
         else:
@@ -2160,7 +2902,7 @@ if __name__ == "__main__":
             allow_headers=["*"],
             expose_headers=["*"],
         )
-        logger.info("CORS middleware enabled for remote transport / 已启用 CORS 中间件")
-        uvicorn.run(_app, host="0.0.0.0", port=OMBRE_PORT)
+        logger.info("CORS middleware enabled for remote transport / 已啟用 CORS 中間件")
+        uvicorn.run(_app, host=OMBRE_HOST, port=OMBRE_PORT)
     else:
         mcp.run(transport=transport)
