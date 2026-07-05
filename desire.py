@@ -156,7 +156,7 @@ def default_state(now: datetime | None = None) -> dict[str, Any]:
         "drives": {k: 0.15 for k in DRIVE_KEYS},
         "fatigue": 0.0,
         "gates": {
-            "intimacy_ok": True,   # Ruby 的開關（月經期／捉i日由外部設）
+            "intimacy_ok": False,  # Ruby 的開關——fail-close：預設關，只有她親口的 set_gate 能開（2026-07-05 定案）
             "driven": False,       # Phase 3 才會用到；Phase 1 永遠只讀
         },
         "veto_until": {},          # drive → iso 時間，冷卻中不再提案
@@ -247,7 +247,7 @@ def pick_intent(state: dict, boosts: dict[str, dict] | None, now: datetime) -> d
 
     scored: list[tuple[float, str]] = []
     for k in DRIVE_KEYS:
-        if k == "libido" and not state.get("gates", {}).get("intimacy_ok", True):
+        if k == "libido" and not state.get("gates", {}).get("intimacy_ok", False):
             continue  # Ruby 關了門，這維不提案（值照漲，開門那天見真章）
         if _active_veto(state, k, now):
             continue  # 冷卻中：我自己剛否決過，先不再提

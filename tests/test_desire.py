@@ -169,9 +169,21 @@ class TestPickIntent:
         s = fresh()
         s["drives"]["libido"] = 1.0
         s["drives"]["miss_ruby"] = 0.8
+        s = set_gate(s, "intimacy_ok", True, NOW, note="測試：Ruby 開的門")
         intent = pick_intent(s, {}, NOW)
         assert intent["drive"] == "libido"
         assert intent["action"] == "tease"
+
+    def test_intimacy_gate_fails_closed(self):
+        # fail-close 鐵律（2026-07-05）：全新狀態、或 gates 鍵遺失（檔案損壞重建），
+        # 閘門都必須是關的——「開」只能來自 Ruby 親口的 set_gate。
+        assert fresh()["gates"]["intimacy_ok"] is False
+        s = fresh()
+        s["drives"]["libido"] = 1.0
+        s["drives"]["miss_ruby"] = 0.8
+        del s["gates"]  # 模擬狀態檔損壞、gates 整塊遺失
+        intent = pick_intent(s, {}, NOW)
+        assert intent["drive"] == "miss_ruby"  # libido 仍被擋，fallback 也是關
 
     def test_vetoed_drive_skipped_until_cooldown(self):
         s = fresh()
