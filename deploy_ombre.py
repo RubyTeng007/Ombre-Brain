@@ -65,8 +65,11 @@ def sha256_local(path: Path) -> str:
 
 
 def sha256_remote(args: argparse.Namespace, files: list[str]) -> dict[str, str]:
+    """Missing remote files simply don't appear in the result (a file that is
+    new this deploy has nothing to drift from), so no check=True here.
+    遠端不存在的檔案就不出現在結果裡（本次新增檔沒有漂移可查），不視為錯誤。"""
     paths = [f"{REMOTE_DIR}/{f}" for f in files]
-    out = ssh(args, ["sha256sum", *paths], capture=True).stdout or ""
+    out = ssh(args, ["sha256sum", *paths], capture=True, check=False).stdout or ""
     hashes: dict[str, str] = {}
     for line in out.splitlines():
         parts = line.split()
@@ -139,8 +142,8 @@ def main() -> int:
         drifted = []
         for f in FILES:
             expected = git_show(marker, f)
-            if expected is None:
-                continue  # file didn't exist at that commit (new file this deploy)
+            if expected is None or f not in remote_hashes:
+                continue  # new file this deploy (absent from that commit or from live)
             if hashlib.sha256(expected).hexdigest() != remote_hashes.get(f):
                 drifted.append(f)
         if drifted and not args.force:
