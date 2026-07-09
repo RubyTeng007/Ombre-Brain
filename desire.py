@@ -71,7 +71,7 @@ MIN_INTENT_SCORE = 0.50      # 低於此分 → 安靜待著（quiet）
 VETO_COOLDOWN_HOURS = 3.0    # 否決後該維冷卻時間
 VETO_DAMP = 0.6              # 否決時該維乘性回落
 MAX_TICK_HOURS = 72.0        # 單次 tick 最大跨度（防時鐘異常暴衝）
-MAX_EVENTS = 30              # events log 保留條數
+MAX_EVENTS = 60              # events log 保留條數（30→60 @2026-07-10：週回顧閉環率統計需要更長樣本）
 
 # 慾望 → 想做的事（我們家的動詞）
 DRIVE_ACTIONS = {
