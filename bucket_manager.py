@@ -166,6 +166,14 @@ class BucketManager:
         self.plan_dir = os.path.join(self.base_dir, "plan")
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
+        # --- BM25 keyword channel: pre-built but dormant (matching.bm25_enabled).
+        # Flip trigger: corpus outgrows rapidfuzz (~2000 buckets) or real recall
+        # misses. When on, BM25 hits join the candidate set and blend into the
+        # topic score — recall insurance, not a ranking rewrite.
+        # --- BM25 關鍵詞通道：預建休眠。開了之後 BM25 命中補進候選集並融入
+        # topic 分——是召回保險，不是重寫排序。---
+        self.bm25_enabled = bool(config.get("matching", {}).get("bm25_enabled", False))
+        self._bm25 = None
 
         # --- Wikilink config / 雙鏈配置 ---
         wikilink_cfg = config.get("wikilink", {})
@@ -669,6 +677,28 @@ class BucketManager:
             except Exception as e:
                 logger.warning(f"Embedding pre-filter failed, using fuzzy only / embedding 預篩失敗: {e}")
 
+        # --- Layer 1.6: BM25 keyword channel (dormant unless matching.bm25_enabled) ---
+        # Recall insurance: strong keyword hits rejoin the candidate set even if
+        # the domain/embedding pre-filters dropped them, and the normalized BM25
+        # score later blends into topic relevance.
+        # --- 第1.6層：BM25 關鍵詞通道（休眠旗標）。強關鍵詞命中補回候選集，
+        # 正規化分數稍後融入 topic 相關度。---
+        bm25_norm: dict[str, float] = {}
+        if self.bm25_enabled:
+            try:
+                bm25_norm = self._bm25_scores(query, all_buckets)
+                if bm25_norm:
+                    candidate_ids = {b["id"] for b in candidates}
+                    by_id = {b["id"]: b for b in all_buckets}
+                    top_ids = sorted(bm25_norm, key=bm25_norm.get, reverse=True)[:20]
+                    for bid in top_ids:
+                        if bid not in candidate_ids and bid in by_id:
+                            candidates.append(by_id[bid])
+                            candidate_ids.add(bid)
+            except Exception as e:
+                logger.warning(f"BM25 channel failed, continuing without / BM25 通道失敗: {e}")
+                bm25_norm = {}
+
         # --- Layer 2: weighted multi-dim ranking ---
         # --- 第二層：多維加權精排 ---
         scored = []
@@ -676,8 +706,10 @@ class BucketManager:
             meta = bucket.get("metadata", {})
 
             try:
-                # Dim 1: topic relevance (fuzzy text, 0~1)
+                # Dim 1: topic relevance (fuzzy text, 0~1; BM25 blends in when enabled)
                 topic_score = self._calc_topic_score(query, bucket)
+                if bm25_norm:
+                    topic_score = max(topic_score, bm25_norm.get(bucket["id"], 0.0))
 
                 # Dim 2: emotion resonance (coordinate distance, 0~1)
                 emotion_score = self._calc_emotion_score(
@@ -726,6 +758,37 @@ class BucketManager:
     # name(×3) + domain(×2.5) + tags(×2) + body(×1)
     # 文本相關性子分：桶名(×3) + 主題域(×2.5) + 標籤(×2) + 正文(×1)
     # ---------------------------------------------------------
+    def _bm25_scores(self, query: str, buckets: list[dict]) -> dict[str, float]:
+        """Normalized (0~1) BM25 scores for the query over the given buckets.
+        The index rebuilds only when the corpus fingerprint changes — at our
+        scale that is tens of milliseconds, paid rarely.
+        對候選語料算正規化 BM25 分；語料指紋沒變就沿用既有索引。"""
+        from bm25_index import Bm25Index
+        version = (
+            len(buckets),
+            hash(tuple(sorted(
+                (b["id"], str(b["metadata"].get("last_active", ""))) for b in buckets
+            ))),
+        )
+        if self._bm25 is None or self._bm25.version != version:
+            docs = {}
+            for b in buckets:
+                meta = b["metadata"]
+                docs[b["id"]] = " ".join([
+                    str(meta.get("name", "")),
+                    " ".join(meta.get("tags", []) or []),
+                    " ".join(meta.get("domain", []) or []),
+                    (b.get("content") or "")[:1000],
+                ])
+            index = Bm25Index()
+            index.build(docs, version=version)
+            self._bm25 = index
+        hits = self._bm25.search(query, top_k=50)
+        if not hits:
+            return {}
+        top = hits[0][1] or 1.0
+        return {doc_id: score / top for doc_id, score in hits}
+
     def _calc_topic_score(self, query: str, bucket: dict) -> float:
         """
         Calculate text dimension relevance score (0~1).

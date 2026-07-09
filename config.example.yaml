@@ -72,7 +72,12 @@ embedding:
   model: "gemini-embedding-001"   # Embedding model / 向量化模型
   # base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
   # api_key: ""
-  # timeout_seconds: 30          # Embedding request timeout (env: OMBRE_EMBED_TIMEOUT_SECONDS)                  
+  # timeout_seconds: 30          # Embedding request timeout (env: OMBRE_EMBED_TIMEOUT_SECONDS)
+  # --- Pre-built local fallback (dormant parachute) / 預建本地降級（休眠降落傘）---
+  # provider: "gemini"           # "gemini" (cloud, default) | "local" (fastembed ONNX, offline)
+  # local_model: "BAAI/bge-small-zh-v1.5"   # 512-dim zh model, pre-downloaded on the VPS
+  # Switch runbook: set provider: local -> restart service -> run backfill_embeddings.py
+  # (all buckets re-embed into the new model space; old gemini vectors stay for switch-back)                  
 
 # --- API usage guard / API 额度护栏 ---
 # DeepSeek has a balance endpoint; Gemini free-tier quota is checked by a
@@ -93,6 +98,7 @@ scoring_weights:
 matching:
   fuzzy_threshold: 50             # Minimum match score (0-100) / 最低匹配分数
   max_results: 5                  # Max results per search / 单次搜索最多返回条数
+  # bm25_enabled: false          # Pre-built BM25 keyword channel (flip when corpus > ~2000 buckets or recall misses)
 
 # --- Obsidian wikilinks / Obsidian 双链自动注入 ---
 wikilink:

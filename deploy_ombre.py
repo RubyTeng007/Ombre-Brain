@@ -35,6 +35,7 @@ MARKER = f"{REMOTE_DIR}/.deployed-commit"
 FILES = [
     "server.py",
     "bucket_manager.py",
+    "bm25_index.py",
     "decay_engine.py",
     "dehydrator.py",
     "embedding_engine.py",

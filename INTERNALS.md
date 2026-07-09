@@ -42,6 +42,34 @@
 熱更新、新 dashboard 前端、AI_NAME 中性化。上游 v2.4.0+ 有 noncommercial 聲明——
 本批次全部按想法自寫，未複製其程式碼。
 
+### 0.5.1 降落傘批次（同日加場，Ruby 拍板「先摺好」）
+
+兩個原本掛牌的項目改為**預建、測試齊、預設休眠**——實作者在場時把傘摺好，
+觸發條件到了只拉繩（改 config），不需要任何人再寫程式碼：
+
+**降落傘 1：本地 embedding fallback**（`embedding.provider: local`）
+- fastembed（ONNX）＋ `BAAI/bge-small-zh-v1.5`（512 維中文小模型），懶載入——
+  provider=gemini 時完全不碰。模型已預下載至 `/opt/ombre-brain/.fastembed-cache`
+  （92MB，備份 tar 已排除；跳傘當下不需要連得上 HuggingFace）。
+- `embeddings.db` 遷移為 `(bucket_id, model)` 複合主鍵：各 provider 的向量空間
+  並存，切換各寫各的、**切回零成本**（Gemini 向量原地保留）。
+- bge 查詢端自動加指令前綴（文檔端不加），LRU 快取鍵含前綴不混撞。
+- **拉繩 runbook**：① `config.yaml` 加 `embedding: {provider: local}` →
+  ② `systemctl restart ombre-brain` → ③ `cd /opt/ombre-brain &&
+  OMBRE_BUCKETS_DIR=buckets .venv/bin/python backfill_embeddings.py`
+  （新空間全量重嵌，本地推理免費，約數分鐘）。信件向量由 letter read 的
+  懶回填逐次補齊（每次 10 封）。切回：provider 改回 gemini ＋ restart，即刻生效。
+- 觸發條件：api_usage_guard 連續報 Gemini 失敗／Google 改免費額度政策。
+
+**降落傘 2：BM25 關鍵詞通道**（`matching.bm25_enabled: true`）
+- 自寫 `bm25_index.py`：Okapi BM25，內建斷詞（英數連段＋CJK bigram，索引端補
+  unigram 讓單字查詢可命中），純 stdlib 零依賴。
+- 接在 search 第 1.6 層：BM25 前 20 名補回候選集（召回保險——domain/向量預篩
+  漏掉的強關鍵詞命中撈回來），正規化分數以 max 融入 topic 相關度，不重寫排序。
+- 索引按語料指紋（桶數＋id/last_active hash）快取，變動才重建（數百桶 ≈ 數十 ms）。
+- **拉繩 runbook**：`config.yaml` 的 `matching:` 加 `bm25_enabled: true` → restart。
+- 觸發條件：桶數破 2000／出現真實召回缺口。
+
 ---
 
 ## 0. 功能总览——这个系统到底做了什么

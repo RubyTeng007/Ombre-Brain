@@ -297,3 +297,124 @@ class TestTimeoutConfig:
         monkeypatch.setenv("OMBRE_COMPRESS_TIMEOUT_SECONDS", "not-a-number")
         cfg = load_config(config_path=str(tmp_path / "missing.yaml"))
         assert "timeout_seconds" not in cfg.get("dehydration", {})
+
+
+# ---------------------------------------------------------
+# 9. BM25 keyword channel (dormant parachute #2)
+# ---------------------------------------------------------
+class TestBm25:
+    def test_chinese_bigram_match(self):
+        from bm25_index import Bm25Index
+        idx = Bm25Index()
+        idx.build({
+            "a": "陪 Ruby 去建國花市挑植物",
+            "b": "修理備份腳本與部署流程",
+            "c": "讀 Klara and the Sun 交換筆記",
+        })
+        hits = idx.search("花市 植物")
+        assert hits and hits[0][0] == "a"
+
+    def test_english_match(self):
+        from bm25_index import Bm25Index
+        idx = Bm25Index()
+        idx.build({"a": "Klara and the Sun reading notes", "b": "backup script"})
+        hits = idx.search("klara sun")
+        assert hits and hits[0][0] == "a"
+
+    def test_single_char_query_hits(self):
+        from bm25_index import Bm25Index
+        idx = Bm25Index()
+        idx.build({"a": "貓咪很可愛", "b": "備份腳本"})
+        hits = idx.search("貓")
+        assert hits and hits[0][0] == "a"
+
+    def test_empty_query_and_corpus(self):
+        from bm25_index import Bm25Index
+        idx = Bm25Index()
+        assert idx.search("任何") == []
+        idx.build({})
+        assert idx.search("") == []
+
+    def test_bm25_recall_insurance_in_search(self, test_config, mock_embedding_engine):
+        """關鍵詞強命中但 fuzzy 分低的桶，開旗標後仍要能進候選集"""
+        import asyncio
+        from bucket_manager import BucketManager
+        test_config["matching"]["bm25_enabled"] = True
+        mgr = BucketManager(test_config, embedding_engine=mock_embedding_engine)
+        async def run():
+            await mgr.create(content="建國花市有很多多肉植物", tags=["花市"], domain=["日常"], name="花市見聞")
+            await mgr.create(content="今天debug了三小時", tags=["編程"], domain=["編程"], name="debug日")
+            return await mgr.search("花市 多肉")
+        results = asyncio.run(run())
+        assert results and results[0]["metadata"]["name"] == "花市見聞"
+
+    def test_bm25_disabled_by_default(self, test_config):
+        from bucket_manager import BucketManager
+        mgr = BucketManager(test_config)
+        assert mgr.bm25_enabled is False
+
+
+# ---------------------------------------------------------
+# 10. local embedding provider (dormant parachute #1)
+# ---------------------------------------------------------
+class TestLocalEmbeddingProvider:
+    def _local_engine(self, tmp_path, monkeypatch=None):
+        from embedding_engine import EmbeddingEngine
+        cfg = {
+            "buckets_dir": str(tmp_path / "buckets"),
+            "embedding": {"provider": "local", "enabled": True},
+            "dehydration": {},
+        }
+        return EmbeddingEngine(cfg)
+
+    def test_local_enabled_without_api_key(self, tmp_path):
+        engine = self._local_engine(tmp_path)
+        assert engine.enabled is True
+        assert engine.provider == "local"
+        assert engine.model == "BAAI/bge-small-zh-v1.5"
+        assert engine.client is None  # cloud client never built in local mode
+
+    def test_model_namespace_isolation(self, tmp_path):
+        """gemini 向量與 local 向量分空間：切 provider 後互不可見、切回無損"""
+        from embedding_engine import EmbeddingEngine
+        cfg_gemini = {
+            "buckets_dir": str(tmp_path / "buckets"),
+            "embedding": {"api_key": "fake", "enabled": True},
+            "dehydration": {},
+        }
+        g = EmbeddingEngine(cfg_gemini)
+        g._store_embedding("bucket1", [1.0, 0.0])
+        assert g.list_ids() == {"bucket1"}
+
+        local = self._local_engine(tmp_path)
+        assert local.list_ids() == set()  # 新空間看不到 gemini 向量 → 觸發回填
+        local._store_embedding("bucket1", [0.5, 0.5, 0.5])
+        assert local.list_ids() == {"bucket1"}
+        # 切回 gemini：原向量還在
+        assert _run(g.get_embedding("bucket1")) == [1.0, 0.0]
+
+    def test_query_prefix_applied_only_for_queries(self, tmp_path):
+        engine = self._local_engine(tmp_path)
+        seen = []
+        async def fake_embed(truncated):
+            seen.append(truncated)
+            return [1.0]
+        engine._embed_uncached = fake_embed
+        _run(engine._generate_embedding("花市", is_query=False))
+        _run(engine._generate_embedding("花市", is_query=True))
+        assert seen[0] == "花市"
+        assert seen[1].startswith("为这个句子生成表示") and seen[1].endswith("花市")
+
+    def test_legacy_rows_migrated_to_gemini_model(self, tmp_path):
+        """舊庫（無 model 欄）遷移後，舊向量歸入 gemini 空間"""
+        import os, sqlite3, json
+        from embedding_engine import EmbeddingEngine
+        db_dir = tmp_path / "buckets"
+        os.makedirs(db_dir, exist_ok=True)
+        db = sqlite3.connect(str(db_dir / "embeddings.db"))
+        db.execute("CREATE TABLE embeddings (bucket_id TEXT PRIMARY KEY, embedding TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        db.execute("INSERT INTO embeddings VALUES ('old1', ?, '2026-07-01')", (json.dumps([1.0]),))
+        db.commit(); db.close()
+        cfg = {"buckets_dir": str(db_dir), "embedding": {"api_key": "fake", "enabled": True}, "dehydration": {}}
+        engine = EmbeddingEngine(cfg)
+        assert engine.list_ids() == {"old1"}
