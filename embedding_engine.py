@@ -16,10 +16,18 @@ import json
 import math
 import sqlite3
 import logging
+from collections import OrderedDict
 
 from openai import AsyncOpenAI
 
 logger = logging.getLogger("ombre_brain.embedding")
+
+# In-process LRU for text→vector: one breath(query=...) embeds the same query
+# in the pre-filter (bucket_mgr.search) AND the vector channel; hold/grow embed
+# the same new content in the semantic merge gate and again on store. Same text
+# + same model = same vector, so caching kills those duplicate API calls.
+# 同一次 breath 檢索會在預篩和向量通道各嵌一次同樣的查詢；快取直接省掉重複呼叫。
+_TEXT_CACHE_MAXSIZE = 64
 
 
 class EmbeddingEngine:
@@ -42,17 +50,23 @@ class EmbeddingEngine:
         self.enabled = bool(self.api_key) and embed_cfg.get("enabled", True)
         self.last_error = ""
         self.last_success = False
+        self._text_cache: "OrderedDict[str, list[float]]" = OrderedDict()
 
         # --- SQLite path: buckets_dir/embeddings.db ---
         db_path = os.path.join(config["buckets_dir"], "embeddings.db")
         self.db_path = db_path
+
+        try:
+            timeout_seconds = float(embed_cfg.get("timeout_seconds", 30.0))
+        except (TypeError, ValueError):
+            timeout_seconds = 30.0
 
         # --- Initialize client ---
         if self.enabled:
             self.client = AsyncOpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
-                timeout=30.0,
+                timeout=timeout_seconds,
             )
         else:
             self.client = None
@@ -106,9 +120,22 @@ class EmbeddingEngine:
             return False
 
     async def _generate_embedding(self, text: str) -> list[float]:
-        """Call API to generate embedding vector."""
+        """Call API to generate embedding vector (LRU-cached per text)."""
         # Truncate to avoid token limits
         truncated = text[:2000]
+        cached = self._text_cache.get(truncated)
+        if cached is not None:
+            self._text_cache.move_to_end(truncated)
+            return list(cached)
+        embedding = await self._embed_uncached(truncated)
+        if embedding:
+            self._text_cache[truncated] = list(embedding)
+            self._text_cache.move_to_end(truncated)
+            while len(self._text_cache) > _TEXT_CACHE_MAXSIZE:
+                self._text_cache.popitem(last=False)
+        return embedding
+
+    async def _embed_uncached(self, truncated: str) -> list[float]:
         try:
             response = await self.client.embeddings.create(
                 model=self.model,
@@ -162,11 +189,16 @@ class EmbeddingEngine:
                 return None
         return None
 
-    async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
+    async def search_similar(
+        self, query: str, top_k: int = 10, id_prefix: str | None = None
+    ) -> list[tuple[str, float]]:
         """
         Search for buckets similar to query text.
         Returns list of (bucket_id, similarity_score) sorted by score desc.
-        搜索與查詢文本相似的桶。返回 (bucket_id, 相似度分數) 列表。
+        id_prefix=None searches bucket vectors only (non-bucket rows like
+        "letter:*" are excluded); id_prefix="letter:" searches just that family.
+        搜索與查詢文本相似的桶。默認只搜桶向量（排除 letter: 等前綴列），
+        傳 id_prefix 則只搜該前綴家族。
         """
         if not self.enabled:
             return []
@@ -179,9 +211,17 @@ class EmbeddingEngine:
             logger.warning(f"Query embedding failed: {e}")
             return []
 
-        # Load all embeddings from SQLite
+        # Load candidate embeddings from SQLite
         conn = sqlite3.connect(self.db_path)
-        rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
+        if id_prefix:
+            rows = conn.execute(
+                "SELECT bucket_id, embedding FROM embeddings WHERE bucket_id LIKE ?",
+                (f"{id_prefix}%",),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT bucket_id, embedding FROM embeddings WHERE bucket_id NOT LIKE 'letter:%'"
+            ).fetchall()
         conn.close()
 
         if not rows:

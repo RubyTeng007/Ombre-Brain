@@ -31,7 +31,7 @@ import random
 import secrets
 import logging
 import shutil
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -103,6 +103,29 @@ def normalize_domains(domains: list[str]) -> list[str]:
     return out
 
 
+# Plan bucket lifecycle states + whitelisted extra metadata keys.
+# plan 桶的生命週期狀態 + 附加元數據白名單。
+_PLAN_STATUSES = ("active", "resolved", "abandoned")
+_EXTRA_META_KEYS = ("status", "weight", "related_bucket", "why_remembered")
+
+
+def _normalize_meta_datetimes(metadata: dict) -> dict:
+    """
+    Buckets written by this system quote their timestamps, but a hand-edited
+    file (e.g. via Obsidian) can leave them unquoted and YAML parses those into
+    datetime/date objects — which then break string sorts and JSON responses.
+    Normalize every datetime-ish value back to an ISO string at the read layer.
+    手編輯的桶檔若時間戳沒加引號，YAML 會解析成 datetime 物件，
+    排序與 JSON 序列化都會炸。在讀取層統一轉回 ISO 字串。
+    """
+    for key, value in metadata.items():
+        if isinstance(value, datetime):
+            metadata[key] = value.isoformat()
+        elif isinstance(value, date):
+            metadata[key] = value.isoformat()
+    return metadata
+
+
 def atomic_write_text(file_path: str, text: str) -> None:
     """Write file via tmp + fsync + rename so a crash never leaves a half-written bucket.
     與 letters/self_concept 相同的原子寫入模式；桶是最重要的存儲，不該比它們脆。"""
@@ -140,6 +163,7 @@ class BucketManager:
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
         self.archive_dir = os.path.join(self.base_dir, "archive")
         self.feel_dir = os.path.join(self.base_dir, "feel")
+        self.plan_dir = os.path.join(self.base_dir, "plan")
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
 
@@ -196,6 +220,7 @@ class BucketManager:
         name: str = None,
         pinned: bool = False,
         protected: bool = False,
+        extra_meta: dict = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -243,6 +268,22 @@ class BucketManager:
             metadata["pinned"] = True
         if protected:
             metadata["protected"] = True
+        # --- Whitelisted extra metadata (plan fields, provenance notes) ---
+        # --- 白名單制的附加元數據（plan 欄位、記錄原因）---
+        for key in _EXTRA_META_KEYS:
+            value = (extra_meta or {}).get(key)
+            if value is None or value == "":
+                continue
+            if key == "weight":
+                try:
+                    metadata[key] = max(0.0, min(1.0, float(value)))
+                except (TypeError, ValueError):
+                    continue
+            elif key == "status":
+                if str(value) in _PLAN_STATUSES:
+                    metadata[key] = str(value)
+            else:
+                metadata[key] = str(value)[:200]
 
         # --- Assemble Markdown file (frontmatter + body) ---
         # --- 組裝 Markdown 文件 ---
@@ -254,6 +295,8 @@ class BucketManager:
             type_dir = self.permanent_dir
         elif bucket_type == "feel":
             type_dir = self.feel_dir
+        elif bucket_type == "plan":
+            type_dir = self.plan_dir
         else:
             type_dir = self.dynamic_dir
         if bucket_type == "feel":
@@ -377,6 +420,17 @@ class BucketManager:
             post["digested"] = bool(kwargs["digested"])
         if "model_valence" in kwargs:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
+        if "status" in kwargs and str(kwargs["status"]) in _PLAN_STATUSES:
+            post["status"] = str(kwargs["status"])
+        if "weight" in kwargs:
+            try:
+                post["weight"] = max(0.0, min(1.0, float(kwargs["weight"])))
+            except (TypeError, ValueError):
+                pass
+        if "why_remembered" in kwargs:
+            post["why_remembered"] = str(kwargs["why_remembered"])[:200]
+        if "related_bucket" in kwargs:
+            post["related_bucket"] = str(kwargs["related_bucket"])[:64]
 
         # --- Auto-refresh activation time / 自動刷新激活時間 ---
         post["last_active"] = now_iso()
@@ -571,9 +625,12 @@ class BucketManager:
         limit = limit or self.max_results
         all_buckets = await self.list_all(include_archive=False)
 
-        # --- Feels are a private channel (breath domain="feel" only), never search results ---
-        # --- feel 是獨立私人通道，永遠不進普通搜索 ---
-        all_buckets = [b for b in all_buckets if b["metadata"].get("type") != "feel"]
+        # --- Feels are a private channel (breath domain="feel" only), never search results.
+        # Plans live in dream's tail only — keeping them out of search also keeps
+        # merge_or_create from ever merging ordinary memories into a plan. ---
+        # --- feel 是獨立私人通道，永遠不進普通搜索；plan 只活在 dream 尾端，
+        # 排除在搜索外也保證合併管線永遠不會把普通記憶併進 plan。---
+        all_buckets = [b for b in all_buckets if b["metadata"].get("type") not in ("feel", "plan")]
 
         if not all_buckets:
             return []
@@ -750,7 +807,7 @@ class BucketManager:
         """
         buckets = []
 
-        dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir]
+        dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir, self.plan_dir]
         if include_archive:
             dirs.append(self.archive_dir)
 
@@ -797,6 +854,7 @@ class BucketManager:
             "dynamic_count": 0,
             "archive_count": 0,
             "feel_count": 0,
+            "plan_count": 0,
             "total_size_kb": 0.0,
             "domains": {},
         }
@@ -806,6 +864,7 @@ class BucketManager:
             (self.dynamic_dir, "dynamic_count"),
             (self.archive_dir, "archive_count"),
             (self.feel_dir, "feel_count"),
+            (self.plan_dir, "plan_count"),
         ]:
             if not os.path.exists(subdir):
                 continue
@@ -909,7 +968,7 @@ class BucketManager:
         """
         if not bucket_id:
             return None
-        for dir_path in [self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir]:
+        for dir_path in [self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir, self.plan_dir]:
             if not os.path.exists(dir_path):
                 continue
             for root, _, files in os.walk(dir_path):
@@ -936,7 +995,7 @@ class BucketManager:
             post = frontmatter.load(file_path)
             return {
                 "id": post.get("id", Path(file_path).stem),
-                "metadata": dict(post.metadata),
+                "metadata": _normalize_meta_datetimes(dict(post.metadata)),
                 "content": post.content,
                 "path": file_path,
             }

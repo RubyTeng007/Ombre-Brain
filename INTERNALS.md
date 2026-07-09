@@ -1,7 +1,46 @@
 # Ombre Brain — 内部开发文档 / INTERNALS
 
 > 本文档面向开发者和维护者。记录功能总览、环境变量、模块依赖、硬编码值和核心设计决策。
-> 最后更新：2026-04-19
+> 最后更新：2026-07-10（上游借鑑批次；0 章節之後的細節以程式碼為準）
+
+## 0.5 2026-07-10 上游借鑑批次（借想法不借程式碼，全部自寫）
+
+比照上游 P0luz/Ombre-Brain v2.3.10–v2.5.0 的更新，挑我們要的重新實作：
+
+**正確性**
+- embedding 文本 LRU 快取（64 條，`embedding_engine._generate_embedding`）：同一查詢在
+  bucket_mgr.search 預篩與 breath 向量通道各嵌一次的重複 API 呼叫直接省掉；失敗不快取。
+- 讀取層 datetime 正規化（`bucket_manager._normalize_meta_datetimes`）：手編輯（Obsidian）
+  的桶檔時間戳沒加引號時 YAML 會解析成 datetime 物件，排序 TypeError、JSON 序列化爆炸——
+  讀取時統一轉 ISO 字串。
+- `breath(importance_min=N)` 檔位保留（`utils.select_importance_tiers`）：高分桶塞滿上限時，
+  每個 importance 檔位先保一個最近更新的席位，剛降級的桶不再被擠出清單。
+
+**功能**
+- `grow(items=[...])` 逐字入庫：調用方帶完整上下文預拆好的定稿逐字保存，只補元數據；
+  合併老桶一律原文追加（merge_audit mode="verbatim-append"），不經 LLM 改寫。
+- `breath(catalog=True)` 目錄模式：一行一桶元數據、0 次 LLM 呼叫，token 預算內裝多少列多少，
+  可配 domain 過濾；feel 不列。
+- `dream(window_hours=48)` 時間窗：改按 last_active 開窗（被合併更新的老桶也回到夢裡——
+  舊 created 排序的盲點），窗口空退回最近創建；正文截斷 500→1200 字。
+- **plan 承諾帳本**（`bucket_type="plan"`，`buckets/plan/`）：`plan()` 工具登記，原文逐字、
+  不衰減、不進普通 breath/搜尋/合併/執念，只在 dream 尾端「記掛著的事」按 weight 排序出現；
+  `trace(status="active/resolved/abandoned", weight=0~1)` 管生命週期。importance=多重要，
+  weight=多重。暫不接 desire 執念（固定分會打滿 duty 加成，日後共同決策）。
+- 信件語義檢索：letter 寫入建向量（embeddings.db key=`letter:<id>`，桶搜尋預設排除、
+  向量衛生不清），read+query 時子字串優先、語義補位（sim≥0.45，懶回填每次最多 10 封）。
+- `hold/trace(why_remembered=...)`：記住的原因，展示欄位不計分，dream 會顯示。
+
+**小件**：`utils.clean_llm_json`（LLM 回覆 JSON 統一清洗，analyze/digest 共用）；
+`dehydration.timeout_seconds`/`embedding.timeout_seconds` 可配
+（env `OMBRE_COMPRESS_TIMEOUT_SECONDS`/`OMBRE_EMBED_TIMEOUT_SECONDS`）。
+
+**運維**：新增 `deploy_ombre.py`（pytest 門 → 漂移檢查 → 兩段式安裝 → 重啟 → hash 驗證 →
+健康檢查 → `.deployed-commit` 部署章）。測試 `tests/test_upstream_inspired.py`。
+
+刻意不跟上游的：src/ 大重構、v3 深內核（WAL/Raft/policy VM）、multi-owner、OAuth、
+熱更新、新 dashboard 前端、AI_NAME 中性化。上游 v2.4.0+ 有 noncommercial 聲明——
+本批次全部按想法自寫，未複製其程式碼。
 
 ---
 

@@ -48,6 +48,7 @@ dehydration:
   # api_key: ""    # ⚠️ Use env var OMBRE_API_KEY instead / 请使用环境变量 OMBRE_API_KEY
   max_tokens: 1024
   temperature: 0.1
+  # timeout_seconds: 60          # LLM request timeout (env: OMBRE_COMPRESS_TIMEOUT_SECONDS)
 
 # --- Decay parameters / 记忆衰减参数 ---
 # Simulates Ebbinghaus forgetting curve, auto-archives inactive memories
@@ -70,7 +71,8 @@ embedding:
   enabled: true                   # Enable embedding / 启用向量化
   model: "gemini-embedding-001"   # Embedding model / 向量化模型
   # base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
-  # api_key: ""                  
+  # api_key: ""
+  # timeout_seconds: 30          # Embedding request timeout (env: OMBRE_EMBED_TIMEOUT_SECONDS)                  
 
 # --- API usage guard / API 额度护栏 ---
 # DeepSeek has a balance endpoint; Gemini free-tier quota is checked by a

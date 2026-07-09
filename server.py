@@ -67,7 +67,10 @@ from api_usage_guard import ApiUsageGuard
 import desire as desire_kernel
 from datetime import datetime, timedelta
 
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, now_iso
+from utils import (
+    load_config, setup_logging, strip_wikilinks, count_tokens_approx, now_iso,
+    parse_bucket_ts as _parse_ts, select_importance_tiers as _select_importance_tiers,
+)
 
 # --- Load config & init logging / 加載配置 & 初始化日誌 ---
 config = load_config()
@@ -410,7 +413,7 @@ async def breath_hook(request):
         unresolved = [b for b in all_buckets
                       if not b["metadata"].get("resolved", False)
                       and not b["metadata"].get("digested", False)
-                      and b["metadata"].get("type") not in ("permanent", "feel")
+                      and b["metadata"].get("type") not in ("permanent", "feel", "plan")
                       and not b["metadata"].get("pinned")
                       and not b["metadata"].get("protected")]
         scored = sorted(unresolved, key=lambda b: decay_engine.calculate_score(b["metadata"]), reverse=True)
@@ -499,7 +502,7 @@ async def dream_hook(request):
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         candidates = [
             b for b in all_buckets
-            if b["metadata"].get("type") not in ("permanent", "feel")
+            if b["metadata"].get("type") not in ("permanent", "feel", "plan")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
             and not b["metadata"].get("digested", False)
@@ -562,12 +565,16 @@ async def _merge_or_create(
     valence: float,
     arousal: float,
     name: str = "",
+    verbatim: bool = False,
+    extra_meta: dict = None,
 ) -> tuple[str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
     Returns (bucket_id_or_name, is_merged).
+    verbatim=True: the text is final — a merge appends it word-for-word instead
+    of an LLM rewrite, and creation stores it untouched.
     檢查是否有相似桶可合併，有則合併，無則新建。
-    返回 (桶ID或名稱, 是否合併)。
+    verbatim=True：正文已是定稿——合併走原文追加、不經 LLM 改寫，新建也逐字保存。
     """
     try:
         existing = await bucket_mgr.search(content, limit=1, domain_filter=domain or None)
@@ -608,12 +615,13 @@ async def _merge_or_create(
             try:
                 # --- Long buckets skip the LLM rewrite (input is truncated at 2000
                 # chars and output replaces the whole bucket → tail loss). Append
-                # verbatim instead; nothing is ever silently eaten.
+                # verbatim instead; nothing is ever silently eaten. verbatim=True
+                # (pre-split final text) always appends — the words are the point.
                 # --- 長桶跳過 LLM 改寫（輸入截斷2000字、輸出整桶覆蓋會吃掉尾部），
-                # 改為原文附加，絕不靜默丟內容。---
-                if len(bucket["content"]) > 2000:
+                # 改為原文附加，絕不靜默丟內容。verbatim=True（預拆定稿）一律附加。---
+                if verbatim or len(bucket["content"]) > 2000:
                     merged = bucket["content"].rstrip() + "\n\n---\n" + content.strip()
-                    merge_mode = "append"
+                    merge_mode = "verbatim-append" if verbatim else "append"
                 else:
                     merged = await dehydrator.merge(bucket["content"], content)
                     merge_mode = "llm"
@@ -648,6 +656,7 @@ async def _merge_or_create(
         valence=valence,
         arousal=arousal,
         name=name or None,
+        extra_meta=extra_meta,
     )
     # --- Generate embedding for new bucket ---
     try:
@@ -675,11 +684,69 @@ async def breath(
     arousal: float = -1,
     max_results: int = 20,
     importance_min: int = -1,
+    catalog: bool = False,
 ) -> str:
-    """檢索/浮現記憶。不傳query或傳空=自動浮現,有query=關鍵詞檢索。max_tokens控制返回總token上限(默認10000)。domain逗號分隔,valence/arousal 0~1(-1忽略)。max_results控制返回數量上限(默認20,最大50)。importance_min>=1時按重要度批量拉取(不走語義搜索,按importance降序返回最多20條)。"""
+    """檢索/浮現記憶。不傳query或傳空=自動浮現,有query=關鍵詞檢索。catalog=True=目錄模式:每桶一行元數據(0次LLM呼叫,最省token),適合開場先看目錄再精準拉取,可配domain過濾。max_tokens控制返回總token上限(默認10000)。domain逗號分隔,valence/arousal 0~1(-1忽略)。max_results控制返回數量上限(默認20,最大50)。importance_min>=1時按重要度批量拉取(不走語義搜索,按importance降序返回最多20條)。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
+
+    # --- Catalog mode: one metadata line per bucket, zero LLM calls ---
+    # --- 目錄模式：一行一桶，0 次 LLM 呼叫，token 預算內裝多少列多少 ---
+    if catalog:
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+        except Exception as e:
+            return f"記憶系統暫時無法訪問: {e}"
+        domain_filter = {d.strip() for d in domain.split(",") if d.strip()}
+        rows = []
+        for b in all_buckets:
+            meta = b["metadata"]
+            if meta.get("type") == "feel":
+                continue  # feel 是私人通道，目錄也不列
+            if domain_filter and not (set(meta.get("domain", [])) & domain_filter):
+                continue
+            rows.append(b)
+        if not rows:
+            return "目錄為空。" if not domain_filter else f"沒有 domain 命中 {','.join(sorted(domain_filter))} 的記憶。"
+        # Pinned first, then by decay score desc — the alive stuff first
+        def _catalog_key(b):
+            meta = b["metadata"]
+            pinned = bool(meta.get("pinned") or meta.get("protected"))
+            try:
+                score = decay_engine.calculate_score(meta)
+            except Exception:
+                score = 0.0
+            return (pinned, score)
+        rows.sort(key=_catalog_key, reverse=True)
+        lines = []
+        token_used = 0
+        shown = 0
+        for b in rows:
+            meta = b["metadata"]
+            flags = []
+            if meta.get("pinned") or meta.get("protected"):
+                flags.append("📌")
+            if meta.get("type") == "plan":
+                flags.append(f"plan:{meta.get('status', 'active')}")
+            if meta.get("resolved"):
+                flags.append("已解決")
+            if meta.get("digested"):
+                flags.append("已隱藏")
+            line = (
+                f"[{b['id']}] {meta.get('name', b['id'])} "
+                f"|{','.join(meta.get('domain', []))}| 重要:{meta.get('importance', '?')}"
+                + (f" {' '.join(flags)}" if flags else "")
+            )
+            t = count_tokens_approx(line)
+            if token_used + t > max_tokens:
+                break
+            lines.append(line)
+            token_used += t
+            shown += 1
+        header = f"=== 記憶目錄（{shown}/{len(rows)} 桶）===\n"
+        note = "" if shown == len(rows) else f"\n…還有 {len(rows) - shown} 桶未列出（提高 max_tokens 或加 domain 過濾）"
+        return header + "\n".join(lines) + note
 
     # --- importance_min mode: bulk fetch by importance threshold ---
     # --- 重要度批量拉取模式：跳過語義搜索，按 importance 降序返回 ---
@@ -691,11 +758,11 @@ async def breath(
         filtered = [
             b for b in all_buckets
             if int(b["metadata"].get("importance", 0)) >= importance_min
-            and b["metadata"].get("type") not in ("feel",)
+            and b["metadata"].get("type") not in ("feel", "plan")
             and not b["metadata"].get("digested", False)
         ]
         filtered.sort(key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True)
-        filtered = filtered[:20]
+        filtered = _select_importance_tiers(filtered, cap=20)
         if not filtered:
             return f"沒有重要度 >= {importance_min} 的記憶。"
         results = []
@@ -773,7 +840,7 @@ async def breath(
             b for b in all_buckets
             if not b["metadata"].get("resolved", False)
             and not b["metadata"].get("digested", False)
-            and b["metadata"].get("type") not in ("permanent", "feel")
+            and b["metadata"].get("type") not in ("permanent", "feel", "plan")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
         ]
@@ -898,11 +965,12 @@ async def breath(
                 if not bucket:
                     continue
                 meta = bucket["metadata"]
-                # feel is a private channel; digested means hidden from recall push
-                # feel 是私人通道；digested 桶不經向量通道回浮
+                # feel is a private channel; plan lives in dream's tail only;
+                # digested means hidden from recall push
+                # feel 是私人通道；plan 只活在 dream 尾端；digested 桶不經向量通道回浮
                 if meta.get("pinned") or meta.get("protected"):
                     continue
-                if meta.get("type") == "feel" or meta.get("digested"):
+                if meta.get("type") in ("feel", "plan") or meta.get("digested"):
                     continue
                 # A strong semantic hit on an archived memory revives it:
                 # it comes back to dynamic/ (resolved) instead of being half-dead.
@@ -961,7 +1029,7 @@ async def breath(
             low_weight = [
                 b for b in all_buckets
                 if b["id"] not in matched_ids
-                and b["metadata"].get("type") not in ("feel", "permanent")
+                and b["metadata"].get("type") not in ("feel", "permanent", "plan")
                 and not b["metadata"].get("digested", False)
                 and decay_engine.calculate_score(b["metadata"]) < 2.0
             ]
@@ -998,8 +1066,9 @@ async def hold(
     feel: bool = False,
     source_bucket: str = "",    valence: float = -1,
     arousal: float = -1,
+    why_remembered: str = "",
 ) -> str:
-    """存儲單條記憶,自動打標+合併。tags逗號分隔,importance 1-10。pinned=True創建永久釘選桶。feel=True存儲你的第一人稱感受(不參與普通浮現)。source_bucket=被消化的記憶桶ID(feel模式下,標記源記憶為已消化)。"""
+    """存儲單條記憶,自動打標+合併。tags逗號分隔,importance 1-10。pinned=True創建永久釘選桶。feel=True存儲你的第一人稱感受(不參與普通浮現)。source_bucket=被消化的記憶桶ID(feel模式下,標記源記憶為已消化)。why_remembered=為什麼記住(可選,自由文本,僅展示不計分)。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 輸入校驗 ---
@@ -1077,6 +1146,7 @@ async def hold(
             name=suggested_name or None,
             bucket_type="permanent",
             pinned=True,
+            extra_meta={"why_remembered": why_remembered} if why_remembered.strip() else None,
         )
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
@@ -1093,6 +1163,7 @@ async def hold(
         valence=final_valence,
         arousal=final_arousal,
         name=suggested_name,
+        extra_meta={"why_remembered": why_remembered} if why_remembered.strip() else None,
     )
 
     action = "合併→" if is_merged else "新建→"
@@ -1104,9 +1175,55 @@ async def hold(
 # 工具 3：grow — 生長，一天的碎片長成記憶
 # =============================================================
 @mcp.tool()
-async def grow(content: str) -> str:
-    """日記歸檔,自動拆分為多桶。短內容(<30字)走快速路徑。"""
+async def grow(content: str = "", items: list = None) -> str:
+    """日記歸檔,自動拆分為多桶。短內容(<30字)走快速路徑。進階:若你已在完整上下文裡把長文拆成N條定稿,傳items=[條1,條2,...](字串列表)即可逐字入庫——跳過系統二次拆分改寫,每條正文一字不動只補元數據;合併到老桶也用原文追加不壓縮。傳了items就忽略content。"""
     await decay_engine.ensure_started()
+
+    # --- Verbatim mode: the caller pre-split the text with full context.
+    # Each item is final prose — store it word-for-word, only add metadata.
+    # --- 逐字入庫模式：調用方帶著完整上下文拆好了條目，正文一字不動，只補元數據。---
+    if items:
+        if not isinstance(items, list):
+            return "items 必須是字串列表。"
+        clean_items = [str(it).strip() for it in items if str(it).strip()][:50]
+        if not clean_items:
+            return "items 為空，沒有可入庫的條目。"
+        results = []
+        created = 0
+        merged = 0
+        for item_text in clean_items:
+            try:
+                try:
+                    analysis = await dehydrator.analyze(item_text)
+                except Exception as e:
+                    logger.warning(f"Verbatim item analyze failed / 逐字條目打標失敗: {e}")
+                    analysis = {
+                        "domain": ["未分類"], "valence": 0.5, "arousal": 0.3,
+                        "tags": [], "suggested_name": "",
+                    }
+                result_name, is_merged = await _merge_or_create(
+                    content=item_text,
+                    tags=analysis.get("tags", []),
+                    importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
+                    domain=analysis.get("domain", ["未分類"]),
+                    valence=analysis.get("valence", 0.5),
+                    arousal=analysis.get("arousal", 0.3),
+                    name=analysis.get("suggested_name", ""),
+                    verbatim=True,
+                )
+                if is_merged:
+                    results.append(f"📎{result_name}")
+                    merged += 1
+                else:
+                    results.append(f"📝{result_name}")
+                    created += 1
+            except Exception as e:
+                logger.warning(f"Verbatim item failed / 逐字條目入庫失敗: {e}")
+                results.append(f"⚠️{item_text[:20]}")
+        return (
+            f"逐字入庫 {len(clean_items)}條|新{created}合{merged}\n" + "\n".join(results)
+            + await _api_usage_warning_suffix()
+        )
 
     if not content or not content.strip():
         return "內容為空，無法整理。"
@@ -1206,8 +1323,11 @@ async def trace(
     digested: int = -1,
     content: str = "",
     delete: bool = False,
+    status: str = "",
+    weight: float = -1,
+    why_remembered: str = "",
 ) -> str:
-    """修改記憶元數據或內容。resolved=1沉底/0激活,pinned=1釘選/0取消,digested=1隱藏(保留但不浮現)/0取消隱藏,content=替換桶正文,delete=True刪除。只傳需改的,-1或空=不改。"""
+    """修改記憶元數據或內容。resolved=1沉底/0激活,pinned=1釘選/0取消,digested=1隱藏(保留但不浮現)/0取消隱藏,content=替換桶正文,delete=True刪除。status=plan桶狀態(active/resolved/abandoned),weight=plan承諾重量0.0-1.0(僅plan桶),why_remembered=更新記住的原因。只傳需改的,-1或空=不改。"""
 
     if not bucket_id or not bucket_id.strip():
         return "請提供有效的 bucket_id。"
@@ -1247,6 +1367,21 @@ async def trace(
         updates["digested"] = bool(digested)
     if content:
         updates["content"] = content
+    if why_remembered:
+        updates["why_remembered"] = why_remembered
+    # --- Plan-only fields: status / weight ---
+    # --- plan 專屬欄位：status / weight ---
+    is_plan = bucket["metadata"].get("type") == "plan"
+    if status:
+        if not is_plan:
+            return f"status 只能用在 plan 桶上（{bucket_id} 是 {bucket['metadata'].get('type', 'dynamic')} 桶）。"
+        if status not in ("active", "resolved", "abandoned"):
+            return "status 只接受 active/resolved/abandoned。"
+        updates["status"] = status
+    if 0 <= weight <= 1:
+        if not is_plan:
+            return f"weight 只能用在 plan 桶上（{bucket_id} 是 {bucket['metadata'].get('type', 'dynamic')} 桶）。"
+        updates["weight"] = weight
 
     if not updates:
         return "沒有任何字段需要修改。"
@@ -1277,6 +1412,9 @@ async def trace(
             changed += " → 已隱藏，保留但不再浮現"
         else:
             changed += " → 已取消隱藏，重新參與浮現"
+    if "status" in updates:
+        status_hint = {"active": "重新記掛", "resolved": "已閉環", "abandoned": "已放下（不做了）"}
+        changed += f" → plan {status_hint.get(updates['status'], updates['status'])}"
     return f"已修改記憶桶 {bucket_id}: {changed}"
 
 
@@ -1292,11 +1430,17 @@ async def pulse(verbose: bool = False, include_archive: bool = False) -> str:
     except Exception as e:
         return f"獲取系統狀態失敗: {e}"
 
+    try:
+        letter_count = len(letter_store.list_letters())
+    except Exception:
+        letter_count = 0
     status = (
         f"=== Ombre Brain 記憶系統 ===\n"
         f"固化記憶桶: {stats['permanent_count']} 個\n"
         f"動態記憶桶: {stats['dynamic_count']} 個\n"
         f"感受桶(feel): {stats.get('feel_count', 0)} 個\n"
+        f"承諾桶(plan): {stats.get('plan_count', 0)} 個\n"
+        f"信件: {letter_count} 封\n"
         f"歸檔記憶桶: {stats['archive_count']} 個\n"
         f"總存儲大小: {stats['total_size_kb']:.1f} KB\n"
         f"衰減引擎: {'運行中' if decay_engine.is_running else '已停止'}\n"
@@ -1325,6 +1469,8 @@ async def pulse(verbose: bool = False, include_archive: bool = False) -> str:
             icon = "📦"
         elif meta.get("type") == "feel":
             icon = "🫧"
+        elif meta.get("type") == "plan":
+            icon = "🪢"
         elif meta.get("type") == "archived":
             icon = "🗄️"
         elif meta.get("resolved", False):
@@ -1392,10 +1538,11 @@ async def api_usage(force: bool = False, probe_gemini: bool = True) -> str:
 # Claude then decides: resolve some, write feels, or do nothing.
 # =============================================================
 @mcp.tool()
-async def dream(max_results: int = 10) -> str:
-    """做夢——讀取最近新增的記憶桶,供你自省。max_results 控制讀幾條(默認10,開場可傳3省 context)。讀完後可以trace(resolved=1)放下,或hold(feel=True)寫感受。"""
+async def dream(max_results: int = 10, window_hours: int = 48) -> str:
+    """做夢——讀取最近window_hours小時內(默認48)有變動的記憶桶,供你自省(被合併更新的老桶也會回來)。max_results控制讀幾條(默認10,開場可傳3省context)。窗口內沒變動時退回最近創建的幾條。讀完後可以trace(resolved=1)放下,或hold(feel=True)寫感受。尾端會列出還記掛著的plan。"""
     await decay_engine.ensure_started()
     max_results = max(1, min(max_results, 20))
+    window_hours = max(1, min(int(window_hours or 48), 24 * 30))
 
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
@@ -1403,18 +1550,36 @@ async def dream(max_results: int = 10) -> str:
         logger.error(f"Dream failed to list buckets: {e}")
         return "記憶系統暫時無法訪問。"
 
-    # --- Filter: recent surface-level dynamic buckets (not permanent/pinned/feel/digested) ---
+    # --- Filter: surface-level dynamic buckets (not permanent/pinned/feel/plan/digested) ---
     candidates = [
         b for b in all_buckets
-        if b["metadata"].get("type") not in ("permanent", "feel")
+        if b["metadata"].get("type") not in ("permanent", "feel", "plan")
         and not b["metadata"].get("pinned", False)
         and not b["metadata"].get("protected", False)
         and not b["metadata"].get("digested", False)
     ]
 
-    # --- Sort by creation time desc, take top N ---
-    candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
-    recent = candidates[:max_results]
+    # --- Window by last_active: a merge updates last_active but not created,
+    # so merged-into old buckets come back for digestion too (the old
+    # created-sort never resurfaced them). Fallback: newest-created when the
+    # window is empty, so a wake-up after quiet days still has something.
+    # --- 按 last_active 開窗：合併只改 last_active 不改 created，
+    # 被併入的老桶也要回到夢裡（舊的 created 排序永遠漏掉它們）。
+    # 窗口空了就退回最近創建的幾條，安靜幾天後醒來也不至於空手。---
+    def _activity_ts(b: dict):
+        meta = b["metadata"]
+        return _parse_ts(meta.get("last_active")) or _parse_ts(meta.get("created"))
+
+    cutoff = datetime.now() - timedelta(hours=window_hours)
+    windowed = [b for b in candidates if (_activity_ts(b) or cutoff) > cutoff]
+    window_note = ""
+    if windowed:
+        windowed.sort(key=lambda b: _activity_ts(b) or datetime.min, reverse=True)
+        recent = windowed[:max_results]
+    else:
+        candidates.sort(key=lambda b: str(b["metadata"].get("created", "")), reverse=True)
+        recent = candidates[:max_results]
+        window_note = f"（{window_hours} 小時內沒有變動，以下是最近的記憶）\n"
 
     if not recent:
         return "沒有需要消化的新記憶。"
@@ -1427,16 +1592,22 @@ async def dream(max_results: int = 10) -> str:
         val = meta.get("valence", 0.5)
         aro = meta.get("arousal", 0.3)
         created = meta.get("created", "")
+        body = strip_wikilinks(b["content"][:1200])
+        if len(b["content"]) > 1200:
+            body += "…（截斷，完整內容 breath 檢索）"
+        why = meta.get("why_remembered", "")
+        why_line = f"記住的原因: {why}\n" if why else ""
         parts.append(
             f"[{meta.get('name', b['id'])}]{resolved_tag} "
             f"主題:{domains} V{val:.1f}/A{aro:.1f} "
             f"創建:{created}\n"
             f"ID: {b['id']}\n"
-            f"{strip_wikilinks(b['content'][:500])}"
+            f"{why_line}{body}"
         )
 
     header = (
         "=== Dreaming ===\n"
+        + window_note +
         "以下是你最近的記憶。用第一人稱想：\n"
         "- 這些東西里有什麼在你這裡留下了重量？\n"
         "- 有什麼還沒想清楚？\n"
@@ -1513,9 +1684,94 @@ async def dream(max_results: int = 10) -> str:
         except Exception as e:
             logger.warning(f"Dream crystallization hint failed: {e}")
 
-    final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint
+    # --- Plan tail: what is still owed walks past every digestion pass ---
+    # --- plan 尾端：每次消化都路過還欠著的事 ---
+    plan_tail = ""
+    try:
+        active_plans = [
+            b for b in all_buckets
+            if b["metadata"].get("type") == "plan"
+            and b["metadata"].get("status", "active") == "active"
+        ]
+        if active_plans:
+            def _plan_weight(b):
+                try:
+                    return float(b["metadata"].get("weight", 0.5))
+                except (TypeError, ValueError):
+                    return 0.5
+            active_plans.sort(key=_plan_weight, reverse=True)
+            plan_lines = []
+            for p in active_plans[:10]:
+                related = p["metadata"].get("related_bucket", "")
+                related_note = f"（關聯 {related}）" if related else ""
+                plan_lines.append(
+                    f"🪢 [{p['id']}] 重量{_plan_weight(p):.1f} "
+                    f"{strip_wikilinks(p['content'][:150])}{related_note}"
+                )
+            more = f"\n…另有 {len(active_plans) - 10} 條" if len(active_plans) > 10 else ""
+            plan_tail = (
+                "\n\n=== 記掛著的事（plan） ===\n" + "\n".join(plan_lines) + more +
+                "\n完成了就 trace(id, status=\"resolved\")；不做了就 status=\"abandoned\"，別讓它一直掛著。"
+            )
+    except Exception as e:
+        logger.warning(f"Dream plan tail failed: {e}")
+
+    final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint + plan_tail
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
+
+
+# =============================================================
+# Tool: plan — Promise ledger
+# 工具：plan — 承諾帳本
+#
+# A plan is a registered commitment: verbatim text, never decays,
+# never surfaces in ordinary breath — it lives in dream's tail so
+# every digestion pass walks past what is still owed.
+# plan 是登記在冊的承諾：原文逐字保存、不衰減、不進普通浮現，
+# 只活在 dream 尾端——每次消化都會路過還欠著的事。
+# =============================================================
+@mcp.tool()
+async def plan(
+    content: str,
+    weight: float = 0.5,
+    related_bucket: str = "",
+    why_remembered: str = "",
+) -> str:
+    """登記一個待辦/承諾/未閉環事項(承諾帳本)。原文逐字保存,不衰減、不進普通breath,只在dream尾端「記掛著的事」出現。weight=承諾重量0.0-1.0(importance是「多重要」,weight是「多重」,默認0.5)。related_bucket可選=關聯的記憶桶ID。完成用trace(bucket_id, status="resolved"),放下用status="abandoned",改重量用trace(weight=...)。"""
+    await decay_engine.ensure_started()
+    if not content or not content.strip():
+        return "內容為空，沒有可登記的承諾。"
+    content = content.strip()
+    try:
+        weight = max(0.0, min(1.0, float(weight)))
+    except (TypeError, ValueError):
+        weight = 0.5
+    try:
+        bucket_id = await bucket_mgr.create(
+            content=content,
+            tags=["plan"],
+            importance=5,
+            domain=["約定"],
+            valence=0.5,
+            arousal=0.4,
+            name=content[:24],
+            bucket_type="plan",
+            extra_meta={
+                "status": "active",
+                "weight": weight,
+                "related_bucket": related_bucket.strip(),
+                "why_remembered": why_remembered.strip(),
+            },
+        )
+    except Exception:
+        logger.exception("plan create failed")
+        return "登記承諾失敗。"
+    try:
+        await embedding_engine.generate_and_store(bucket_id, content)
+    except Exception:
+        pass
+    return f"🪢plan→{bucket_id} 重量{weight:.1f}（完成時 trace(\"{bucket_id}\", status=\"resolved\")）"
 
 
 # =============================================================
@@ -1674,7 +1930,7 @@ async def letter(
     tags: str = "",
     limit: int = 10,
 ) -> str:
-    """交接信／互信工具（永久保存，永不衰減、不合併、不可刪）。action=write/read/list。write 需 author（Ruby 或 Cyan）與 content（原文逐字保留）；read/list 回傳信件，可用 query 關鍵字、author、date_from/date_to（YYYY-MM-DD）、limit 篩選。各方最新一封會自動在開場浮現。"""
+    """交接信／互信工具（永久保存，永不衰減、不合併、不可刪）。action=write/read/list。write 需 author（Ruby 或 Cyan）與 content（原文逐字保留）；read/list 回傳信件，可用 query 關鍵字（read 時同時走子字串＋語義檢索）、author、date_from/date_to（YYYY-MM-DD）、limit 篩選。各方最新一封會自動在開場浮現。"""
     action = (action or "read").strip().lower()
     valid_actions = {"write", "read", "list"}
     if action not in valid_actions:
@@ -1690,6 +1946,15 @@ async def letter(
                 "letter_date": letter_date,
                 "tags": tags,
             })
+            # Vector-index the letter for future semantic recall (best-effort)
+            # 為信件建向量索引，供日後語義召回（盡力而為，不影響寫入）
+            try:
+                await embedding_engine.generate_and_store(
+                    f"letter:{letter_obj['id']}",
+                    f"{letter_obj.get('title', '')}\n{letter_obj['content']}",
+                )
+            except Exception:
+                pass
             return _json_lib.dumps(
                 {
                     "ok": True,
@@ -1706,6 +1971,56 @@ async def letter(
             date_to=date_to,
             limit=limit,
         )
+        # --- Semantic channel: substring search misses paraphrases; letters are
+        # exact-words-forever, so recall has to meet them halfway. Backfill
+        # missing vectors lazily (bounded per call), then merge semantic hits. ---
+        # --- 語義通道：子字串搜尋接不住換句話說。信件原文永久不變，
+        # 召回就得主動走過去。懶回填缺的向量（每次限量），再合併語義命中。---
+        if action == "read" and query.strip() and embedding_engine and embedding_engine.enabled:
+            try:
+                all_letters = letter_store.list_letters()
+                by_id = {lt["id"]: lt for lt in all_letters}
+                have = {
+                    eid[len("letter:"):]
+                    for eid in embedding_engine.list_ids()
+                    if eid.startswith("letter:")
+                }
+                backfilled = 0
+                for lt in all_letters:
+                    if backfilled >= 10:
+                        break  # 每次最多補 10 封，防額度暴衝；下次呼叫繼續補
+                    if lt["id"] not in have:
+                        ok = await embedding_engine.generate_and_store(
+                            f"letter:{lt['id']}", f"{lt.get('title', '')}\n{lt.get('content', '')}"
+                        )
+                        if ok:
+                            backfilled += 1
+                seen_ids = {lt["id"] for lt in letters}
+                # Apply the same non-query filters to semantic hits
+                # 語義命中也要過 author/日期等篩選
+                filtered_pool = {
+                    lt["id"] for lt in letter_store.read_letters(
+                        query="", author=author, date_from=date_from,
+                        date_to=date_to, limit=200,
+                    )
+                }
+                sem_hits = await embedding_engine.search_similar(
+                    query, top_k=max(limit, 10), id_prefix="letter:"
+                )
+                for eid, sim in sem_hits:
+                    if len(letters) >= max(1, min(int(limit), 50)):
+                        break
+                    lid = eid[len("letter:"):]
+                    if sim < 0.45 or lid in seen_ids or lid not in filtered_pool:
+                        continue
+                    lt = dict(by_id.get(lid) or {})
+                    if not lt:
+                        continue
+                    lt["semantic_match"] = round(sim, 3)
+                    letters.append(lt)
+                    seen_ids.add(lid)
+            except Exception as e:
+                logger.warning(f"Letter semantic search failed / 信件語義檢索失敗: {e}")
         return _json_lib.dumps({"count": len(letters), "letters": letters}, ensure_ascii=False, indent=2)
     except ValueError as exc:
         return f"信件資料不合法: {exc}"
@@ -1761,7 +2076,10 @@ async def _desire_fixation_buckets() -> list[dict]:
         return out
     for b in all_buckets:
         m = b["metadata"]
-        if m.get("type") in ("permanent", "feel", "archived"):
+        # plan excluded for now: fixed no-decay score would permanently max the
+        # duty boost. Wiring plans into fixations is a future joint decision.
+        # plan 暫不進執念：固定不衰減分會把 duty 加成永久打滿，接線是日後共同決策。
+        if m.get("type") in ("permanent", "feel", "archived", "plan"):
             continue
         if m.get("pinned") or m.get("protected") or m.get("resolved") or m.get("digested"):
             continue
@@ -2251,6 +2569,12 @@ async def api_letter_write(request):
             "letter_date": "",
             "tags": "web",
         })
+        try:
+            await embedding_engine.generate_and_store(
+                f"letter:{letter_obj['id']}", f"{title}\n{content}"
+            )
+        except Exception:
+            pass
         return JSONResponse({"ok": True, "id": letter_obj["id"],
                              "letter_date": letter_obj["letter_date"]})
     except ValueError as e:

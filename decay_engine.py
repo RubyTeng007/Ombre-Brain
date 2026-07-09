@@ -114,6 +114,12 @@ class DecayEngine:
         if metadata.get("type") == "feel":
             return 50.0
 
+        # --- Plan buckets (promise ledger): never decay, fixed score.
+        # They only surface in dream's tail; the fixed value is for displays. ---
+        # --- plan 桶（承諾帳本）：不衰減，固定分。只在 dream 尾端浮現，固定值僅供顯示。---
+        if metadata.get("type") == "plan":
+            return 50.0
+
         importance = max(1, min(10, int(metadata.get("importance", 5))))
         activation_count = max(1.0, float(metadata.get("activation_count", 1)))
 
@@ -203,9 +209,9 @@ class DecayEngine:
         for bucket in buckets:
             meta = bucket.get("metadata", {})
 
-            # Skip permanent / pinned / protected / feel buckets
-            # 跳過固化桶、釘選/保護桶和 feel 桶
-            if meta.get("type") in ("permanent", "feel") or meta.get("pinned") or meta.get("protected"):
+            # Skip permanent / pinned / protected / feel / plan buckets
+            # 跳過固化桶、釘選/保護桶、feel 桶和 plan 桶
+            if meta.get("type") in ("permanent", "feel", "plan") or meta.get("pinned") or meta.get("protected"):
                 continue
 
             checked += 1
@@ -293,6 +299,11 @@ class DecayEngine:
 
             orphans_removed = 0
             for orphan in emb_ids - bucket_ids:
+                # Prefixed rows (letter:*) are letter vectors, not bucket orphans —
+                # letters are permanent and live outside the bucket store.
+                # letter: 前綴是信件向量，不是孤兒——信件永久保存且不在桶存儲裡。
+                if orphan.startswith("letter:"):
+                    continue
                 try:
                     self.embedding_engine.delete_embedding(orphan)
                     orphans_removed += 1

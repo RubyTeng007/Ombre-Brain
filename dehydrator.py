@@ -32,7 +32,7 @@ import logging
 
 from openai import AsyncOpenAI
 
-from utils import count_tokens_approx
+from utils import clean_llm_json, count_tokens_approx
 
 logger = logging.getLogger("ombre_brain.dehydrator")
 
@@ -173,6 +173,10 @@ class Dehydrator:
         self.base_url = dehy_cfg.get("base_url", "https://api.deepseek.com/v1")
         self.max_tokens = dehy_cfg.get("max_tokens", 2048)
         self.temperature = dehy_cfg.get("temperature", 0.1)
+        try:
+            timeout_seconds = float(dehy_cfg.get("timeout_seconds", 60.0))
+        except (TypeError, ValueError):
+            timeout_seconds = 60.0
 
         # --- API availability / 是否有可用的 API ---
         self.api_available = bool(self.api_key)
@@ -183,7 +187,7 @@ class Dehydrator:
             self.client = AsyncOpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
-                timeout=60.0,
+                timeout=timeout_seconds,
             )
         else:
             self.client = None
@@ -457,13 +461,10 @@ class Dehydrator:
         解析並校驗 API 返回的打標結果。
         """
         try:
-            # Handle potential markdown code block wrapping
-            # 處理可能的 markdown 代碼塊包裹
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
-            result = json.loads(cleaned)
-        except (json.JSONDecodeError, IndexError, ValueError):
+            # Tolerate code fences and chatter around the JSON payload
+            # 容忍 code fence 與 JSON 前後的說明文字
+            result = json.loads(clean_llm_json(raw))
+        except (json.JSONDecodeError, ValueError):
             logger.warning(f"API tagging JSON parse failed / JSON 解析失敗: {raw[:200]}")
             return self._default_analysis()
 
@@ -566,11 +567,8 @@ class Dehydrator:
         解析並校驗 API 返回的日記整理結果。
         """
         try:
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
-            items = json.loads(cleaned)
-        except (json.JSONDecodeError, IndexError, ValueError):
+            items = json.loads(clean_llm_json(raw))
+        except (json.JSONDecodeError, ValueError):
             logger.warning(f"Diary digest JSON parse failed / JSON 解析失敗: {raw[:200]}")
             return []
 

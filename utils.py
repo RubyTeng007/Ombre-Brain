@@ -132,6 +132,20 @@ def load_config(config_path: str = None) -> dict:
         except ValueError:
             logging.warning("OMBRE_DEEPSEEK_LOW_BALANCE_USD is not a valid number; ignored")
 
+    # OMBRE_COMPRESS_TIMEOUT_SECONDS / OMBRE_EMBED_TIMEOUT_SECONDS override the
+    # LLM / embedding client timeouts (config keys dehydration.timeout_seconds /
+    # embedding.timeout_seconds; defaults 60 / 30).
+    for env_name, section, key in (
+        ("OMBRE_COMPRESS_TIMEOUT_SECONDS", "dehydration", "timeout_seconds"),
+        ("OMBRE_EMBED_TIMEOUT_SECONDS", "embedding", "timeout_seconds"),
+    ):
+        raw = os.environ.get(env_name, "")
+        if raw:
+            try:
+                config.setdefault(section, {})[key] = float(raw)
+            except ValueError:
+                logging.warning(f"{env_name} is not a valid number; ignored")
+
     # --- Ensure bucket storage directories exist ---
     # --- 確保記憶桶存儲目錄存在 ---
     buckets_dir = config["buckets_dir"]
@@ -244,3 +258,73 @@ def now_iso() -> str:
     返回當前時間的 ISO 格式字符串。
     """
     return datetime.now().isoformat(timespec="seconds")
+
+
+def parse_bucket_ts(value):
+    """Parse a bucket timestamp into naive local datetime (tz-aware → local, tz dropped).
+    Returns None on unparseable input.
+    把桶時間戳解析成 naive 本地時間（帶時區的先轉本地再去時區），混用也能比較。"""
+    try:
+        ts = datetime.fromisoformat(str(value))
+    except (ValueError, TypeError):
+        return None
+    if ts.tzinfo is not None:
+        ts = ts.astimezone().replace(tzinfo=None)
+    return ts
+
+
+def select_importance_tiers(filtered: list, cap: int = 20) -> list:
+    """
+    Pick up to `cap` buckets from an importance-desc-sorted list, but reserve
+    one slot per importance tier first (most recently updated bucket of each
+    tier). Without this, 20+ importance-10 buckets crowd out a bucket that was
+    just demoted to 9 — trace looks like it "didn't take".
+    重要度批量拉取的檔位保留：每個檔位先保一個「最近更新」的席位，
+    否則高分桶塞滿上限時，剛被降級的桶會被擠出清單、看似 trace 沒生效。
+    """
+    def _last_active(b: dict) -> str:
+        return str(b["metadata"].get("last_active", b["metadata"].get("created", "")))
+
+    reserved_ids = set()
+    tiers_seen = set()
+    for b in sorted(filtered, key=_last_active, reverse=True):
+        tier = int(b["metadata"].get("importance", 0))
+        if tier not in tiers_seen:
+            tiers_seen.add(tier)
+            reserved_ids.add(b["id"])
+    reserved = [b for b in filtered if b["id"] in reserved_ids][:cap]
+    remaining = [b for b in filtered if b["id"] not in reserved_ids]
+    return (reserved + remaining)[:cap]
+
+
+def clean_llm_json(raw: str) -> str:
+    """
+    Extract the JSON payload from an LLM reply: strip markdown code fences and
+    any chatter before/after the first JSON array or object. Returns a string
+    for json.loads(); raises ValueError when no JSON-looking span is found.
+    從 LLM 回覆中抽出 JSON：剝掉 code fence 與前後說明文字，
+    找不到 JSON 片段時拋 ValueError（讓調用方走既有的解析失敗路徑）。
+    """
+    if not raw or not raw.strip():
+        raise ValueError("empty LLM reply")
+    cleaned = raw.strip()
+
+    # Prefer the content of a fenced block when present
+    fence = re.search(r"```(?:json)?\s*\n?(.*?)```", cleaned, flags=re.DOTALL)
+    if fence:
+        cleaned = fence.group(1).strip()
+
+    if cleaned.startswith("{") or cleaned.startswith("["):
+        return cleaned
+
+    # Chatter around the payload: take the widest span from the first opening
+    # bracket to its matching closer's last occurrence.
+    starts = [i for i in (cleaned.find("["), cleaned.find("{")) if i != -1]
+    if not starts:
+        raise ValueError("no JSON payload found in LLM reply")
+    start = min(starts)
+    closer = "]" if cleaned[start] == "[" else "}"
+    end = cleaned.rfind(closer)
+    if end <= start:
+        raise ValueError("unterminated JSON payload in LLM reply")
+    return cleaned[start:end + 1]
