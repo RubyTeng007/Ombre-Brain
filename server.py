@@ -584,16 +584,20 @@ async def _merge_or_create(
 
     if existing and existing[0].get("score", 0) > config.get("merge_threshold", 75):
         bucket = existing[0]
-        semantic_ok = True
+        # --- Semantic gate, FAIL-CLOSED (2026-07-12): a destructive merge requires
+        # a VERIFIED vector similarity. Engine disabled, missing embeddings, or an
+        # exception all mean "don't merge, create a new bucket" — a duplicate is
+        # recoverable, a wrong merge is not. (Fuzzy score alone can't gate this:
+        # it mixes time/emotion/importance, so same-day similar-mood content
+        # crosses the bar without being the same memory.)
+        # --- 語義閘門，fail-closed（2026-07-12）：破壞性合併必須以「驗證過的」
+        # 向量相似度為前提——引擎關閉、向量缺失、檢查異常一律不合併、改走新建
+        # （重複可救，誤併不可逆）。模糊分數混入時間/情感/重要度權重，
+        # 同日同情緒的內容會誤過線，單靠它守不住這道門。---
+        semantic_ok = False
         # --- Never merge into pinned/protected buckets ---
         # --- 不合併到釘選/保護桶 ---
         if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
-            # --- Semantic gate: fuzzy score mixes time/emotion/importance (topic is
-            # only 47% of it), so same-day similar-mood content can cross the bar.
-            # Require real semantic similarity before a destructive merge.
-            # --- 語義閘門：模糊分數混入時間/情感/重要度權重，同日同情緒的內容
-            # 可能誤過線。破壞性合併前要求向量相似度達標。---
-            semantic_ok = True
             if embedding_engine and embedding_engine.enabled:
                 try:
                     emb_new = await embedding_engine._generate_embedding(content)
@@ -606,8 +610,18 @@ async def _merge_or_create(
                                 f"Merge vetoed by semantic gate / 語義閘門否決合併: "
                                 f"{bucket['id']} sim={sim:.3f}"
                             )
+                    else:
+                        logger.info(
+                            f"Merge vetoed, embedding missing (fail-closed) / "
+                            f"向量缺失，不合併: {bucket['id']}"
+                        )
                 except Exception as e:
-                    logger.warning(f"Semantic gate check failed, allowing merge / 語義閘門檢查失敗: {e}")
+                    logger.warning(
+                        f"Semantic gate check failed, merge vetoed (fail-closed) / "
+                        f"語義閘門檢查異常，不合併: {e}"
+                    )
+            else:
+                logger.info("Merge skipped, embedding engine off (fail-closed) / 向量引擎關閉，不合併")
         if (
             not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected"))
             and semantic_ok
@@ -1325,9 +1339,13 @@ async def trace(
     delete: bool = False,
     status: str = "",
     weight: float = -1,
+    kind: str = "",
+    target_drive: str = "",
+    progress: float = -1,
+    due_at: str = "",
     why_remembered: str = "",
 ) -> str:
-    """修改記憶元數據或內容。resolved=1沉底/0激活,pinned=1釘選/0取消,digested=1隱藏(保留但不浮現)/0取消隱藏,content=替換桶正文,delete=True刪除。status=plan桶狀態(active/resolved/abandoned),weight=plan承諾重量0.0-1.0(僅plan桶),why_remembered=更新記住的原因。只傳需改的,-1或空=不改。"""
+    """修改記憶元數據或內容。resolved=1沉底/0激活,pinned=1釘選/0取消,digested=1隱藏(保留但不浮現)/0取消隱藏,content=替換桶正文,delete=True刪除。plan桶專屬:status=active/resolved/abandoned,weight=承諾重量0.0-1.0,kind=promise/task/question/maintenance,target_drive=掛的驅動維度,progress=進度0.0-1.0,due_at=期限(ISO日期)。why_remembered=更新記住的原因。只傳需改的,-1或空=不改。"""
 
     if not bucket_id or not bucket_id.strip():
         return "請提供有效的 bucket_id。"
@@ -1382,6 +1400,31 @@ async def trace(
         if not is_plan:
             return f"weight 只能用在 plan 桶上（{bucket_id} 是 {bucket['metadata'].get('type', 'dynamic')} 桶）。"
         updates["weight"] = weight
+    if kind:
+        if not is_plan:
+            return f"kind 只能用在 plan 桶上（{bucket_id} 是 {bucket['metadata'].get('type', 'dynamic')} 桶）。"
+        kind = kind.strip().lower()
+        if kind not in PLAN_KINDS:
+            return f"kind 只接受 {'/'.join(PLAN_KINDS)}。"
+        updates["kind"] = kind
+    if target_drive:
+        if not is_plan:
+            return f"target_drive 只能用在 plan 桶上（{bucket_id} 是 {bucket['metadata'].get('type', 'dynamic')} 桶）。"
+        target_drive = target_drive.strip().lower()
+        if target_drive not in desire_kernel.DRIVE_KEYS:
+            return f"target_drive 只接受 {'/'.join(desire_kernel.DRIVE_KEYS)}。"
+        updates["target_drive"] = target_drive
+    if 0 <= progress <= 1:
+        if not is_plan:
+            return f"progress 只能用在 plan 桶上（{bucket_id} 是 {bucket['metadata'].get('type', 'dynamic')} 桶）。"
+        updates["progress"] = progress
+    if due_at:
+        if not is_plan:
+            return f"due_at 只能用在 plan 桶上（{bucket_id} 是 {bucket['metadata'].get('type', 'dynamic')} 桶）。"
+        due_at_norm = _validate_due_at(due_at)
+        if due_at_norm is None:
+            return "due_at 需為 ISO 日期（如 2026-07-15）。"
+        updates["due_at"] = due_at_norm
 
     if not updates:
         return "沒有任何字段需要修改。"
@@ -1581,8 +1624,48 @@ async def dream(max_results: int = 10, window_hours: int = 48) -> str:
         recent = candidates[:max_results]
         window_note = f"（{window_hours} 小時內沒有變動，以下是最近的記憶）\n"
 
+    # --- Plan tail: what is still owed walks past every digestion pass.
+    # Built BEFORE the empty-window early return (2026-07-12) — a quiet stretch
+    # with nothing to digest is exactly when the ledger must still be seen.
+    # --- plan 尾端：每次消化都路過還欠著的事。提前於空窗返回之前構建
+    # （2026-07-12）——安靜到沒東西可消化的時候，帳本反而更不能漏看。---
+    plan_tail = ""
+    try:
+        active_plans = [
+            b for b in all_buckets
+            if b["metadata"].get("type") == "plan"
+            and b["metadata"].get("status", "active") == "active"
+        ]
+        if active_plans:
+            def _plan_weight(b):
+                try:
+                    return float(b["metadata"].get("weight", 0.5))
+                except (TypeError, ValueError):
+                    return 0.5
+            active_plans.sort(key=_plan_weight, reverse=True)
+            plan_lines = []
+            for p in active_plans[:10]:
+                meta_p = p["metadata"]
+                related = meta_p.get("related_bucket", "")
+                related_note = f"（關聯 {related}）" if related else ""
+                kind_note = f" {meta_p.get('kind')}" if meta_p.get("kind") else ""
+                due_note = f" 期限{meta_p.get('due_at')}" if meta_p.get("due_at") else ""
+                prog = meta_p.get("progress", 0)
+                prog_note = f" 進度{float(prog):.0%}" if prog else ""
+                plan_lines.append(
+                    f"🪢 [{p['id']}]{kind_note} 重量{_plan_weight(p):.1f}{prog_note}{due_note} "
+                    f"{strip_wikilinks(p['content'][:150])}{related_note}"
+                )
+            more = f"\n…另有 {len(active_plans) - 10} 條" if len(active_plans) > 10 else ""
+            plan_tail = (
+                "\n\n=== 記掛著的事（plan） ===\n" + "\n".join(plan_lines) + more +
+                "\n完成了就 trace(id, status=\"resolved\")；不做了就 status=\"abandoned\"，別讓它一直掛著。"
+            )
+    except Exception as e:
+        logger.warning(f"Dream plan tail failed: {e}")
+
     if not recent:
-        return "沒有需要消化的新記憶。"
+        return "沒有需要消化的新記憶。" + plan_tail
 
     parts = []
     for b in recent:
@@ -1684,38 +1767,6 @@ async def dream(max_results: int = 10, window_hours: int = 48) -> str:
         except Exception as e:
             logger.warning(f"Dream crystallization hint failed: {e}")
 
-    # --- Plan tail: what is still owed walks past every digestion pass ---
-    # --- plan 尾端：每次消化都路過還欠著的事 ---
-    plan_tail = ""
-    try:
-        active_plans = [
-            b for b in all_buckets
-            if b["metadata"].get("type") == "plan"
-            and b["metadata"].get("status", "active") == "active"
-        ]
-        if active_plans:
-            def _plan_weight(b):
-                try:
-                    return float(b["metadata"].get("weight", 0.5))
-                except (TypeError, ValueError):
-                    return 0.5
-            active_plans.sort(key=_plan_weight, reverse=True)
-            plan_lines = []
-            for p in active_plans[:10]:
-                related = p["metadata"].get("related_bucket", "")
-                related_note = f"（關聯 {related}）" if related else ""
-                plan_lines.append(
-                    f"🪢 [{p['id']}] 重量{_plan_weight(p):.1f} "
-                    f"{strip_wikilinks(p['content'][:150])}{related_note}"
-                )
-            more = f"\n…另有 {len(active_plans) - 10} 條" if len(active_plans) > 10 else ""
-            plan_tail = (
-                "\n\n=== 記掛著的事（plan） ===\n" + "\n".join(plan_lines) + more +
-                "\n完成了就 trace(id, status=\"resolved\")；不做了就 status=\"abandoned\"，別讓它一直掛著。"
-            )
-    except Exception as e:
-        logger.warning(f"Dream plan tail failed: {e}")
-
     final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint + plan_tail
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
@@ -1730,15 +1781,56 @@ async def dream(max_results: int = 10, window_hours: int = 48) -> str:
 # every digestion pass walks past what is still owed.
 # plan 是登記在冊的承諾：原文逐字保存、不衰減、不進普通浮現，
 # 只活在 dream 尾端——每次消化都會路過還欠著的事。
+#
+# kind/target_drive (2026-07-12): a plan states which drive it hangs on.
+# The upcoming fixation wiring reads target_drive DIRECTLY — never the
+# domain→drive map, which would translate a technical chore into
+# "missing Ruby" (all plans used to be domain=約定).
+# kind/target_drive（2026-07-12）：plan 自己聲明掛在哪個驅動維度。
+# 之後的執念接線直接讀 target_drive——絕不走 domain 映射，
+# 否則技術待辦會被翻譯成「想Ruby」（過去所有 plan 都是約定域）。
 # =============================================================
+PLAN_KINDS = ("promise", "task", "question", "maintenance")
+PLAN_KIND_DEFAULT_DRIVE = {
+    "promise": "miss_ruby",
+    "task": "duty",
+    "maintenance": "duty",
+    "question": "curiosity",
+}
+PLAN_KIND_DOMAIN = {
+    "promise": "約定",
+    "task": "待辦",
+    "maintenance": "待辦",
+    "question": "待辦",
+}
+
+
+def _validate_due_at(due_at: str) -> str | None:
+    """Return the trimmed ISO date/datetime, or None if unparseable."""
+    due_at = due_at.strip()
+    if not due_at:
+        return ""
+    from datetime import date as _date
+    for parser in (datetime.fromisoformat, _date.fromisoformat):
+        try:
+            parser(due_at)
+            return due_at
+        except ValueError:
+            continue
+    return None
+
+
 @mcp.tool()
 async def plan(
     content: str,
     weight: float = 0.5,
+    kind: str = "task",
+    target_drive: str = "",
+    due_at: str = "",
     related_bucket: str = "",
     why_remembered: str = "",
 ) -> str:
-    """登記一個待辦/承諾/未閉環事項(承諾帳本)。原文逐字保存,不衰減、不進普通breath,只在dream尾端「記掛著的事」出現。weight=承諾重量0.0-1.0(importance是「多重要」,weight是「多重」,默認0.5)。related_bucket可選=關聯的記憶桶ID。完成用trace(bucket_id, status="resolved"),放下用status="abandoned",改重量用trace(weight=...)。"""
+    """登記一個待辦/承諾/未閉環事項(承諾帳本)。原文逐字保存,不衰減、不進普通breath,只在dream尾端「記掛著的事」出現。weight=承諾重量0.0-1.0(importance是「多重要」,weight是「多重」,默認0.5)。kind=promise(對Ruby的承諾)/task(工程待辦)/question(想弄清的問題)/maintenance(例行維護),默認task。target_drive=掛在哪個驅動維度(miss_ruby/reflection/curiosity/duty/social/creation/libido),不填按kind自動:promise→miss_ruby,task/maintenance→duty,question→curiosity(日後執念接線讀它,不走domain映射)。due_at=期限(ISO日期,可選)。related_bucket可選=關聯記憶桶ID。完成用trace(bucket_id, status="resolved"),放下用status="abandoned",改重量/進度用trace(weight=.../progress=...)。"""
     await decay_engine.ensure_started()
     if not content or not content.strip():
         return "內容為空，沒有可登記的承諾。"
@@ -1747,12 +1839,21 @@ async def plan(
         weight = max(0.0, min(1.0, float(weight)))
     except (TypeError, ValueError):
         weight = 0.5
+    kind = (kind or "task").strip().lower()
+    if kind not in PLAN_KINDS:
+        return f"kind 只接受 {'/'.join(PLAN_KINDS)}。"
+    target_drive = (target_drive or "").strip().lower() or PLAN_KIND_DEFAULT_DRIVE[kind]
+    if target_drive not in desire_kernel.DRIVE_KEYS:
+        return f"target_drive 只接受 {'/'.join(desire_kernel.DRIVE_KEYS)}。"
+    due_at_norm = _validate_due_at(due_at)
+    if due_at_norm is None:
+        return "due_at 需為 ISO 日期（如 2026-07-15 或 2026-07-15T21:00:00+08:00）。"
     try:
         bucket_id = await bucket_mgr.create(
             content=content,
             tags=["plan"],
             importance=5,
-            domain=["約定"],
+            domain=[PLAN_KIND_DOMAIN[kind]],
             valence=0.5,
             arousal=0.4,
             name=content[:24],
@@ -1760,6 +1861,10 @@ async def plan(
             extra_meta={
                 "status": "active",
                 "weight": weight,
+                "kind": kind,
+                "target_drive": target_drive,
+                "due_at": due_at_norm,
+                "progress": 0.0,
                 "related_bucket": related_bucket.strip(),
                 "why_remembered": why_remembered.strip(),
             },
@@ -1771,7 +1876,10 @@ async def plan(
         await embedding_engine.generate_and_store(bucket_id, content)
     except Exception:
         pass
-    return f"🪢plan→{bucket_id} 重量{weight:.1f}（完成時 trace(\"{bucket_id}\", status=\"resolved\")）"
+    return (
+        f"🪢plan→{bucket_id} {kind}/{target_drive} 重量{weight:.1f}"
+        f"（完成時 trace(\"{bucket_id}\", status=\"resolved\")）"
+    )
 
 
 # =============================================================

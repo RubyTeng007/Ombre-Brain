@@ -106,7 +106,14 @@ def normalize_domains(domains: list[str]) -> list[str]:
 # Plan bucket lifecycle states + whitelisted extra metadata keys.
 # plan 桶的生命週期狀態 + 附加元數據白名單。
 _PLAN_STATUSES = ("active", "resolved", "abandoned")
-_EXTRA_META_KEYS = ("status", "weight", "related_bucket", "why_remembered")
+_EXTRA_META_KEYS = (
+    "status", "weight", "related_bucket", "why_remembered",
+    # plan schema (2026-07-12): the fixation wiring reads target_drive
+    # directly — never the domain→drive map.
+    # plan schema（2026-07-12）：執念接線直接讀 target_drive，不走 domain 映射。
+    "kind", "target_drive", "due_at", "progress",
+)
+_FLOAT_META_KEYS = ("weight", "progress")
 
 
 def _normalize_meta_datetimes(metadata: dict) -> dict:
@@ -282,7 +289,7 @@ class BucketManager:
             value = (extra_meta or {}).get(key)
             if value is None or value == "":
                 continue
-            if key == "weight":
+            if key in _FLOAT_META_KEYS:
                 try:
                     metadata[key] = max(0.0, min(1.0, float(value)))
                 except (TypeError, ValueError):
@@ -435,6 +442,17 @@ class BucketManager:
                 post["weight"] = max(0.0, min(1.0, float(kwargs["weight"])))
             except (TypeError, ValueError):
                 pass
+        if "progress" in kwargs:
+            try:
+                post["progress"] = max(0.0, min(1.0, float(kwargs["progress"])))
+            except (TypeError, ValueError):
+                pass
+        if "kind" in kwargs:
+            post["kind"] = str(kwargs["kind"])[:32]
+        if "target_drive" in kwargs:
+            post["target_drive"] = str(kwargs["target_drive"])[:32]
+        if "due_at" in kwargs:
+            post["due_at"] = str(kwargs["due_at"])[:64]
         if "why_remembered" in kwargs:
             post["why_remembered"] = str(kwargs["why_remembered"])[:200]
         if "related_bucket" in kwargs:
@@ -663,19 +681,16 @@ class BucketManager:
         else:
             candidates = all_buckets
 
-        # --- Layer 1.5: embedding pre-filter (optional, reduces multi-dim ranking set) ---
-        # --- 第1.5層：embedding 預篩（可選，縮小精排候選集）---
-        if self.embedding_engine and self.embedding_engine.enabled:
-            try:
-                vector_results = await self.embedding_engine.search_similar(query, top_k=50)
-                if vector_results:
-                    vector_ids = {bid for bid, _ in vector_results}
-                    emb_candidates = [b for b in candidates if b["id"] in vector_ids]
-                    if emb_candidates:  # only replace if there's non-empty overlap
-                        candidates = emb_candidates
-                    # else: keep original candidates as fallback
-            except Exception as e:
-                logger.warning(f"Embedding pre-filter failed, using fuzzy only / embedding 預篩失敗: {e}")
+        # --- Layer 1.5 removed (2026-07-12): the embedding pre-filter REPLACED the
+        # candidate set with the vector top-50, so an exact name/tag hit outside
+        # that set was dropped before precision ranking ever saw it. At this corpus
+        # size full fuzzy ranking costs milliseconds; semantic recall has its own
+        # parallel vector channel in breath (server.py) and BM25 (layer 1.6) covers
+        # full-body keywords. Recall beats latency here.
+        # --- 第1.5層已移除（2026-07-12）：embedding 預篩會「取代」候選集，
+        # 精確的名字/標籤命中若不在向量前 50 就在精排前被丟掉。這個語料規模
+        # 全量精排只要毫秒級；語義召回由 breath 的並聯向量通道負責，
+        # 全文關鍵詞由 BM25（第1.6層）兜底。召回優先於延遲。---
 
         # --- Layer 1.6: BM25 keyword channel (dormant unless matching.bm25_enabled) ---
         # Recall insurance: strong keyword hits rejoin the candidate set even if

@@ -1,7 +1,33 @@
 # Ombre Brain — 内部开发文档 / INTERNALS
 
 > 本文档面向开发者和维护者。记录功能总览、环境变量、模块依赖、硬编码值和核心设计决策。
-> 最后更新：2026-07-10（上游借鑑批次；0 章節之後的細節以程式碼為準）
+> 最后更新：2026-07-12（第零批止血；0 章節之後的細節以程式碼為準）
+
+## 0.6 2026-07-12 第零批止血（Non 規格交叉評審後的 no-regret 修復）
+
+對照 Non/Nest 記憶系統規格做的全系統評審（Ruby 交辦、兩個 session 交叉驗證）發現的
+實際缺陷，全部修復：
+
+- **merge 語義閘 fail-closed**（`server.py _merge_or_create`）：原本例外時、向量缺失時
+  都會放行破壞性合併（雙重 fail-open）。現在破壞性合併必須以「驗證過的」向量相似度
+  為前提——引擎關閉、向量缺失、檢查異常一律不合併、改走新建。重複可救，誤併不可逆。
+- **搜尋召回：移除向量預篩**（`bucket_manager.search` 原第 1.5 層）：預篩會用向量
+  top-50「取代」候選集，精確的名字/標籤命中不在其中就在精排前被丟掉。此語料規模
+  全量精排毫秒級；語義召回由 breath 並聯向量通道負責、全文關鍵詞由 BM25 兜底。
+  同批啟用 live 的 `matching.bm25_enabled`（預建降落傘，召回缺口證實故拉繩）。
+- **dream 空窗也要看見 plan 帳本**（`server.py dream`）：plan 尾段移到「沒有需要消化
+  的新記憶」提前返回之前——安靜期反而更不能漏看欠著的事。
+- **plan schema**（`server.py plan/trace`，`bucket_manager` 白名單）：新增
+  `kind`（promise/task/question/maintenance，默認 task）、`target_drive`（不填按 kind
+  自動：promise→miss_ruby、task/maintenance→duty、question→curiosity）、`due_at`、
+  `progress`。**執念接線（第一批）將直接讀 target_drive，永不走 domain→drive 映射**——
+  否則全掛約定域的技術待辦會被翻譯成「想Ruby」。
+- 測試：`tests/test_batch0.py`（merge 閘三路徑＋驗證通過路徑＋釘選保護、搜尋召回回歸、
+  dream 空窗 plan 尾段、plan schema 全欄位）。
+
+第一批（代謝）已定案待觀察期收官報告：執念語義收窄（open_loop/plan/自寫閃念才餵）、
+高位消退 hysteresis、近高位加權抽選、satisfy degree＋engage 帳本、wake_id 因果鏈。
+評審全文見 Ombre 記憶桶 7693b0f6284f。
 
 ## 0.5 2026-07-10 上游借鑑批次（借想法不借程式碼，全部自寫）
 
