@@ -2367,6 +2367,19 @@ async def _desire_state_payload() -> dict:
         return state
 
     state = desire_store.mutate(_refresh, now)
+
+    # batch-4a (2026-07-12): the kernel never prunes veto_until — it only
+    # checks expiry at read time — so shipping the raw dict made the web UI
+    # display long-expired cooldowns as 「否決中」. Only still-active vetoes
+    # leave the house; unparseable timestamps are dropped rather than shown.
+    active_vetoes = {}
+    for k, v in (state.get("veto_until", {}) or {}).items():
+        try:
+            if _dt.fromisoformat(str(v)) > now:
+                active_vetoes[k] = v
+        except (ValueError, TypeError):
+            continue
+
     return {
         "updated_at": state["updated_at"],
         "drives": state["drives"],
@@ -2376,7 +2389,10 @@ async def _desire_state_payload() -> dict:
         "gates": state["gates"],
         "boosts": boosts,
         "intent": state["last_intent"],
-        "veto_until": state.get("veto_until", {}),
+        "veto_until": active_vetoes,
+        # 高位消退態（batch-1 hysteresis）：瓶子摸頂後不漲反落的原因，
+        # 不端出來的話前端只能看著水位「自己降」而無從解釋。
+        "saturated": state.get("saturated", {}),
         "events": state.get("events", [])[-10:],
         "driven_behavior_enabled": False,  # Phase 1 鐵律：永遠只讀
     }
@@ -2598,6 +2614,10 @@ async def api_buckets(request):
                 "affects_desire": meta.get("affects_desire", False),
                 "retrieved_count": meta.get("retrieved_count", 0),
                 "consumed": meta.get("consumed", ""),
+                # batch-4a: when this bucket last ACTUALLY surfaced (breath /
+                # search hit) — the memory room's 「正在浮現」 was faking it
+                # with top-by-score; this field lets it tell the truth.
+                "last_surfaced": meta.get("last_surfaced", ""),
             })
         result.sort(key=lambda x: x["score"], reverse=True)
         return JSONResponse(result)
@@ -2953,10 +2973,21 @@ async def api_hold(request):
 
 @mcp.custom_route("/api/bucket/{bucket_id}/trace", methods=["POST"])
 async def api_bucket_trace(request):
-    """Write ops for the Cyan web memory room: resolve / pin / delete only.
+    """Write ops for the Cyan web memory room: resolve / pin / status / delete.
 
-    Mirrors the MCP trace tool's semantics for these three fields, including
-    pinning locking importance to 10 and delete removing the embedding.
+    Type-aware since 2026-07-12 (batch-4a): the web door speaks each bucket
+    type's own verbs instead of one generic set —
+    - plan buckets: "resolved" maps onto the plan lifecycle (`status`), because
+      the fixation feed reads `status` — a web 沉底 that only wrote `resolved`
+      left the plan silently feeding desire forever. Explicit `status`
+      (active/resolved/abandoned) is also accepted, plan-only.
+    - pin is dynamic-only: feel/plan/mirage never enter the decay cycle, so
+      "pin to stop forgetting" is meaningless there, and pinning a mirage
+      would dress a dream up as doctrine.
+    - resolve is refused on feel/mirage (they never surface in ordinary
+      breath, 沉底 has nothing to sink). Delete stays allowed for every type —
+      deleting from the UI is Ruby's explicit act.
+    Pinning still locks importance to 10, delete still removes the embedding.
     """
     from starlette.responses import JSONResponse
     err = _require_read_access(request)
@@ -2973,17 +3004,43 @@ async def api_bucket_trace(request):
                 embedding_engine.delete_embedding(bucket_id)
                 return JSONResponse({"ok": True, "deleted": True})
             return JSONResponse({"error": "not found"}, status_code=404)
+        bucket = await bucket_mgr.get(bucket_id)
+        if not bucket:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        btype = bucket.get("metadata", {}).get("type", "dynamic")
         updates = {}
+        if body.get("status") is not None:
+            if btype != "plan":
+                return JSONResponse(
+                    {"error": "status 是帳票（plan）專屬的生命週期欄位"}, status_code=400)
+            if body["status"] not in ("active", "resolved", "abandoned"):
+                return JSONResponse({"error": "status 只能是 active/resolved/abandoned"},
+                                    status_code=400)
+            updates["status"] = body["status"]
+            # Keep the decay/sort track in step with the lifecycle track.
+            updates["resolved"] = body["status"] != "active"
         if body.get("resolved") in (0, 1, True, False):
-            updates["resolved"] = bool(body["resolved"])
+            if btype == "plan":
+                # Legacy web shape on a plan: translate 沉底 into the lifecycle
+                # field the fixation feed actually reads (and keep both tracks
+                # consistent). Explicit `status` above wins if both are sent.
+                updates.setdefault("status", "resolved" if body["resolved"] else "active")
+                updates["resolved"] = updates["status"] != "active"
+            elif btype in ("feel", "mirage"):
+                return JSONResponse(
+                    {"error": "感受與蜃景不走浮現循環，沒有「沉底」可言"}, status_code=400)
+            else:
+                updates["resolved"] = bool(body["resolved"])
         if body.get("pinned") in (0, 1, True, False):
+            if btype not in ("dynamic", "permanent"):
+                return JSONResponse(
+                    {"error": "釘選只屬於會衰減的記憶；感受／帳票／蜃景本來就不會被忘掉"},
+                    status_code=400)
             updates["pinned"] = bool(body["pinned"])
             if updates["pinned"]:
                 updates["importance"] = 10  # pinned -> lock importance, same as MCP trace
         if not updates:
             return JSONResponse({"error": "no supported fields"}, status_code=400)
-        if not await bucket_mgr.get(bucket_id):
-            return JSONResponse({"error": "not found"}, status_code=404)
         success = await bucket_mgr.update(bucket_id, **updates)
         return JSONResponse({"ok": bool(success), "updates": updates})
     except Exception as e:
@@ -3475,6 +3532,14 @@ async def api_system_status(request):
                 "permanent": stats.get("permanent_count", 0),
                 "dynamic": stats.get("dynamic_count", 0),
                 "archive": stats.get("archive_count", 0),
+                # batch-4a: the full pulse. get_stats always counted these;
+                # the web door just never passed them on, so the memory
+                # room's 脈搏 showed a three-chamber heart on an eight-organ
+                # body. `total` keeps its original meaning (active memory).
+                "feel": stats.get("feel_count", 0),
+                "plan": stats.get("plan_count", 0),
+                "mirage": stats.get("mirage_count", 0),
+                "letters": len(letter_store.list_letters()),
                 "total": stats.get("permanent_count", 0) + stats.get("dynamic_count", 0),
             },
             "using_env_password": bool(os.environ.get("OMBRE_DASHBOARD_PASSWORD", "")),
