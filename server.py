@@ -1589,6 +1589,7 @@ async def pulse(verbose: bool = False, include_archive: bool = False) -> str:
         f"動態記憶桶: {stats['dynamic_count']} 個\n"
         f"感受桶(feel): {stats.get('feel_count', 0)} 個\n"
         f"承諾桶(plan): {stats.get('plan_count', 0)} 個\n"
+        f"蜃景桶(mirage/夢): {stats.get('mirage_count', 0)} 個\n"
         f"信件: {letter_count} 封\n"
         f"歸檔記憶桶: {stats['archive_count']} 個\n"
         f"總存儲大小: {stats['total_size_kb']:.1f} KB\n"
