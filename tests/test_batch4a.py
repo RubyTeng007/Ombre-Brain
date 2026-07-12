@@ -151,15 +151,55 @@ class TestTraceTypeBoundaries:
         assert meta["pinned"] is True
         assert meta["importance"] == 10  # pin locks importance, unchanged
 
-    def test_delete_allowed_for_every_type(self, wired, bucket_mgr):
-        bid = _run(bucket_mgr.create(content="一場夢", name="一場夢", bucket_type="mirage"))
-        resp = _run(srv.api_bucket_trace(FakeRequest(bid, {"delete": True})))
-        assert resp.status_code == 200
-        assert _payload(resp)["deleted"] is True
-
     def test_missing_bucket_404(self, wired):
         resp = _run(srv.api_bucket_trace(FakeRequest("nope00000000", {"resolved": 1})))
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------
+# 2b. 4c hardening：web 門的只讀邊界收到最終形
+# ---------------------------------------------------------
+class TestTraceReadOnlyBoundaries:
+    def test_delete_is_dynamic_only(self, wired, bucket_mgr):
+        """Feel/mirage are Cyan's inner objects (deleted by his hand via MCP,
+        never a web button); plans retire via abandoned, keeping the ledger."""
+        for btype in ("feel", "mirage"):
+            bid = _run(bucket_mgr.create(content="內在物", name="內在物", bucket_type=btype))
+            resp = _run(srv.api_bucket_trace(FakeRequest(bid, {"delete": True})))
+            assert resp.status_code == 400, btype
+        pid = _mk_plan(bucket_mgr)
+        assert _run(srv.api_bucket_trace(FakeRequest(pid, {"delete": True}))).status_code == 400
+        did = _run(bucket_mgr.create(content="普通", name="普通"))
+        resp = _run(srv.api_bucket_trace(FakeRequest(did, {"delete": True})))
+        assert resp.status_code == 200
+        assert _payload(resp)["deleted"] is True
+
+    def test_feel_fully_read_only(self, wired, bucket_mgr):
+        bid = _run(bucket_mgr.create(content="一段感受", name="一段感受", bucket_type="feel"))
+        for body in ({"resolved": 1}, {"pinned": 1}, {"delete": True}):
+            assert _run(srv.api_bucket_trace(FakeRequest(bid, body))).status_code == 400
+
+    def test_portrait_refuses_everything(self, wired, bucket_mgr):
+        bid = _run(bucket_mgr.create(content="畫像正文", name="畫像Ruby 的模樣",
+                                     domain=["畫像"], pinned=True))
+        for body in ({"resolved": 1}, {"pinned": 0}, {"delete": True}, {"progress": 0.5}):
+            assert _run(srv.api_bucket_trace(FakeRequest(bid, body))).status_code == 400
+
+    def test_plan_progress_updates(self, wired, bucket_mgr):
+        bid = _mk_plan(bucket_mgr)
+        resp = _run(srv.api_bucket_trace(FakeRequest(bid, {"progress": 0.7})))
+        assert resp.status_code == 200
+        meta = _run(bucket_mgr.get(bid))["metadata"]
+        assert abs(float(meta["progress"]) - 0.7) < 1e-9
+
+    def test_progress_is_plan_only_and_validated(self, wired, bucket_mgr):
+        did = _run(bucket_mgr.create(content="普通", name="普通"))
+        assert _run(srv.api_bucket_trace(FakeRequest(did, {"progress": 0.5}))).status_code == 400
+        pid = _mk_plan(bucket_mgr)
+        assert _run(srv.api_bucket_trace(FakeRequest(pid, {"progress": "abc"}))).status_code == 400
+        resp = _run(srv.api_bucket_trace(FakeRequest(pid, {"progress": 1.7})))
+        assert resp.status_code == 200  # clamped
+        assert float(_run(bucket_mgr.get(pid))["metadata"]["progress"]) == 1.0
 
 
 # ---------------------------------------------------------

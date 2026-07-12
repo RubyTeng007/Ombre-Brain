@@ -2980,13 +2980,19 @@ async def api_bucket_trace(request):
     - plan buckets: "resolved" maps onto the plan lifecycle (`status`), because
       the fixation feed reads `status` — a web 沉底 that only wrote `resolved`
       left the plan silently feeding desire forever. Explicit `status`
-      (active/resolved/abandoned) is also accepted, plan-only.
+      (active/resolved/abandoned) is also accepted, plan-only, and `progress`
+      (0..1) is plan-only too.
     - pin is dynamic-only: feel/plan/mirage never enter the decay cycle, so
       "pin to stop forgetting" is meaningless there, and pinning a mirage
       would dress a dream up as doctrine.
     - resolve is refused on feel/mirage (they never surface in ordinary
-      breath, 沉底 has nothing to sink). Delete stays allowed for every type —
-      deleting from the UI is Ruby's explicit act.
+      breath, 沉底 has nothing to sink).
+    - 4c hardening (2026-07-12, joint spec review): feel and mirage are fully
+      READ-ONLY through this door — Cyan's inner objects get deleted by Cyan's
+      own hand (MCP trace on Ruby's word), not by a button. Plans retire via
+      `abandoned`, never deletion (the promise history stays). Portraits
+      (domain 畫像) and permanent doctrine refuse every mutation here. The web
+      delete verb therefore applies to ordinary dynamic memories only.
     Pinning still locks importance to 10, delete still removes the embedding.
     """
     from starlette.responses import JSONResponse
@@ -2998,17 +3004,37 @@ async def api_bucket_trace(request):
     except Exception:
         return JSONResponse({"error": "invalid JSON"}, status_code=400)
     try:
+        bucket = await bucket_mgr.get(bucket_id)
+        if not bucket:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        meta = bucket.get("metadata", {})
+        btype = meta.get("type", "dynamic")
+        is_portrait = "畫像" in (meta.get("domain") or [])
+        if is_portrait or btype == "permanent":
+            return JSONResponse(
+                {"error": "畫像與固化準則在這扇門裡是只讀的"}, status_code=400)
         if body.get("delete") is True:
+            if btype != "dynamic":
+                return JSONResponse(
+                    {"error": "只有普通記憶能從這裡遺忘；帳票用「放下」退場，"
+                              "感受與蜃景是 Cyan 的內在物——要刪，開口讓他親手刪"},
+                    status_code=400)
             success = await bucket_mgr.delete(bucket_id)
             if success:
                 embedding_engine.delete_embedding(bucket_id)
                 return JSONResponse({"ok": True, "deleted": True})
             return JSONResponse({"error": "not found"}, status_code=404)
-        bucket = await bucket_mgr.get(bucket_id)
-        if not bucket:
-            return JSONResponse({"error": "not found"}, status_code=404)
-        btype = bucket.get("metadata", {}).get("type", "dynamic")
+        if btype in ("feel", "mirage"):
+            return JSONResponse(
+                {"error": "感受與蜃景是只讀的——看得到，但不是按鈕能動的"}, status_code=400)
         updates = {}
+        if body.get("progress") is not None:
+            if btype != "plan":
+                return JSONResponse({"error": "progress 是帳票（plan）專屬"}, status_code=400)
+            try:
+                updates["progress"] = max(0.0, min(1.0, float(body["progress"])))
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "progress 要是 0 到 1 的數字"}, status_code=400)
         if body.get("status") is not None:
             if btype != "plan":
                 return JSONResponse(
