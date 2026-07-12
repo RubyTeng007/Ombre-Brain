@@ -1,7 +1,40 @@
 # Ombre Brain — 内部开发文档 / INTERNALS
 
 > 本文档面向开发者和维护者。记录功能总览、环境变量、模块依赖、硬编码值和核心设计决策。
-> 最后更新：2026-07-12（第零批止血；0 章節之後的細節以程式碼為準）
+> 最后更新：2026-07-12（第一批代謝；0 章節之後的細節以程式碼為準）
+
+## 0.7 2026-07-12 第一批代謝（觀察期收官後的 kernel 升級，Ruby joint 拍板）
+
+觀察期數據（07-05→07-12）：desire 喚醒 7→11 次/日、**quiet ratio 0%**（123 次諮詢
+0 次安靜——執念全量餵的直接病症）、閉環習慣健康（satisfy 動詞分佈真實、veto 有理由）、
+miss_ruby 零 FIRE（presence-feeding 正確運作）。據此上線：
+
+- **執念語義收窄**（`server._desire_fixation_buckets`）：執念來源只剩兩種——
+  ① active plan（直接讀 `target_drive`，weight 即召喚力）② `affects_desire=1`
+  的未解決動態桶（`trace(affects_desire=1)` 刻意掛上）。「所有未解決桶都算執念」
+  的舊制廢止；珍貴記憶 ≠ 此刻掛心。部署當下 boost 歸零重啟。
+- **plan 份額上限**（`desire.drive_boosts`＋`PLAN_STRENGTH_CAP=0.6`）：單維裡
+  plan 強度最多佔 0.6（boost ≤ +0.21/0.35）——承諾鋪底，活記憶主唱。
+- **高位消退 hysteresis**（`desire.tick`）：`SAT_CEIL=0.85` 進消退態（停漲、
+  按 `SAT_FALL_HOURS` 各維速度下落：深層 3h／中層 2h／輕層 1h），落到
+  `SAT_FLOOR=0.65` 解除；satisfy 打到 floor 以下直接解除、絕不往上抬。
+  0.85 特意高於「一夜不見 +0.32」的 0.82 落點，不剪晨間想她。
+- **近高位加權抽選**（`desire.pick_intent`＋`TIE_BAND=0.12`）：與榜首差 ≤0.12
+  的維度按分數加權抽一個（取代純 argmax），`PICK_STABILITY_SECONDS=300` 窗內
+  種子固定不抖。
+- **satisfy degree ＋ engage**（`desire.satisfy/engage`）：degree=缺口真的填了
+  幾成（eff = 1−degree×(1−mult)）；engage=做了相關的事但不聲稱滿足，只記帳
+  不動水位。MCP desire 工具同步支援 action=engage、satisfy degree 參數。
+- **互相制約**：explore/browse/create/chore 的 ACTION_SATISFY 各帶 libido ×0.95。
+- **wake 因果鏈**（`POST /api/desire/wake`＋autonomy.ts）：喚醒通知「送達成功」
+  後 autonomy 回 POST 一筆 `wake:{drive}`（wake_id 冪等，滾動窗查重）；幽靈喚醒
+  （已回滾的）永不進帳。
+- **append-only ledger**（`DesireStore._append_ledger`→`buckets/desire_ledger.jsonl`）：
+  mutate 時把新事件同步追加；state 只留 MAX_EVENTS 滾動窗，完整因果史在 ledger。
+  閉環率統計從手工對帳變一條 grep。
+- 頻道側配套（cyan-vps-work）：`fatigueDamp`（0.45 起線性阻尼到 0.72×0.5，硬閘
+  不動）進 attemptDesireFire；喚醒 prompt 中疲勞帶體感行（不給數字）。
+- 測試：`tests/test_batch1.py`（31 條）；全套 161 pass。頻道 bun 43 pass。
 
 ## 0.6 2026-07-12 第零批止血（Non 規格交叉評審後的 no-regret 修復）
 

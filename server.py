@@ -1343,9 +1343,10 @@ async def trace(
     target_drive: str = "",
     progress: float = -1,
     due_at: str = "",
+    affects_desire: int = -1,
     why_remembered: str = "",
 ) -> str:
-    """修改記憶元數據或內容。resolved=1沉底/0激活,pinned=1釘選/0取消,digested=1隱藏(保留但不浮現)/0取消隱藏,content=替換桶正文,delete=True刪除。plan桶專屬:status=active/resolved/abandoned,weight=承諾重量0.0-1.0,kind=promise/task/question/maintenance,target_drive=掛的驅動維度,progress=進度0.0-1.0,due_at=期限(ISO日期)。why_remembered=更新記住的原因。只傳需改的,-1或空=不改。"""
+    """修改記憶元數據或內容。resolved=1沉底/0激活,pinned=1釘選/0取消,digested=1隱藏(保留但不浮現)/0取消隱藏,content=替換桶正文,delete=True刪除。plan桶專屬:status=active/resolved/abandoned,weight=承諾重量0.0-1.0,kind=promise/task/question/maintenance,target_drive=掛的驅動維度,progress=進度0.0-1.0,due_at=期限(ISO日期)。affects_desire=1把這條記憶刻意掛成執念(餵慾望boost)/0取下——動態桶專用,珍貴記憶≠此刻掛心,只掛真的還鯁著的事。why_remembered=更新記住的原因。只傳需改的,-1或空=不改。"""
 
     if not bucket_id or not bucket_id.strip():
         return "請提供有效的 bucket_id。"
@@ -1425,6 +1426,11 @@ async def trace(
         if due_at_norm is None:
             return "due_at 需為 ISO 日期（如 2026-07-15）。"
         updates["due_at"] = due_at_norm
+    if affects_desire in (0, 1):
+        btype = bucket["metadata"].get("type", "dynamic")
+        if btype != "dynamic":
+            return f"affects_desire 只能用在動態桶上（{bucket_id} 是 {btype} 桶；plan 走 target_drive）。"
+        updates["affects_desire"] = bool(affects_desire)
 
     if not updates:
         return "沒有任何字段需要修改。"
@@ -1458,6 +1464,8 @@ async def trace(
     if "status" in updates:
         status_hint = {"active": "重新記掛", "resolved": "已閉環", "abandoned": "已放下（不做了）"}
         changed += f" → plan {status_hint.get(updates['status'], updates['status'])}"
+    if "affects_desire" in updates:
+        changed += " → 已掛成執念（開始餵慾望）" if updates["affects_desire"] else " → 已從執念取下"
     return f"已修改記憶桶 {bucket_id}: {changed}"
 
 
@@ -2174,8 +2182,13 @@ async def self_concept(
 # 函數只提案，醒著的 Cyan 有否決權。
 # =============================================================
 async def _desire_fixation_buckets() -> list[dict]:
-    """收集執念候選桶：未解決、未消化、非釘選/永久/feel 的動態桶摘要。
-    只取 id/name/domains/衰減分 —— 桶正文永不進入慾望系統（鐵律）。"""
+    """收集執念候選（2026-07-12 語義收窄）：珍貴記憶 ≠ 此刻的掛心。
+    只有兩種東西能餵執念——
+    ① active plan：直接讀 target_drive，weight 即召喚力（joint 拍板的接線）。
+    ② affects_desire=1 的未解決動態桶：我刻意掛上的心事（trace 標記）。
+    觀察期證據：舊制「所有未解決桶都算執念」讓舊告白把 miss_ruby boost
+    永久打滿 +0.35、quiet ratio 歸零（123 次諮詢 0 次安靜）。
+    只取 id/name/domains/分數 —— 桶正文永不進入慾望系統（鐵律）。"""
     out = []
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
@@ -2184,13 +2197,31 @@ async def _desire_fixation_buckets() -> list[dict]:
         return out
     for b in all_buckets:
         m = b["metadata"]
-        # plan excluded for now: fixed no-decay score would permanently max the
-        # duty boost. Wiring plans into fixations is a future joint decision.
-        # plan 暫不進執念：固定不衰減分會把 duty 加成永久打滿，接線是日後共同決策。
-        if m.get("type") in ("permanent", "feel", "archived", "plan"):
+        btype = m.get("type")
+        if btype == "plan":
+            if m.get("status", "active") != "active":
+                continue
+            drive = str(m.get("target_drive", "") or "")
+            if drive not in desire_kernel.DRIVE_KEYS:
+                continue  # 舊 plan 沒標 target_drive → 不餵（trace 補標後生效）
+            try:
+                weight = float(m.get("weight", 0.5))
+            except (TypeError, ValueError):
+                weight = 0.5
+            out.append({
+                "id": b["id"],
+                "name": m.get("name", b["id"]),
+                "kind": "plan",
+                "drive": drive,
+                "weight": weight,
+            })
+            continue
+        if btype in ("permanent", "feel", "archived"):
             continue
         if m.get("pinned") or m.get("protected") or m.get("resolved") or m.get("digested"):
             continue
+        if not m.get("affects_desire"):
+            continue  # ← 收窄核心：沒被刻意掛上的記憶不再推水位
         try:
             score = decay_engine.calculate_score(m)
         except Exception:
@@ -2241,8 +2272,9 @@ async def desire(
     event: str = "",
     reason: str = "",
     value: int = -1,
+    degree: float = 1.0,
 ) -> str:
-    """慾望系統（Phase 1 只讀，不接管行為）。action=state 看七維驅動條+執念加成+此刻提案；action=feed 餵真實事件（drive=維度或fatigue, amount=±0~1, event=因為發生了什麼）；action=satisfy 做完某事後回落（verb=murmur/dream_feel/explore/chore/browse/create/tease/rest, event=做了什麼）；action=veto 否決當下提案（drive=維度, reason=為什麼不）；action=gate 開關親密閘（drive=intimacy_ok, value=0/1）。七維：miss_ruby想Ruby/reflection沉澱/curiosity好奇/duty記掛/social人群/creation創作/libido性。"""
+    """慾望系統（只提案不執行）。action=state 看七維驅動條+執念加成+此刻提案；action=feed 餵真實事件（drive=維度或fatigue, amount=±0~1, event=因為發生了什麼）；action=satisfy 缺口真的被填了才用（verb=murmur/dream_feel/explore/chore/browse/create/tease/rest, event=做了什麼, degree=填了多少0~1默認1——只填一半就誠實報0.5）；action=engage 做了相關的事但不聲稱滿足（verb+event, 只記帳不動水位）；action=veto 否決當下提案（drive=維度, reason=為什麼不）；action=gate 親密閘（drive=intimacy_ok, value=0/1, 只聽Ruby的話）。執念來源（2026-07-12 收窄後）：active plan（target_drive）＋trace(affects_desire=1) 刻意掛上的記憶。七維：miss_ruby想Ruby/reflection沉澱/curiosity好奇/duty記掛/social人群/creation創作/libido性。"""
     from datetime import datetime as _dt
     action = (action or "state").strip().lower()
     now = _dt.now()
@@ -2261,8 +2293,15 @@ async def desire(
             if not verb.strip():
                 return "satisfy 需要 verb（murmur/dream_feel/explore/chore/browse/create/tease/rest）。"
             desire_store.mutate(
-                lambda st: desire_kernel.satisfy(st, verb.strip(), now, note=event), now)
-            return f"已回落：{verb}（{event or '做完了'}）"
+                lambda st: desire_kernel.satisfy(st, verb.strip(), now, note=event, degree=degree), now)
+            deg_note = f"，程度 {degree:.2f}" if 0 <= degree < 1 else ""
+            return f"已回落：{verb}（{event or '做完了'}{deg_note}）"
+        if action == "engage":
+            if not verb.strip():
+                return "engage 需要 verb（做了哪類事）。"
+            desire_store.mutate(
+                lambda st: desire_kernel.engage(st, verb.strip(), now, note=event), now)
+            return f"已記錄參與：{verb}（{event or '未註明'}）——水位未動，缺口填上了再 satisfy"
         if action == "veto":
             if not drive.strip():
                 return "veto 需要 drive。"
@@ -2297,7 +2336,7 @@ async def desire(
             desire_store.mutate(
                 lambda st: desire_kernel.set_gate(st, "intimacy_ok", bool(value), now, note=event), now)
             return f"親密閘已{'開' if value else '關'}（{event or ''}）"
-        return f"不支援的 action: {action}。可用: state/feed/satisfy/veto/gate"
+        return f"不支援的 action: {action}。可用: state/feed/satisfy/engage/veto/gate"
     except ValueError as exc:
         return f"慾望系統輸入錯誤: {exc}"
     except Exception:
@@ -2349,6 +2388,47 @@ async def api_desire_state(request):
         return JSONResponse(await _desire_state_payload())
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/desire/wake", methods=["POST"])
+async def api_desire_wake(request):
+    """Wake causal chain (2026-07-12 batch-1): autonomy posts here AFTER a wake
+    was actually delivered (post-notification, so ghost wakes never land).
+    The ledger then holds wake → feed/engage/satisfy/veto in one stream —
+    closure rate becomes computable instead of hand-correlated.
+    喚醒因果鏈：autonomy 在通知「送達成功」後才記一筆 wake 事件，
+    幽靈喚醒永遠不進帳本；閉環率從此可算。冪等：同 wake_id 只記一次。"""
+    from starlette.responses import JSONResponse
+    from datetime import datetime as _dt
+    denied = _require_hook_access(request)
+    if denied:
+        return denied
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    drive_name = str(body.get("drive", "")).strip()
+    wake_id = str(body.get("wake_id", "")).strip()[:64]
+    action_name = str(body.get("action", ""))[:32]
+    score = str(body.get("score", ""))[:16]
+    if drive_name not in desire_kernel.DRIVE_KEYS and drive_name != "fatigue":
+        return JSONResponse({"error": f"unknown drive: {drive_name}"}, status_code=400)
+    if not wake_id:
+        return JSONResponse({"error": "wake_id is required"}, status_code=400)
+    now = _dt.now()
+    note = f"{wake_id} {action_name} score={score}".strip()
+    try:
+        def _record(st):
+            # 冪等：滾動窗內同 wake_id 已存在就不重記
+            for e in st.get("events", []):
+                if e.get("kind", "").startswith("wake:") and wake_id in e.get("note", ""):
+                    return st
+            desire_kernel._log_event(st, now, f"wake:{drive_name}", note)
+            return st
+        desire_store.mutate(_record, now)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    return JSONResponse({"ok": True, "wake_id": wake_id})
 
 
 # =============================================================

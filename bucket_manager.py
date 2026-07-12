@@ -453,6 +453,8 @@ class BucketManager:
             post["target_drive"] = str(kwargs["target_drive"])[:32]
         if "due_at" in kwargs:
             post["due_at"] = str(kwargs["due_at"])[:64]
+        if "affects_desire" in kwargs:
+            post["affects_desire"] = bool(kwargs["affects_desire"])
         if "why_remembered" in kwargs:
             post["why_remembered"] = str(kwargs["why_remembered"])[:200]
         if "related_bucket" in kwargs:
