@@ -2289,20 +2289,27 @@ async def self_concept(
 # 七維驅動條＋fatigue 閘；執念層直接掛 Ombre 未解決桶；
 # 函數只提案，醒著的 Cyan 有否決權。
 # =============================================================
-async def _desire_fixation_buckets() -> list[dict]:
+async def _desire_fixation_buckets(with_detail: bool = False):
     """收集執念候選（2026-07-12 語義收窄）：珍貴記憶 ≠ 此刻的掛心。
     只有兩種東西能餵執念——
     ① active plan：直接讀 target_drive，weight 即召喚力（joint 拍板的接線）。
     ② affects_desire=1 的未解決動態桶：我刻意掛上的心事（trace 標記）。
     觀察期證據：舊制「所有未解決桶都算執念」讓舊告白把 miss_ruby boost
     永久打滿 +0.35、quiet ratio 歸零（123 次諮詢 0 次安靜）。
-    只取 id/name/domains/分數 —— 桶正文永不進入慾望系統（鐵律）。"""
-    out = []
+    只取 id/name/domains/分數 —— 桶正文永不進入慾望系統（鐵律）。
+
+    with_detail=True（P1）另回 typed refs 給前端：
+    {drive: [{id,name,type,kind,weight|score,expired,feeding}]}——
+    過期但仍 active 的 plan 也在列（feeding=False），UI 才能誠實說
+    「期限已過，已停止餵暗流，等待完成或放下」。"""
+    out: list[dict] = []
+    detail: dict[str, list] = {}
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
     except Exception as e:
         logger.warning(f"desire fixation list failed: {e}")
-        return out
+        return (out, detail) if with_detail else out
+    from datetime import date as _date
     for b in all_buckets:
         m = b["metadata"]
         btype = m.get("type")
@@ -2315,18 +2322,26 @@ async def _desire_fixation_buckets() -> list[dict]:
             # 過期斷餵（2026-07-12 第三批）：due_at 過了的 plan 不再推水位——
             # 否則過期的夢種子/question 會變成永動執念。帳本身還在（dream 尾端
             # 照列），等我 resolve/abandon；壞格式不當過期，寧可多餵也不無聲斷線。
+            expired = False
             due = str(m.get("due_at", "") or "").strip()
             if due:
                 try:
-                    from datetime import date as _date
-                    if _date.today() > _date.fromisoformat(due[:10]):
-                        continue
+                    expired = _date.today() > _date.fromisoformat(due[:10])
                 except ValueError:
-                    pass
+                    expired = False
             try:
                 weight = float(m.get("weight", 0.5))
             except (TypeError, ValueError):
                 weight = 0.5
+            if with_detail:
+                detail.setdefault(drive, []).append({
+                    "id": b["id"], "name": m.get("name", b["id"]),
+                    "type": "plan", "kind": m.get("kind", "task"),
+                    "weight": weight, "due_at": due,
+                    "expired": expired, "feeding": not expired,
+                })
+            if expired:
+                continue
             out.append({
                 "id": b["id"],
                 "name": m.get("name", b["id"]),
@@ -2345,20 +2360,33 @@ async def _desire_fixation_buckets() -> list[dict]:
             score = decay_engine.calculate_score(m)
         except Exception:
             continue
+        if with_detail:
+            # 跟 kernel 同一條映射規則：第一個命中的 domain 決定它掛哪維
+            mem_drive = ""
+            for d in m.get("domain", []) or []:
+                mem_drive = desire_kernel.DOMAIN_TO_DRIVE.get(str(d), "")
+                if mem_drive:
+                    break
+            if mem_drive:
+                detail.setdefault(mem_drive, []).append({
+                    "id": b["id"], "name": m.get("name", b["id"]),
+                    "type": "memory", "score": round(score, 2),
+                    "expired": False, "feeding": True,
+                })
         out.append({
             "id": b["id"],
             "name": m.get("name", b["id"]),
             "domains": m.get("domain", []),
             "score": score,
         })
-    return out
+    return (out, detail) if with_detail else out
 
 
 async def _desire_state_payload() -> dict:
     """tick 後的完整狀態＋執念加成＋當下提案（并持久化 last_intent）。"""
     from datetime import datetime as _dt
     now = _dt.now()
-    buckets = await _desire_fixation_buckets()
+    buckets, boosts_detail = await _desire_fixation_buckets(with_detail=True)
     boosts = desire_kernel.drive_boosts(buckets)
 
     def _refresh(state):
@@ -2388,6 +2416,9 @@ async def _desire_state_payload() -> dict:
         "fatigue_gate": desire_kernel.FATIGUE_GATE,
         "gates": state["gates"],
         "boosts": boosts,
+        # P1 typed refs：執念來源帶 id/type/過期/是否仍餵——前端的線頭
+        # 從純文字變成能點開的門；舊 sources 保留向後相容。
+        "boosts_detail": boosts_detail,
         "intent": state["last_intent"],
         "veto_until": active_vetoes,
         # 高位消退態（batch-1 hysteresis）：瓶子摸頂後不漲反落的原因，
@@ -2549,24 +2580,139 @@ async def api_desire_wake(request):
     wake_id = str(body.get("wake_id", "")).strip()[:64]
     action_name = str(body.get("action", ""))[:32]
     score = str(body.get("score", ""))[:16]
+    # P1 (2026-07-12 深夜): the wake's first-person reason rides along so the
+    # causal receipt can say WHY, not just which drive. Control chars stripped;
+    # 200 chars is the note cap anyway.
+    reason = " ".join(str(body.get("reason", "")).split())[:200]
     if drive_name not in desire_kernel.DRIVE_KEYS and drive_name != "fatigue":
         return JSONResponse({"error": f"unknown drive: {drive_name}"}, status_code=400)
     if not wake_id:
         return JSONResponse({"error": "wake_id is required"}, status_code=400)
     now = _dt.now()
-    note = f"{wake_id} {action_name} score={score}".strip()
+    # P1 fix: wake_id goes into the event's own field (the frontend chains on
+    # e.wake_id — it used to hide inside the note string, so chains never
+    # grouped on live data). note carries the human reason; action/score stay
+    # as a technical suffix for the Engine side.
+    note = reason if reason else f"{action_name} score={score}".strip()
     try:
         def _record(st):
-            # 冪等：滾動窗內同 wake_id 已存在就不重記
+            # 冪等：滾動窗內同 wake_id 已存在就不重記（兼容舊 note 內嵌格式）
             for e in st.get("events", []):
-                if e.get("kind", "").startswith("wake:") and wake_id in e.get("note", ""):
+                if e.get("kind", "").startswith("wake:") and (
+                        e.get("wake_id") == wake_id or wake_id in e.get("note", "")):
                     return st
-            desire_kernel._log_event(st, now, f"wake:{drive_name}", note)
+            desire_kernel._log_event(st, now, f"wake:{drive_name}", note, wake_id=wake_id)
             return st
         desire_store.mutate(_record, now)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
     return JSONResponse({"ok": True, "wake_id": wake_id})
+
+
+def _ledger_tail(path: str, max_lines: int = 2000) -> list[dict]:
+    """Read the tail of desire_ledger.jsonl (append-only full history).
+    Bounded read: the file grows forever, receipts only need the recent past."""
+    import os as _os
+    if not _os.path.exists(path):
+        return []
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 512 * 1024))
+            raw = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    lines = raw.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    out = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            e = _json_lib.loads(ln)
+            if isinstance(e, dict):
+                out.append(e)
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+@mcp.custom_route("/api/desire/ledger", methods=["GET"])
+async def api_desire_ledger(request):
+    """Read-only causal receipts (P1, 2026-07-12): the full append-only ledger
+    grouped by wake_id — 醒來→選擇→結果 as one receipt. Fields the old data
+    can't fill honestly say unknown; nothing is guessed. Loose events (feeds,
+    gates, closures done outside any wake) come back separately.
+    唯讀因果收據：按 wake_id 分組；舊資料缺欄照實說「未知」，不准猜。"""
+    from starlette.responses import JSONResponse
+    err = _require_read_access(request)
+    if err: return err
+    try:
+        limit = max(1, min(100, int(request.query_params.get("limit", "30"))))
+    except (ValueError, TypeError):
+        limit = 30
+    events = _ledger_tail(desire_store.ledger_path)
+    # state 滾動窗裡可能有 ledger 檔尚未包含的最新幾筆？不會——mutate 同步
+    # 寫兩邊；但 ledger 寫失敗不擋主流程，所以以 state 補最近événements。
+    try:
+        st = desire_store.load()
+        seen = {(e.get("ts"), e.get("kind")) for e in events}
+        for e in st.get("events", []):
+            if (e.get("ts"), e.get("kind")) not in seen:
+                events.append(e)
+        events.sort(key=lambda e: str(e.get("ts", "")))
+    except Exception:
+        pass
+
+    receipts: list[dict] = []
+    by_wake: dict[str, dict] = {}
+    loose: list[dict] = []
+    verbs_close = ("satisfy:", "engage:", "veto:")
+    for e in events:
+        kind = str(e.get("kind", ""))
+        wid = str(e.get("wake_id", "") or "")
+        if kind.startswith("wake:"):
+            r = {
+                "wake_id": wid or "未知",
+                "ts": e.get("ts", ""),
+                "source": "desire",
+                "drive": kind[len("wake:"):],
+                "reason": e.get("note", "") or "未知",
+                "delivery": "delivered",  # 幽靈喚醒從不進帳（送達後才 POST）
+                "choice": "unknown", "verb": "", "degree": None,
+                "closed": False, "result_note": "",
+            }
+            receipts.append(r)
+            if wid:
+                by_wake[wid] = r
+            continue
+        if wid and wid in by_wake and kind.startswith(verbs_close):
+            r = by_wake[wid]
+            head, _, rest = kind.partition(":")
+            parts = rest.split(":")
+            r["choice"] = head
+            r["verb"] = parts[0] if parts else ""
+            if head == "satisfy":
+                deg = 1.0
+                for p in parts[1:]:
+                    if p.startswith("d"):
+                        try: deg = float(p[1:])
+                        except ValueError: pass
+                r["degree"] = deg
+            r["closed"] = True
+            r["result_note"] = e.get("note", "")
+            continue
+        loose.append(e)
+
+    receipts.reverse()  # 新的在前
+    return JSONResponse({
+        "receipts": receipts[:limit],
+        "loose": loose[-limit:][::-1],
+        "note": "收據只涵蓋暗流喚醒；早午晚儀式與排程不進慾望帳。舊資料缺的欄位是「未知」，不是猜的。",
+    })
 
 
 # =============================================================
