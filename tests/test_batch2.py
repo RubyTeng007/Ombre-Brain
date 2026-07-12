@@ -87,6 +87,12 @@ class TestKnotDrive:
         loaded = store.load(NOW)
         assert "knot" in loaded["drives"]
 
+    def test_knot_baseline_is_zero(self):
+        # 事件驅動維度基線 0：沒有心結就是沒有，不是 0.15 個
+        s = dk.default_state(NOW)
+        assert s["drives"]["knot"] == 0.0
+        assert s["drives"]["miss_ruby"] == 0.15
+
 
 # ---------------------------------------------------------
 # 2. Mirage（夢）桶：隔離通道

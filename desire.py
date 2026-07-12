@@ -183,12 +183,13 @@ def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
 
 
 def default_state(now: datetime | None = None) -> dict[str, Any]:
-    """全新狀態：各維從低水位起步，閘門全開、安全預設。"""
+    """全新狀態：各維從低水位起步，閘門全開、安全預設。
+    事件驅動維度（RISE=0，如 knot）基線為 0——沒有心結就是沒有，不是 0.15 個。"""
     now = now or datetime.now()
     return {
         "version": _STATE_VERSION,
         "updated_at": now.isoformat(timespec="seconds"),
-        "drives": {k: 0.15 for k in DRIVE_KEYS},
+        "drives": {k: (0.0 if RISE_PER_HOUR[k] == 0.0 else 0.15) for k in DRIVE_KEYS},
         "fatigue": 0.0,
         "gates": {
             "intimacy_ok": False,  # Ruby 的開關——fail-close：預設關，只有她親口的 set_gate 能開（2026-07-05 定案）
