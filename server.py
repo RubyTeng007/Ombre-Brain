@@ -2563,6 +2563,18 @@ async def api_buckets(request):
                 "activation_count": meta.get("activation_count", 1),
                 "score": decay_engine.calculate_score(meta),
                 "content_preview": strip_wikilinks(b.get("content", ""))[:200],
+                # batch-2 fields the memory room renders (2026-07-12):
+                # plan ledger, fixation anchor, two-tier counters, dream provenance
+                # 第二批新欄位：帳本、執念錨、兩層計數、夢的素材出處
+                "status": meta.get("status", ""),
+                "weight": meta.get("weight"),
+                "kind": meta.get("kind", ""),
+                "target_drive": meta.get("target_drive", ""),
+                "progress": meta.get("progress"),
+                "due_at": meta.get("due_at", ""),
+                "affects_desire": meta.get("affects_desire", False),
+                "retrieved_count": meta.get("retrieved_count", 0),
+                "consumed": meta.get("consumed", ""),
             })
         result.sort(key=lambda x: x["score"], reverse=True)
         return JSONResponse(result)
