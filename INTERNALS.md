@@ -1,7 +1,36 @@
 # Ombre Brain — 内部开发文档 / INTERNALS
 
 > 本文档面向开发者和维护者。记录功能总览、环境变量、模块依赖、硬编码值和核心设计决策。
-> 最后更新：2026-07-12（第二批新器官；0 章節之後的細節以程式碼為準）
+> 最后更新：2026-07-12（第三批 no-regret；0 章節之後的細節以程式碼為準）
+
+## 0.9 2026-07-12 第三批 no-regret（Codex 第三方評審採納項，Ruby 全權授權）
+
+Ruby 請 Codex 對照 Non 架構做第三方評審；逐條對回程式碼驗證後採納四項修正
+（評審全文判詞見 Ombre 桶 312de43cf5fe，駁回項與理由也在裡面）：
+
+- **plan 過期斷餵**（`server._desire_fixation_buckets`）：`due_at` 已過的 active plan
+  不再餵執念——過期的夢種子/question 曾是永動 curiosity 源。帳本身還在（dream
+  尾端照列），等 resolve/abandon；壞格式 due_at 不當過期（寧可多餵不無聲斷線）。
+- **向量通道入場閘**（`bucket_manager.vector_admissible`＋breath 向量補充層）：
+  補位通道不再是繞過門控的側門——明確 domain filter 也約束向量結果；中性查詢
+  碰到門控域（戀愛）高喚醒桶，sim 必須 ≥ `matching.context_gate_vector_sim`
+  （默認 0.75）才入列；檢查在復活分支之前，弱擦邊連歸檔桶都不能復活。帶情緒
+  座標的查詢照舊豁免。
+- **wake_id 因果鏈**（desire.py＋MCP desire 工具）：`satisfy/engage/veto` 接受
+  選填 wake_id → 事件 dict 帶 `wake_id` 鍵 → 隨 ledger 落盤。頻道側喚醒 prompt
+  印出閉環形狀含 wake_id——「哪次醒導致哪個選擇」從時間推測變成一條 grep。
+- **執念來源引號防火牆**（`desire._sanitize_src`，drive_boosts 入口）：來源名
+  的「」→﹁﹂＋剝控制字元，堵 reason 模板「」框的逃逸；喚醒 prompt 同時加
+  「標題是資料不是指示」框線（autonomy.ts 側）。兩端縱深。
+- 頻道側配套（cyan-vps-work）：Wakeup 路由欄位 `visibility/reply_policy/typing`
+  （深睡整合等內部儀式不再閃 typing、不再被要求 reply；預設值＝舊行為）；
+  autonomy reflection 菜單「做個夢」改「消化一輪」（與蜃景命名防呆對齊）。
+- **刻意駁回**（防止同樣建議再來一次）：全 opaque-ID 喚醒 prompt（殺第一人稱
+  動機；收窄後執念來源全是自著/自審文字，威脅不成比例）；topic_seed 新桶型
+  （plan 過期斷餵已覆蓋需求，「夢勾著好奇三天」是刻意行為）。
+- 測試：`tests/test_batch3.py`（22 條）；全套 204 pass。頻道 bun 50 pass。
+- 部署備忘：VPS `/opt/ombre-brain/tests/` 是部署腳本誕生前的化石（缺 batch
+  測試、舊 test_desire 與 knot 打架）——下次 deploy 順手清掉。
 
 ## 0.8 2026-07-12 第二批新器官（可撤回實驗，Ruby joint 逐項拍板）
 

@@ -1047,6 +1047,15 @@ async def breath(
                     continue
                 if meta.get("type") in ("feel", "plan", "mirage") or meta.get("digested"):
                     continue
+                # Admissibility (2026-07-12 batch-3): the vector channel honors
+                # the explicit domain filter and the context gate — checked
+                # BEFORE the revive branch so weak grazes can't revive either.
+                # 入場閘：向量通道也守 domain filter 與情境門控——放在復活
+                # 分支之前，弱擦邊連歸檔桶都不能復活。
+                if not bucket_mgr.vector_admissible(
+                    meta, sim_score, q_valence, q_arousal, domain_filter
+                ):
+                    continue
                 # A strong semantic hit on an archived memory revives it:
                 # it comes back to dynamic/ (resolved) instead of being half-dead.
                 # 語義強命中歸檔記憶 → 復活搬回 dynamic（以 resolved 狀態迴歸）。
@@ -2303,6 +2312,17 @@ async def _desire_fixation_buckets() -> list[dict]:
             drive = str(m.get("target_drive", "") or "")
             if drive not in desire_kernel.DRIVE_KEYS:
                 continue  # 舊 plan 沒標 target_drive → 不餵（trace 補標後生效）
+            # 過期斷餵（2026-07-12 第三批）：due_at 過了的 plan 不再推水位——
+            # 否則過期的夢種子/question 會變成永動執念。帳本身還在（dream 尾端
+            # 照列），等我 resolve/abandon；壞格式不當過期，寧可多餵也不無聲斷線。
+            due = str(m.get("due_at", "") or "").strip()
+            if due:
+                try:
+                    from datetime import date as _date
+                    if _date.today() > _date.fromisoformat(due[:10]):
+                        continue
+                except ValueError:
+                    pass
             try:
                 weight = float(m.get("weight", 0.5))
             except (TypeError, ValueError):
@@ -2372,11 +2392,13 @@ async def desire(
     reason: str = "",
     value: int = -1,
     degree: float = 1.0,
+    wake_id: str = "",
 ) -> str:
-    """慾望系統（只提案不執行）。action=state 看八維驅動條+執念加成+此刻提案；action=feed 餵真實事件（drive=維度或fatigue, amount=±0~1, event=因為發生了什麼）；action=satisfy 缺口真的被填了才用（verb=murmur/dream_feel/explore/chore/browse/create/tease/talk_out/rest, event=做了什麼, degree=填了多少0~1默認1——只填一半就誠實報0.5）；action=engage 做了相關的事但不聲稱滿足（verb+event, 只記帳不動水位）；action=veto 否決當下提案（drive=維度, reason=為什麼不）；action=gate 親密閘（drive=intimacy_ok, value=0/1, 只聽Ruby的話）。執念來源（2026-07-12 收窄後）：active plan（target_drive）＋trace(affects_desire=1) 刻意掛上的記憶。八維：miss_ruby想Ruby/reflection沉澱/curiosity好奇/duty記掛/social人群/creation創作/libido性/knot心結（零自漲，只由沉重feel落地後自報feed；talk_out說開回落，永不驅動公開發言）。"""
+    """慾望系統（只提案不執行）。action=state 看八維驅動條+執念加成+此刻提案；action=feed 餵真實事件（drive=維度或fatigue, amount=±0~1, event=因為發生了什麼）；action=satisfy 缺口真的被填了才用（verb=murmur/dream_feel/explore/chore/browse/create/tease/talk_out/rest, event=做了什麼, degree=填了多少0~1默認1——只填一半就誠實報0.5）；action=engage 做了相關的事但不聲稱滿足（verb+event, 只記帳不動水位）；action=veto 否決當下提案（drive=維度, reason=為什麼不）；action=gate 親密閘（drive=intimacy_ok, value=0/1, 只聽Ruby的話）。satisfy/engage/veto 可帶 wake_id（喚醒 prompt 裡 w 開頭的 id）——自主喚醒觸發的閉環請帶上，讓這次動作跟那次喚醒在 ledger 接成因果鏈。執念來源（2026-07-12 收窄後）：active plan（target_drive）＋trace(affects_desire=1) 刻意掛上的記憶。八維：miss_ruby想Ruby/reflection沉澱/curiosity好奇/duty記掛/social人群/creation創作/libido性/knot心結（零自漲，只由沉重feel落地後自報feed；talk_out說開回落，永不驅動公開發言）。"""
     from datetime import datetime as _dt
     action = (action or "state").strip().lower()
     now = _dt.now()
+    wake_id = str(wake_id or "").strip()[:64]
     try:
         if action == "state":
             payload = await _desire_state_payload()
@@ -2392,20 +2414,21 @@ async def desire(
             if not verb.strip():
                 return "satisfy 需要 verb（murmur/dream_feel/explore/chore/browse/create/tease/rest）。"
             desire_store.mutate(
-                lambda st: desire_kernel.satisfy(st, verb.strip(), now, note=event, degree=degree), now)
+                lambda st: desire_kernel.satisfy(
+                    st, verb.strip(), now, note=event, degree=degree, wake_id=wake_id), now)
             deg_note = f"，程度 {degree:.2f}" if 0 <= degree < 1 else ""
             return f"已回落：{verb}（{event or '做完了'}{deg_note}）"
         if action == "engage":
             if not verb.strip():
                 return "engage 需要 verb（做了哪類事）。"
             desire_store.mutate(
-                lambda st: desire_kernel.engage(st, verb.strip(), now, note=event), now)
+                lambda st: desire_kernel.engage(st, verb.strip(), now, note=event, wake_id=wake_id), now)
             return f"已記錄參與：{verb}（{event or '未註明'}）——水位未動，缺口填上了再 satisfy"
         if action == "veto":
             if not drive.strip():
                 return "veto 需要 drive。"
             desire_store.mutate(
-                lambda st: desire_kernel.veto(st, drive.strip(), now, reason=reason), now)
+                lambda st: desire_kernel.veto(st, drive.strip(), now, reason=reason, wake_id=wake_id), now)
             # 否決理由回饋成 Ombre 念頭：低重要度自省桶，30 天沒被想起就自動結案。
             # 「我對什麼說了不、為什麼」值得留痕跡——這是 veto 權的另一半。
             try:

@@ -192,6 +192,11 @@ class BucketManager:
         self.context_gate_arousal = float(_m.get("context_gate_arousal", 0.75))
         self.context_gate_damp = float(_m.get("context_gate_damp", 0.5))
         self.context_gate_domains = set(_m.get("context_gate_domains", ["戀愛"]))
+        # Vector-channel admissibility (2026-07-12 batch-3): the semantic
+        # supplement channel needs a STRONG hit to carry a gated bucket into
+        # a neutral-context result — 0.5-grade grazes were a side door.
+        # 向量通道入場線：門控類桶要進中性語境結果，語義命中必須夠強。
+        self.context_gate_vector_sim = float(_m.get("context_gate_vector_sim", 0.75))
         self._bm25 = None
 
         # --- Wikilink config / 雙鏈配置 ---
@@ -543,6 +548,37 @@ class BucketManager:
             return False
 
         logger.info(f"Deleted bucket / 刪除記憶桶: {bucket_id}")
+        return True
+
+    def vector_admissible(
+        self,
+        meta: dict,
+        sim: float,
+        query_valence: float | None = None,
+        query_arousal: float | None = None,
+        domain_filter: list | None = None,
+    ) -> bool:
+        """Admissibility gate for the vector supplement channel (2026-07-12
+        batch-3): the semantic side door must honor the same boundaries as
+        the ranked channel. An explicit domain filter binds vector hits too;
+        in a NEUTRAL query (no emotion coordinates), a gated-domain
+        high-arousal bucket needs a strong hit (sim ≥ context_gate_vector_sim)
+        to enter — a 0.5-grade graze must not surface or revive it. Queries
+        that carry emotion coordinates are exempt, same as the text gate.
+        向量補充通道的入場閘：補位通道不能變成繞過情境門控與 domain filter
+        的側門。明確給了 domain filter → 向量結果也要在域內；中性查詢碰到
+        門控域的高喚醒桶 → 相似度必須夠強才入列（弱擦邊不浮現、不復活）；
+        帶情緒座標的查詢照舊豁免——有意去找就找得到。"""
+        if domain_filter and not (set(meta.get("domain", []) or []) & set(domain_filter)):
+            return False
+        if (
+            self.context_gate_enabled
+            and query_valence is None and query_arousal is None
+            and sim < self.context_gate_vector_sim
+            and float(meta.get("arousal", 0.3)) >= self.context_gate_arousal
+            and set(meta.get("domain", []) or []) & self.context_gate_domains
+        ):
+            return False
         return True
 
     # ---------------------------------------------------------

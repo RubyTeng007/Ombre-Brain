@@ -235,6 +235,15 @@ def tick(state: dict, now: datetime) -> dict:
     return new
 
 
+def _sanitize_src(name: str) -> str:
+    """執念來源名進 sources/reason/喚醒 prompt 前的清洗（2026-07-12 第三批）。
+    名字是資料不是指令：全形引號會逃出 reason 模板的「」框，換成豎排引號
+    保留可讀性；控制字元一併去掉。收窄後來源都是自著/自審文字，這層是
+    縱深防禦，不是唯一防線。"""
+    s = "".join(ch for ch in str(name) if ch >= " ")
+    return s.replace("「", "﹁").replace("」", "﹂")
+
+
 def drive_boosts(buckets: list[dict]) -> dict[str, dict[str, Any]]:
     """
     執念層：算各維召喚力加成。輸入兩種項目（2026-07-12 語義收窄後，
@@ -248,7 +257,7 @@ def drive_boosts(buckets: list[dict]) -> dict[str, dict[str, Any]]:
     """
     per_drive: dict[str, list[tuple[float, str, bool]]] = {k: [] for k in DRIVE_KEYS}
     for b in buckets or []:
-        name = str(b.get("name", ""))[:40]
+        name = _sanitize_src(str(b.get("name", ""))[:40])
         if b.get("kind") == "plan":
             drive = str(b.get("drive", ""))
             if drive not in DRIVE_KEYS:
@@ -363,7 +372,8 @@ def pick_intent(state: dict, boosts: dict[str, dict] | None, now: datetime) -> d
     }
 
 
-def satisfy(state: dict, action: str, now: datetime, note: str = "", degree: float = 1.0) -> dict:
+def satisfy(state: dict, action: str, now: datetime, note: str = "", degree: float = 1.0,
+            wake_id: str = "") -> dict:
     """做完了：相關維度乘性回落。rest 額外回復 fatigue。純函數。
     degree（0~1，2026-07-12 第一批）＝缺口真的被填了多少：
     1.0＝完整滿足（原行為）；0.5＝只填了一半，回落減半；0＝沒填上，不動。
@@ -384,17 +394,17 @@ def satisfy(state: dict, action: str, now: datetime, note: str = "", degree: flo
         f = float(new.get("fatigue", 0.0))
         new["fatigue"] = round(_clamp(f * (1.0 - degree * 0.5)), 4)
     tag = f"satisfy:{action}" + (f":d{degree:.2f}" if degree < 1.0 else "")
-    _log_event(new, now, tag, note)
+    _log_event(new, now, tag, note, wake_id=wake_id)
     return new
 
 
-def engage(state: dict, action: str, now: datetime, note: str = "") -> dict:
+def engage(state: dict, action: str, now: datetime, note: str = "", wake_id: str = "") -> dict:
     """做了相關的事，但不聲稱缺口已填——只記帳、完全不動水位（2026-07-12 第一批）。
     「參與」和「滿足」是兩件事：engage 是誠實的中間態，供因果鏈與週回顧統計。"""
     if action not in ACTION_SATISFY:
         raise ValueError(f"未知的 action: {action}")
     new = json.loads(json.dumps(state))
-    _log_event(new, now, f"engage:{action}", note)
+    _log_event(new, now, f"engage:{action}", note, wake_id=wake_id)
     return new
 
 
@@ -416,7 +426,7 @@ def feed(state: dict, drive: str, amount: float, now: datetime, event: str = "")
     return new
 
 
-def veto(state: dict, drive: str, now: datetime, reason: str = "") -> dict:
+def veto(state: dict, drive: str, now: datetime, reason: str = "", wake_id: str = "") -> dict:
     """
     否決提案：該維乘性回落並進入冷卻。
     否決理由記進 events（Phase 2 會回饋成 Ombre 念頭）。
@@ -428,7 +438,7 @@ def veto(state: dict, drive: str, now: datetime, reason: str = "") -> dict:
     new["drives"][drive] = round(_clamp(cur * VETO_DAMP), 4)
     until = now.timestamp() + VETO_COOLDOWN_HOURS * 3600
     new.setdefault("veto_until", {})[drive] = datetime.fromtimestamp(until).isoformat(timespec="seconds")
-    _log_event(new, now, f"veto:{drive}", reason)
+    _log_event(new, now, f"veto:{drive}", reason, wake_id=wake_id)
     return new
 
 
@@ -444,14 +454,19 @@ def set_gate(state: dict, gate: str, value: bool, now: datetime, note: str = "")
     return new
 
 
-def _log_event(state: dict, now: datetime, kind: str, note: str = "") -> None:
-    """就地記一筆事件（僅供內部在 deep copy 上使用）。"""
-    events = state.setdefault("events", [])
-    events.append({
+def _log_event(state: dict, now: datetime, kind: str, note: str = "", wake_id: str = "") -> None:
+    """就地記一筆事件（僅供內部在 deep copy 上使用）。
+    wake_id（2026-07-12 第三批）：這筆閉環動作對應哪次喚醒——有給才記，
+    讓「哪次醒導致哪個選擇」從時間推測變成 ledger 裡的一條 grep。"""
+    entry = {
         "ts": now.isoformat(timespec="seconds"),
         "kind": kind,
         "note": str(note)[:200],
-    })
+    }
+    if wake_id:
+        entry["wake_id"] = str(wake_id)[:64]
+    events = state.setdefault("events", [])
+    events.append(entry)
     del events[:-MAX_EVENTS]
 
 
