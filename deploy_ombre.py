@@ -178,8 +178,9 @@ def main() -> int:
         *[f"install -m 644 -o {OWNER} -g {OWNER} {stage}/{f} {REMOTE_DIR}/{f}.new-{deploy_id}" for f in FILES],
         # phase 2: atomic renames (no mixed tree on a mid-script failure)
         *[f"mv {REMOTE_DIR}/{f}.new-{deploy_id} {REMOTE_DIR}/{f}" for f in FILES],
-        # plan buckets dir for the promise ledger
+        # plan buckets dir for the promise ledger + dream dir for the dream channel
         f"install -d -o {OWNER} -g {OWNER} {REMOTE_DIR}/buckets/plan",
+        f"install -d -o {OWNER} -g {OWNER} {REMOTE_DIR}/buckets/mirage",
         f"rm -rf {stage}",
     ]
     ssh(args, ["\n".join(lines)])

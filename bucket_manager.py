@@ -112,6 +112,9 @@ _EXTRA_META_KEYS = (
     # directly — never the domain→drive map.
     # plan schema（2026-07-12）：執念接線直接讀 target_drive，不走 domain 映射。
     "kind", "target_drive", "due_at", "progress",
+    # dream provenance (2026-07-12 batch-2): which buckets the dream consumed.
+    # dream 出處（第二批）：這個夢消化了哪些桶。
+    "consumed",
 )
 _FLOAT_META_KEYS = ("weight", "progress")
 
@@ -170,6 +173,7 @@ class BucketManager:
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
         self.archive_dir = os.path.join(self.base_dir, "archive")
         self.feel_dir = os.path.join(self.base_dir, "feel")
+        self.mirage_dir = os.path.join(self.base_dir, "mirage")
         self.plan_dir = os.path.join(self.base_dir, "plan")
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
@@ -180,6 +184,14 @@ class BucketManager:
         # --- BM25 關鍵詞通道：預建休眠。開了之後 BM25 命中補進候選集並融入
         # topic 分——是召回保險，不是重寫排序。---
         self.bm25_enabled = bool(config.get("matching", {}).get("bm25_enabled", False))
+        # --- Context gate (2026-07-12 batch-2): neutral-context queries damp
+        # weak-hit high-arousal intimate buckets out of the ranking.
+        # --- 情境門控：中性語境查詢把弱命中的高喚醒親密桶擋在榜外。---
+        _m = config.get("matching", {})
+        self.context_gate_enabled = bool(_m.get("context_gate_enabled", True))
+        self.context_gate_arousal = float(_m.get("context_gate_arousal", 0.75))
+        self.context_gate_damp = float(_m.get("context_gate_damp", 0.5))
+        self.context_gate_domains = set(_m.get("context_gate_domains", ["戀愛"]))
         self._bm25 = None
 
         # --- Wikilink config / 雙鏈配置 ---
@@ -247,8 +259,8 @@ class BucketManager:
         """
         bucket_id = generate_bucket_id()
         bucket_name = sanitize_name(name) if name else bucket_id
-        # feel buckets are allowed to have empty domain; others default to ["未分類"]
-        if bucket_type == "feel":
+        # feel/mirage buckets are allowed to have empty domain; others default to ["未分類"]
+        if bucket_type in ("feel", "mirage"):
             domain = normalize_domains(domain) if domain is not None else []
         else:
             domain = normalize_domains(domain) or ["未分類"]
@@ -310,12 +322,16 @@ class BucketManager:
             type_dir = self.permanent_dir
         elif bucket_type == "feel":
             type_dir = self.feel_dir
+        elif bucket_type == "mirage":
+            type_dir = self.mirage_dir
         elif bucket_type == "plan":
             type_dir = self.plan_dir
         else:
             type_dir = self.dynamic_dir
         if bucket_type == "feel":
             primary_domain = "沉澱物"  # feel subfolder name
+        elif bucket_type == "mirage":
+            primary_domain = "蜃景"  # mirage subfolder name
         else:
             primary_domain = sanitize_name(domain[0]) if domain else "未分類"
         target_dir = os.path.join(type_dir, primary_domain)
@@ -535,6 +551,27 @@ class BucketManager:
     # Called on every recall hit; affects decay score.
     # 每次檢索命中時調用，影響衰減得分。
     # ---------------------------------------------------------
+    async def mark_surfaced(self, bucket_id: str) -> None:
+        """Record that a bucket was shown (surfaced or returned by search)
+        WITHOUT reinforcing it: last_surfaced + retrieved_count only —
+        last_active / activation_count stay untouched, so being looked at
+        is not the same as being engaged with (2026-07-12 batch-2).
+        記錄「被看見」但不加固：只寫 last_surfaced 與 retrieved_count，
+        不動 last_active / activation_count——被看到 ≠ 被用到。"""
+        file_path = self._find_bucket_file(bucket_id)
+        if not file_path:
+            return
+        try:
+            post = frontmatter.load(file_path)
+            post["last_surfaced"] = now_iso()
+            try:
+                post["retrieved_count"] = int(post.get("retrieved_count", 0)) + 1
+            except (ValueError, TypeError):
+                post["retrieved_count"] = 1
+            atomic_write_text(file_path, frontmatter.dumps(post))
+        except Exception as e:
+            logger.warning(f"Failed to mark surfaced / 記錄浮現失敗: {bucket_id}: {e}")
+
     async def touch(self, bucket_id: str, ripple: bool = False) -> None:
         """
         Update a bucket's last activation time and count (capped at ACTIVATION_CAP).
@@ -584,8 +621,8 @@ class BucketManager:
             if bucket["id"] == source_id:
                 continue
             meta = bucket.get("metadata", {})
-            # Skip pinned/permanent/feel and buckets already settled or digested
-            if meta.get("pinned") or meta.get("protected") or meta.get("type") in ("permanent", "feel"):
+            # Skip pinned/permanent/feel/mirage and buckets already settled or digested
+            if meta.get("pinned") or meta.get("protected") or meta.get("type") in ("permanent", "feel", "mirage"):
                 continue
             if meta.get("resolved") or meta.get("digested"):
                 continue
@@ -658,7 +695,7 @@ class BucketManager:
         # merge_or_create from ever merging ordinary memories into a plan. ---
         # --- feel 是獨立私人通道，永遠不進普通搜索；plan 只活在 dream 尾端，
         # 排除在搜索外也保證合併管線永遠不會把普通記憶併進 plan。---
-        all_buckets = [b for b in all_buckets if b["metadata"].get("type") not in ("feel", "plan")]
+        all_buckets = [b for b in all_buckets if b["metadata"].get("type") not in ("feel", "plan", "mirage")]
 
         if not all_buckets:
             return []
@@ -749,6 +786,25 @@ class BucketManager:
                 # Normalize to 0~100 for readability
                 weight_sum = self.w_topic + self.w_emotion + self.w_time + self.w_importance
                 normalized = (total / weight_sum) * 100 if weight_sum > 0 else 0
+
+                # --- Context gate (2026-07-12 batch-2): in a NEUTRAL query context
+                # (no emotion coordinates passed), high-arousal intimate memories
+                # need a strong topic hit to rank — a work-context search should
+                # not surface bedroom memories on a weak fuzzy match. Strong topic
+                # relevance (≥0.5) passes untouched; vector channel is unaffected
+                # (semantic similarity IS a strong signal).
+                # --- 情境門控（2026-07-12 第二批）：中性語境（沒帶情緒座標的查詢）
+                # 裡，高喚醒的親密記憶要有夠強的主題命中才排得上——工作語境的
+                # 搜尋不該因為模糊分擦邊就浮出臥室記憶。主題相關 ≥0.5 原樣放行；
+                # 向量通道不受影響（語義相似本身就是強信號）。---
+                if (
+                    self.context_gate_enabled
+                    and query_valence is None and query_arousal is None
+                    and topic_score < 0.5
+                    and float(meta.get("arousal", 0.3)) >= self.context_gate_arousal
+                    and set(meta.get("domain", [])) & self.context_gate_domains
+                ):
+                    normalized *= self.context_gate_damp
 
                 # Threshold check uses raw (pre-penalty) score so resolved buckets
                 # 閾值用原始分數判定，確保 resolved 桶在關鍵詞命中時仍可被搜出
@@ -887,7 +943,7 @@ class BucketManager:
         """
         buckets = []
 
-        dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir, self.plan_dir]
+        dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir, self.plan_dir, self.mirage_dir]
         if include_archive:
             dirs.append(self.archive_dir)
 
@@ -935,6 +991,7 @@ class BucketManager:
             "archive_count": 0,
             "feel_count": 0,
             "plan_count": 0,
+            "mirage_count": 0,
             "total_size_kb": 0.0,
             "domains": {},
         }
@@ -945,6 +1002,7 @@ class BucketManager:
             (self.archive_dir, "archive_count"),
             (self.feel_dir, "feel_count"),
             (self.plan_dir, "plan_count"),
+            (self.mirage_dir, "mirage_count"),
         ]:
             if not os.path.exists(subdir):
                 continue
@@ -1048,7 +1106,7 @@ class BucketManager:
         """
         if not bucket_id:
             return None
-        for dir_path in [self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir, self.plan_dir]:
+        for dir_path in [self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir, self.plan_dir, self.mirage_dir]:
             if not os.path.exists(dir_path):
                 continue
             for root, _, files in os.walk(dir_path):

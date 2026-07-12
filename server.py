@@ -413,7 +413,7 @@ async def breath_hook(request):
         unresolved = [b for b in all_buckets
                       if not b["metadata"].get("resolved", False)
                       and not b["metadata"].get("digested", False)
-                      and b["metadata"].get("type") not in ("permanent", "feel", "plan")
+                      and b["metadata"].get("type") not in ("permanent", "feel", "plan", "mirage")
                       and not b["metadata"].get("pinned")
                       and not b["metadata"].get("protected")]
         scored = sorted(unresolved, key=lambda b: decay_engine.calculate_score(b["metadata"]), reverse=True)
@@ -502,7 +502,7 @@ async def dream_hook(request):
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         candidates = [
             b for b in all_buckets
-            if b["metadata"].get("type") not in ("permanent", "feel", "plan")
+            if b["metadata"].get("type") not in ("permanent", "feel", "plan", "mirage")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
             and not b["metadata"].get("digested", False)
@@ -716,8 +716,8 @@ async def breath(
         rows = []
         for b in all_buckets:
             meta = b["metadata"]
-            if meta.get("type") == "feel":
-                continue  # feel 是私人通道，目錄也不列
+            if meta.get("type") in ("feel", "mirage"):
+                continue  # feel/mirage(夢) 是私人通道，目錄也不列
             if domain_filter and not (set(meta.get("domain", [])) & domain_filter):
                 continue
             rows.append(b)
@@ -772,7 +772,7 @@ async def breath(
         filtered = [
             b for b in all_buckets
             if int(b["metadata"].get("importance", 0)) >= importance_min
-            and b["metadata"].get("type") not in ("feel", "plan")
+            and b["metadata"].get("type") not in ("feel", "plan", "mirage")
             and not b["metadata"].get("digested", False)
         ]
         filtered.sort(key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True)
@@ -823,6 +823,36 @@ async def breath(
             logger.error(f"Feel retrieval failed: {e}")
             return "讀取 feel 失敗。"
 
+    # --- Mirage retrieval: domain="mirage" is the dream channel (batch-2).
+    # domain="dream"/"夢" redirects with a hint — weak models land safely.
+    # --- 蜃景檢索：domain="mirage" 是夢的獨立入口；打 "dream"/"夢" 會被指路。---
+    if domain.strip().lower() in ("dream", "夢", "夢境"):
+        return '夢住在 domain="mirage"（蜃景）。dream() 工具是消化儀式，不是夢。'
+    if domain.strip().lower() == "mirage":
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+            dreams = [b for b in all_buckets if b["metadata"].get("type") == "mirage"]
+            dreams.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+            if not dreams:
+                return "還沒有做過夢。"
+            dreams = dreams[:max_results]
+            results = []
+            for d in dreams:
+                created = d["metadata"].get("created", "")
+                consumed_note = d["metadata"].get("consumed", "")
+                src_line = f"\n（素材：{consumed_note}）" if consumed_note else ""
+                results.append(
+                    f"[{created}] [bucket_id:{d['id']}]\n{strip_wikilinks(d['content'])}{src_line}"
+                )
+                if count_tokens_approx("\n---\n".join(results)) > max_tokens:
+                    break
+            return (
+                "=== 你做過的夢（殘影，不是事實） ===\n" + "\n---\n".join(results)
+            )
+        except Exception as e:
+            logger.error(f"Dream retrieval failed: {e}")
+            return "讀取夢失敗。"
+
     # --- No args or empty query: surfacing mode (weight pool active push) ---
     # --- 無參數或空query：浮現模式（權重池主動推送）---
     if not query or not query.strip():
@@ -848,15 +878,35 @@ async def breath(
                 logger.warning(f"Failed to dehydrate pinned bucket / 釘選桶脫水失敗: {e}")
                 continue
 
+        # --- Surface cooldown (2026-07-12 batch-2): a bucket shown recently sits
+        # out the next surfacings, so the same hot handful stops headlining every
+        # breath. Query search is untouched (asking is always answered); pinned
+        # never cool. recall.surface_cooldown_hours=0 disables.
+        # --- 浮現冷卻（第二批）：剛浮現過的桶下幾輪讓位，熱門幾條不再霸佔
+        # 每一次呼吸。query 檢索不受影響（開口問就答）；釘選永不冷卻。---
+        cooldown_h = float(config.get("recall", {}).get("surface_cooldown_hours", 6))
+
+        def _cooling(meta: dict) -> bool:
+            if cooldown_h <= 0:
+                return False
+            ts = meta.get("last_surfaced", "")
+            if not ts:
+                return False
+            try:
+                return datetime.now() - datetime.fromisoformat(str(ts)) < timedelta(hours=cooldown_h)
+            except (ValueError, TypeError):
+                return False
+
         # --- Unresolved buckets: surface top N by weight ---
         # --- 未解決桶：按權重浮現前 N 條 ---
         unresolved = [
             b for b in all_buckets
             if not b["metadata"].get("resolved", False)
             and not b["metadata"].get("digested", False)
-            and b["metadata"].get("type") not in ("permanent", "feel", "plan")
+            and b["metadata"].get("type") not in ("permanent", "feel", "plan", "mirage")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
+            and not _cooling(b["metadata"])
         ]
 
         logger.info(
@@ -919,6 +969,7 @@ async def breath(
         candidates = candidates[:max_results]
 
         dynamic_results = []
+        surfaced_ids: list[str] = []
         for b in candidates:
             if token_budget <= 0:
                 break
@@ -931,6 +982,7 @@ async def breath(
                 # NOTE: no touch() here — surfacing should NOT reset decay timer
                 score = decay_engine.calculate_score(b["metadata"])
                 dynamic_results.append(f"[權重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
+                surfaced_ids.append(b["id"])
                 token_budget -= summary_tokens
             except Exception as e:
                 logger.warning(f"Failed to dehydrate surfaced bucket / 浮現脫水失敗: {e}")
@@ -944,6 +996,14 @@ async def breath(
             parts.append("=== 核心準則 ===\n" + "\n---\n".join(pinned_results))
         if dynamic_results:
             parts.append("=== 浮現記憶 ===\n" + "\n---\n".join(dynamic_results))
+
+        # --- Stamp what actually surfaced (cooldown + retrieved_count; not a touch) ---
+        # --- 蓋浮現章（供冷卻與 retrieved 計數；不是加固）---
+        for bid in surfaced_ids:
+            try:
+                await bucket_mgr.mark_surfaced(bid)
+            except Exception as e:
+                logger.warning(f"mark_surfaced failed: {bid}: {e}")
         return "\n\n".join(parts)
 
     # --- With args: search mode (keyword + vector dual channel) ---
@@ -980,11 +1040,12 @@ async def breath(
                     continue
                 meta = bucket["metadata"]
                 # feel is a private channel; plan lives in dream's tail only;
-                # digested means hidden from recall push
-                # feel 是私人通道；plan 只活在 dream 尾端；digested 桶不經向量通道回浮
+                # dreams are their own channel; digested means hidden from recall push
+                # feel 是私人通道；plan 只活在 dream 尾端；蜃景（夢）走自己的通道；
+                # digested 桶不經向量通道回浮
                 if meta.get("pinned") or meta.get("protected"):
                     continue
-                if meta.get("type") in ("feel", "plan") or meta.get("digested"):
+                if meta.get("type") in ("feel", "plan", "mirage") or meta.get("digested"):
                     continue
                 # A strong semantic hit on an archived memory revives it:
                 # it comes back to dynamic/ (resolved) instead of being half-dead.
@@ -1019,11 +1080,17 @@ async def breath(
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
                 break
-            # Only the strongest hit ripples its temporal neighbors;
-            # rippling every hit is what inflated activation counts.
-            # 只有最強命中才擴散漣漪；每個命中都擴散正是通脹的來源。
-            await bucket_mgr.touch(bucket["id"], ripple=not ripple_done)
-            ripple_done = True
+            # --- Two-tier reinforcement (2026-07-12 batch-2): only the strongest
+            # hit gets a real touch (activation + ripple) — the rest were merely
+            # RETRIEVED, and being listed is not being engaged with. Every hit
+            # still stamps last_surfaced/retrieved_count for stats.
+            # --- 兩層加固（第二批）：只有最強命中才真正 touch（激活＋漣漪），
+            # 其餘只是「被搜到」——被列出不等於被用到。所有命中仍蓋
+            # retrieved 章供統計。---
+            if not ripple_done:
+                await bucket_mgr.touch(bucket["id"], ripple=True)
+                ripple_done = True
+            await bucket_mgr.mark_surfaced(bucket["id"])
             if bucket.get("vector_match"):
                 summary = f"[語義關聯] [bucket_id:{bucket['id']}] {summary}"
             else:
@@ -1078,19 +1145,50 @@ async def hold(
     importance: int = 5,
     pinned: bool = False,
     feel: bool = False,
+    mirage: bool = False,
+    consumed: str = "",
     source_bucket: str = "",    valence: float = -1,
     arousal: float = -1,
     why_remembered: str = "",
 ) -> str:
-    """存儲單條記憶,自動打標+合併。tags逗號分隔,importance 1-10。pinned=True創建永久釘選桶。feel=True存儲你的第一人稱感受(不參與普通浮現)。source_bucket=被消化的記憶桶ID(feel模式下,標記源記憶為已消化)。why_remembered=為什麼記住(可選,自由文本,僅展示不計分)。"""
+    """存儲單條記憶,自動打標+合併。tags逗號分隔,importance 1-10。pinned=True創建永久釘選桶。feel=True存儲你的第一人稱感受(不參與普通浮現)。mirage=True存儲一段夢(蜃景桶——名字本身就是警示:鮮明但不是真的。隔離桶:不合併/不搜尋/不衰減/不進畫像或self_concept,只走breath(domain="mirage")讀;consumed=逗號分隔的素材桶ID,記出處;夢是敘事殘影不是事實,永不當記憶引用)。source_bucket=被消化的記憶桶ID(feel模式下,標記源記憶為已消化)。why_remembered=為什麼記住(可選,自由文本,僅展示不計分)。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 輸入校驗 ---
     if not content or not content.strip():
         return "內容為空，無法存儲。"
+    if feel and mirage:
+        return "feel 和 mirage（夢）是兩種桶，一次只能選一種。"
 
     importance = max(1, min(10, importance))
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+    # --- Mirage mode (2026-07-12 batch-2): an isolated dream-narrative bucket.
+    # truth status IS the bucket type: merges can't reach it (excluded from
+    # search), it never decays, never surfaces in ordinary breath, and by
+    # rule never gets cited into portraits or self_concept as fact.
+    # --- 蜃景模式（第二批）：隔離的夢敘事桶。桶型即真值標記（蜃景＝鮮明但不真）：合併搆不到
+    # （排除在搜尋外）、不衰減、不進普通浮現，且按規則永不作為事實
+    # 引入畫像或 self_concept。---
+    if mirage:
+        d_valence = valence if 0 <= valence <= 1 else 0.5
+        d_arousal = arousal if 0 <= arousal <= 1 else 0.4
+        bucket_id = await bucket_mgr.create(
+            content=content,
+            tags=[],
+            importance=5,
+            domain=[],
+            valence=d_valence,
+            arousal=d_arousal,
+            name=None,
+            bucket_type="mirage",
+            extra_meta={"consumed": consumed.strip()},
+        )
+        try:
+            await embedding_engine.generate_and_store(bucket_id, content)
+        except Exception:
+            pass
+        return f"🌙mirage→{bucket_id}"
 
     # --- Feel mode: store as feel type, minimal metadata ---
     # --- Feel 模式：存為 feel 類型，最少元數據 ---
@@ -1590,7 +1688,7 @@ async def api_usage(force: bool = False, probe_gemini: bool = True) -> str:
 # =============================================================
 @mcp.tool()
 async def dream(max_results: int = 10, window_hours: int = 48) -> str:
-    """做夢——讀取最近window_hours小時內(默認48)有變動的記憶桶,供你自省(被合併更新的老桶也會回來)。max_results控制讀幾條(默認10,開場可傳3省context)。窗口內沒變動時退回最近創建的幾條。讀完後可以trace(resolved=1)放下,或hold(feel=True)寫感受。尾端會列出還記掛著的plan。"""
+    """消化儀式(醒著做的)——讀取最近window_hours小時內(默認48)有變動的記憶桶,供你自省(被合併更新的老桶也會回來)。max_results控制讀幾條(默認10,開場可傳3省context)。窗口內沒變動時退回最近創建的幾條。讀完後可以trace(resolved=1)放下,或hold(feel=True)寫感受。尾端會列出還記掛著的plan。※名字辨析:這個工具是「反芻消化」,不產生也不讀取夢;「真的夢」住在蜃景桶(mirage)——存夢用hold(mirage=True),讀夢用breath(domain="mirage")。"""
     await decay_engine.ensure_started()
     max_results = max(1, min(max_results, 20))
     window_hours = max(1, min(int(window_hours or 48), 24 * 30))
@@ -1604,7 +1702,7 @@ async def dream(max_results: int = 10, window_hours: int = 48) -> str:
     # --- Filter: surface-level dynamic buckets (not permanent/pinned/feel/plan/digested) ---
     candidates = [
         b for b in all_buckets
-        if b["metadata"].get("type") not in ("permanent", "feel", "plan")
+        if b["metadata"].get("type") not in ("permanent", "feel", "plan", "mirage")
         and not b["metadata"].get("pinned", False)
         and not b["metadata"].get("protected", False)
         and not b["metadata"].get("digested", False)
@@ -2216,7 +2314,7 @@ async def _desire_fixation_buckets() -> list[dict]:
                 "weight": weight,
             })
             continue
-        if btype in ("permanent", "feel", "archived"):
+        if btype in ("permanent", "feel", "archived", "mirage"):
             continue
         if m.get("pinned") or m.get("protected") or m.get("resolved") or m.get("digested"):
             continue
@@ -2274,7 +2372,7 @@ async def desire(
     value: int = -1,
     degree: float = 1.0,
 ) -> str:
-    """慾望系統（只提案不執行）。action=state 看七維驅動條+執念加成+此刻提案；action=feed 餵真實事件（drive=維度或fatigue, amount=±0~1, event=因為發生了什麼）；action=satisfy 缺口真的被填了才用（verb=murmur/dream_feel/explore/chore/browse/create/tease/rest, event=做了什麼, degree=填了多少0~1默認1——只填一半就誠實報0.5）；action=engage 做了相關的事但不聲稱滿足（verb+event, 只記帳不動水位）；action=veto 否決當下提案（drive=維度, reason=為什麼不）；action=gate 親密閘（drive=intimacy_ok, value=0/1, 只聽Ruby的話）。執念來源（2026-07-12 收窄後）：active plan（target_drive）＋trace(affects_desire=1) 刻意掛上的記憶。七維：miss_ruby想Ruby/reflection沉澱/curiosity好奇/duty記掛/social人群/creation創作/libido性。"""
+    """慾望系統（只提案不執行）。action=state 看八維驅動條+執念加成+此刻提案；action=feed 餵真實事件（drive=維度或fatigue, amount=±0~1, event=因為發生了什麼）；action=satisfy 缺口真的被填了才用（verb=murmur/dream_feel/explore/chore/browse/create/tease/talk_out/rest, event=做了什麼, degree=填了多少0~1默認1——只填一半就誠實報0.5）；action=engage 做了相關的事但不聲稱滿足（verb+event, 只記帳不動水位）；action=veto 否決當下提案（drive=維度, reason=為什麼不）；action=gate 親密閘（drive=intimacy_ok, value=0/1, 只聽Ruby的話）。執念來源（2026-07-12 收窄後）：active plan（target_drive）＋trace(affects_desire=1) 刻意掛上的記憶。八維：miss_ruby想Ruby/reflection沉澱/curiosity好奇/duty記掛/social人群/creation創作/libido性/knot心結（零自漲，只由沉重feel落地後自報feed；talk_out說開回落，永不驅動公開發言）。"""
     from datetime import datetime as _dt
     action = (action or "state").strip().lower()
     now = _dt.now()

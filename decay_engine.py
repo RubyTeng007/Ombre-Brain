@@ -120,6 +120,14 @@ class DecayEngine:
         if metadata.get("type") == "plan":
             return 50.0
 
+        # --- Dream buckets (2026-07-12 batch-2): own private channel, never
+        # decay-cycled; lower fixed value than feel — a dream is residue,
+        # not sediment. ---
+        # --- dream 桶（第二批）：獨立私人通道、不進衰減循環；固定值低於
+        # feel——夢是殘影，不是沉澱。---
+        if metadata.get("type") == "mirage":
+            return 30.0
+
         importance = max(1, min(10, int(metadata.get("importance", 5))))
         activation_count = max(1.0, float(metadata.get("activation_count", 1)))
 
@@ -211,7 +219,7 @@ class DecayEngine:
 
             # Skip permanent / pinned / protected / feel / plan buckets
             # 跳過固化桶、釘選/保護桶、feel 桶和 plan 桶
-            if meta.get("type") in ("permanent", "feel", "plan") or meta.get("pinned") or meta.get("protected"):
+            if meta.get("type") in ("permanent", "feel", "plan", "mirage") or meta.get("pinned") or meta.get("protected"):
                 continue
 
             checked += 1

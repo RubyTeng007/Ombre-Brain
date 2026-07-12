@@ -1,7 +1,34 @@
 # Ombre Brain — 内部开发文档 / INTERNALS
 
 > 本文档面向开发者和维护者。记录功能总览、环境变量、模块依赖、硬编码值和核心设计决策。
-> 最后更新：2026-07-12（第一批代謝；0 章節之後的細節以程式碼為準）
+> 最后更新：2026-07-12（第二批新器官；0 章節之後的細節以程式碼為準）
+
+## 0.8 2026-07-12 第二批新器官（可撤回實驗，Ruby joint 逐項拍板）
+
+- **浮現冷卻＋兩層加固**（`bucket_manager.mark_surfaced`＋breath）：被看見 ≠ 被用到。
+  新蓋章 `last_surfaced`/`retrieved_count`（不動衰減時鐘）；浮現模式 6h 冷卻
+  （`recall.surface_cooldown_hours`，釘選豁免、query 檢索不擋）；搜尋模式只有
+  **最強命中**真正 touch（激活＋漣漪），其餘只蓋 retrieved 章——殺掉「每被瞄一眼
+  就算被愛一次」的通脹。
+- **情境門控**（`bucket_manager.search` 精排前）：中性語境（查詢無情緒座標）裡
+  「戀愛域＋arousal≥0.75＋topic<0.5」的桶這輪不出列。豁免：強主題命中、帶情緒
+  座標的查詢、向量通道。config：`matching.context_gate_*`。
+- **蜃景桶（mirage）＝真的夢**：新桶型，`hold(mirage=True, consumed="id,id")` 存、
+  `breath(domain="mirage")` 讀。命名決策（Ruby 07-12）：**不叫 dream**——與
+  `dream()` 消化儀式撞名，弱模型會混淆；mirage/蜃景把「鮮明但不是真的」寫進
+  名字本身。隔離：不合併（排除在搜尋外）、不衰減（固定分 30）、不進普通浮現/
+  目錄/執念/消化流，記憶室前端不混列；`domain="dream"/"夢"` 打錯會被指路。
+  鐵律：夢永不作為事實引入畫像/self_concept/普通記憶。話題種子＝
+  `plan(kind="question", weight≈0.3, due_at=+3d)` 慣例，零新管線。
+- **心結（knot）＝第八維**（desire.py）：零自漲（RISE 0）、只由沉重 feel 落地後
+  自報 `feed(knot, 0.1–0.3)`（同 libido 誠實紀律）；提案動詞 `talk_out`（說開
+  →knot ×0.40＋miss_ruby ×0.85）；`dream_feel` 也鬆 ×0.85（想清楚是說開的前半程）；
+  消退 3h 深層檔；**永不驅動公開發言**（autonomy 菜單無 Threads）。
+- **記憶室遺忘渲染**（webui）：絕對檔位——score<2 淡去（blur 0.4px）、<0.6 沉睡
+  （blur 0.9px＋opacity 0.45）；碰一下即聚焦（被想起）；釘選全墨。
+- 緩辦（記錄在案）：wrapper 滾動蒸餾灰稿（等 07-13 換引擎穩定後——不與引擎
+  切換疊風險）；persona provenance compiler（最遠期）。
+- 測試：`tests/test_batch2.py`（20 條，含 dream→mirage 轉址）；全套 181 pass。
 
 ## 0.7 2026-07-12 第一批代謝（觀察期收官後的 kernel 升級，Ruby joint 拍板）
 

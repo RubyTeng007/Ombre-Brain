@@ -41,7 +41,11 @@ class TestTick:
         s = fresh()
         s2 = tick(s, NOW + timedelta(hours=10))
         for k in DRIVE_KEYS:
-            assert s2["drives"][k] > s["drives"][k], k
+            if desire.RISE_PER_HOUR[k] == 0.0:
+                # 事件驅動維度（knot）：零自漲是設計，不隨時間長
+                assert s2["drives"][k] == pytest.approx(s["drives"][k]), k
+            else:
+                assert s2["drives"][k] > s["drives"][k], k
 
     def test_rise_rate_matches_constant(self):
         s = fresh()
