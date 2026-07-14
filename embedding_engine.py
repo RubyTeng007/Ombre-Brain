@@ -18,6 +18,7 @@ import sqlite3
 import logging
 from collections import OrderedDict
 
+import numpy as np
 from openai import AsyncOpenAI
 
 logger = logging.getLogger("ombre_brain.embedding")
@@ -326,16 +327,50 @@ class EmbeddingEngine:
         if not rows:
             return []
 
-        # Calculate cosine similarity
-        results = []
+        # Rank by cosine similarity, batched with numpy instead of a per-row
+        # Python loop. Mathematically identical to calling _cosine_similarity
+        # on every row — dot(row, q) / (‖row‖·‖q‖) — but computed as one matrix
+        # op, so it stays fast as the corpus grows.
+        # 用 numpy 一次矩陣運算取代逐行迴圈，數學等價，向量多時快得多。
+        ids: list[str] = []
+        vecs: list[np.ndarray] = []
         for bucket_id, emb_json in rows:
             try:
-                stored_embedding = json.loads(emb_json)
-                sim = self._cosine_similarity(query_embedding, stored_embedding)
-                results.append((bucket_id, sim))
-            except (json.JSONDecodeError, Exception):
-                continue
+                raw = json.loads(emb_json)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue  # unparseable row — skip, exactly like the old loop
+            if not isinstance(raw, list):
+                continue  # non-vector JSON (null/number/object) — skip, like before
+            try:
+                vec = np.asarray(raw, dtype=np.float64)
+            except (ValueError, TypeError):
+                continue  # list with non-numeric contents — skip, like before
+            ids.append(bucket_id)
+            vecs.append(vec)
 
+        if not ids:
+            return []
+
+        query_dim = len(query_embedding)
+        q = np.asarray(query_embedding, dtype=np.float64)
+        q_norm = float(np.linalg.norm(q))
+
+        # Rows whose dimension matches the query go through the batched cosine;
+        # any odd-length row scores 0.0 (mirrors _cosine_similarity's len guard),
+        # so one stray legacy vector can never crash the whole search.
+        sims_by_index: dict[int, float] = {}
+        aligned_idx = [i for i, v in enumerate(vecs) if v.ndim == 1 and v.shape[0] == query_dim]
+        if aligned_idx and q_norm > 0.0:
+            mat = np.stack([vecs[i] for i in aligned_idx])       # (M, D)
+            denom = np.linalg.norm(mat, axis=1) * q_norm         # (M,)
+            dots = mat @ q                                        # (M,)
+            sims = np.zeros_like(dots)
+            nz = denom > 0.0
+            sims[nz] = dots[nz] / denom[nz]                      # zero-norm rows stay 0.0
+            for i, s in zip(aligned_idx, sims):
+                sims_by_index[i] = float(s)
+
+        results = [(ids[i], sims_by_index.get(i, 0.0)) for i in range(len(ids))]
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
 
