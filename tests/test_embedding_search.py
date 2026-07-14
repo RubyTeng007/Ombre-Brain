@@ -120,3 +120,70 @@ def test_disabled_engine_returns_empty(tmp_path):
         "embedding": {"enabled": False, "api_key": ""},
     })
     assert asyncio.run(ee.search_similar("q", top_k=10)) == []
+
+
+# --- parsed-vector cache (option B) ---
+
+def test_cache_hit_returns_identical_results(tmp_path):
+    ee = _engine(tmp_path)
+    for i in range(20):
+        ee._store_embedding(f"b{i}", [float(i), 1.0, 0.5])
+    _stub_query(ee, [3.0, 1.0, 0.5])
+    r1 = asyncio.run(ee.search_similar("q", top_k=20))
+    r2 = asyncio.run(ee.search_similar("q", top_k=20))  # served from cache
+    assert r1 == r2
+    assert len(ee._matrix_cache) >= 1  # cache populated
+
+
+def test_cache_invalidated_on_store(tmp_path):
+    ee = _engine(tmp_path)
+    ee._store_embedding("a", [1.0, 0.0, 0.0])
+    _stub_query(ee, [1.0, 0.0, 0.0])
+    assert [x[0] for x in asyncio.run(ee.search_similar("q", 10))] == ["a"]
+    ee._store_embedding("b", [1.0, 0.0, 0.0])  # add — must invalidate the cache
+    assert sorted(x[0] for x in asyncio.run(ee.search_similar("q", 10))) == ["a", "b"]
+
+
+def test_cache_invalidated_on_delete(tmp_path):
+    ee = _engine(tmp_path)
+    ee._store_embedding("a", [1.0, 0.0])
+    ee._store_embedding("b", [0.0, 1.0])
+    _stub_query(ee, [1.0, 0.0])
+    assert len(asyncio.run(ee.search_similar("q", 10))) == 2
+    ee.delete_embedding("b")  # remove — must invalidate the cache
+    assert [x[0] for x in asyncio.run(ee.search_similar("q", 10))] == ["a"]
+
+
+def test_cache_detects_external_process_write(tmp_path):
+    # Another process (backfill/import) writing straight to the DB bypasses the
+    # same-process cache clear — the (COUNT, MAX) signature must still rebuild.
+    import sqlite3
+    import json as _json
+    from utils import now_iso
+
+    ee = _engine(tmp_path)
+    ee._store_embedding("a", [1.0, 0.0, 0.0])
+    _stub_query(ee, [1.0, 0.0, 0.0])
+    assert [x[0] for x in asyncio.run(ee.search_similar("q", 10))] == ["a"]  # warms cache
+
+    conn = sqlite3.connect(ee.db_path)  # separate connection, ee._matrix_cache untouched
+    conn.execute(
+        "INSERT OR REPLACE INTO embeddings (bucket_id, embedding, updated_at, model) VALUES (?,?,?,?)",
+        ("ext", _json.dumps([1.0, 0.0, 0.0]), now_iso(), ee.model),
+    )
+    conn.commit()
+    conn.close()
+    # count changed 1 -> 2, so the signature differs and the cache rebuilds
+    assert sorted(x[0] for x in asyncio.run(ee.search_similar("q", 10))) == ["a", "ext"]
+
+
+def test_cache_separates_filters(tmp_path):
+    ee = _engine(tmp_path)
+    ee._store_embedding("bucket1", [1.0, 0.0])
+    ee._store_embedding("letter:1", [1.0, 0.0])
+    _stub_query(ee, [1.0, 0.0])
+    assert [x[0] for x in asyncio.run(ee.search_similar("q", 10))] == ["bucket1"]
+    assert [x[0] for x in asyncio.run(ee.search_similar("q", 10, id_prefix="letter:"))] == ["letter:1"]
+    # both filters cached under distinct keys; neither leaks into the other
+    assert [x[0] for x in asyncio.run(ee.search_similar("q", 10))] == ["bucket1"]
+    assert len(ee._matrix_cache) == 2

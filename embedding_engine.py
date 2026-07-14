@@ -30,6 +30,15 @@ logger = logging.getLogger("ombre_brain.embedding")
 # 同一次 breath 檢索會在預篩和向量通道各嵌一次同樣的查詢；快取直接省掉重複呼叫。
 _TEXT_CACHE_MAXSIZE = 64
 
+# Parsed-vector cache for search_similar. After the numpy batching, json.loads
+# over every stored vector — not the cosine math — was the dominant per-query
+# cost, and search re-parsed all of them on every call. This caches the parsed
+# vectors per (model, filter); a (COUNT, MAX(updated_at)) signature rebuilds it
+# when rows change from any process, and same-process writes clear it outright
+# (now_iso is second-precision, so the signature alone could miss a same-second
+# re-embed of an existing bucket).
+_MATRIX_CACHE_MAXSIZE = 4
+
 
 class EmbeddingEngine:
     """
@@ -79,6 +88,8 @@ class EmbeddingEngine:
         self.last_error = ""
         self.last_success = False
         self._text_cache: "OrderedDict[str, list[float]]" = OrderedDict()
+        # (model, id_prefix) -> (signature, ids, parsed_vectors); see _load_vectors
+        self._matrix_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
 
         # --- SQLite path: buckets_dir/embeddings.db ---
         db_path = os.path.join(config["buckets_dir"], "embeddings.db")
@@ -254,6 +265,7 @@ class EmbeddingEngine:
         )
         conn.commit()
         conn.close()
+        self._matrix_cache.clear()  # a stored vector changes search results
 
     def delete_embedding(self, bucket_id: str):
         """Remove embedding when bucket is deleted (all models — the bucket is gone)."""
@@ -261,6 +273,7 @@ class EmbeddingEngine:
         conn.execute("DELETE FROM embeddings WHERE bucket_id = ?", (bucket_id,))
         conn.commit()
         conn.close()
+        self._matrix_cache.clear()  # a removed vector changes search results
 
     def list_ids(self) -> set[str]:
         """Bucket_ids with a stored embedding in the ACTIVE model space (for
@@ -288,6 +301,65 @@ class EmbeddingEngine:
                 return None
         return None
 
+    def _load_vectors(self, conn, id_prefix: str | None):
+        """(ids, parsed float vectors) for the active model + filter, parsed at
+        most once until the underlying rows change.
+
+        After the numpy batching, json.loads over every row — not the cosine
+        math — was the dominant per-query cost, and search re-parsed them every
+        call. This caches the parsed vectors per (model, filter). A cheap
+        (COUNT, MAX(updated_at)) signature detects inserts/updates/deletes from
+        ANY process and forces a rebuild; same-process writes also clear the
+        cache outright (now_iso is second-precision, so the signature alone
+        could miss a same-second re-embed). Cached vectors are only ever read,
+        never mutated, so sharing them across queries is safe.
+
+        `where` is one of two fixed literals below — never user input — so the
+        f-string carries no injection surface; values go through params."""
+        if id_prefix:
+            where = "bucket_id LIKE ? AND model = ?"
+            params = (f"{id_prefix}%", self.model)
+        else:
+            where = "bucket_id NOT LIKE 'letter:%' AND model = ?"
+            params = (self.model,)
+        cache_key = (self.model, id_prefix or "")
+
+        cnt, max_ts = conn.execute(
+            f"SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM embeddings WHERE {where}",
+            params,
+        ).fetchone()
+        signature = (cnt, max_ts)
+
+        cached = self._matrix_cache.get(cache_key)
+        if cached is not None and cached[0] == signature:
+            self._matrix_cache.move_to_end(cache_key)
+            return cached[1], cached[2]
+
+        rows = conn.execute(
+            f"SELECT bucket_id, embedding FROM embeddings WHERE {where}", params
+        ).fetchall()
+        ids: list[str] = []
+        vecs: list[np.ndarray] = []
+        for bucket_id, emb_json in rows:
+            try:
+                raw = json.loads(emb_json)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue  # unparseable row — skip, exactly like the old loop
+            if not isinstance(raw, list):
+                continue  # non-vector JSON (null/number/object) — skip, like before
+            try:
+                vec = np.asarray(raw, dtype=np.float64)
+            except (ValueError, TypeError):
+                continue  # list with non-numeric contents — skip, like before
+            ids.append(bucket_id)
+            vecs.append(vec)
+
+        self._matrix_cache[cache_key] = (signature, ids, vecs)
+        self._matrix_cache.move_to_end(cache_key)
+        while len(self._matrix_cache) > _MATRIX_CACHE_MAXSIZE:
+            self._matrix_cache.popitem(last=False)
+        return ids, vecs
+
     async def search_similar(
         self, query: str, top_k: int = 10, id_prefix: str | None = None
     ) -> list[tuple[str, float]]:
@@ -310,21 +382,16 @@ class EmbeddingEngine:
             logger.warning(f"Query embedding failed: {e}")
             return []
 
-        # Load candidate embeddings from SQLite (active model space only)
+        # Load the active-model candidate vectors — parsed once and cached, since
+        # the JSON parse of every row (not the cosine math) was the dominant
+        # per-query cost after the numpy batching. See _load_vectors.
         conn = sqlite3.connect(self.db_path)
-        if id_prefix:
-            rows = conn.execute(
-                "SELECT bucket_id, embedding FROM embeddings WHERE bucket_id LIKE ? AND model = ?",
-                (f"{id_prefix}%", self.model),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT bucket_id, embedding FROM embeddings WHERE bucket_id NOT LIKE 'letter:%' AND model = ?",
-                (self.model,),
-            ).fetchall()
-        conn.close()
+        try:
+            ids, vecs = self._load_vectors(conn, id_prefix)
+        finally:
+            conn.close()
 
-        if not rows:
+        if not ids:
             return []
 
         # Rank by cosine similarity, batched with numpy instead of a per-row
@@ -332,24 +399,6 @@ class EmbeddingEngine:
         # on every row — dot(row, q) / (‖row‖·‖q‖) — but computed as one matrix
         # op, so it stays fast as the corpus grows.
         # 用 numpy 一次矩陣運算取代逐行迴圈，數學等價，向量多時快得多。
-        ids: list[str] = []
-        vecs: list[np.ndarray] = []
-        for bucket_id, emb_json in rows:
-            try:
-                raw = json.loads(emb_json)
-            except (json.JSONDecodeError, ValueError, TypeError):
-                continue  # unparseable row — skip, exactly like the old loop
-            if not isinstance(raw, list):
-                continue  # non-vector JSON (null/number/object) — skip, like before
-            try:
-                vec = np.asarray(raw, dtype=np.float64)
-            except (ValueError, TypeError):
-                continue  # list with non-numeric contents — skip, like before
-            ids.append(bucket_id)
-            vecs.append(vec)
-
-        if not ids:
-            return []
 
         query_dim = len(query_embedding)
         q = np.asarray(query_embedding, dtype=np.float64)
