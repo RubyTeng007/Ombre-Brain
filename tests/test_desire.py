@@ -21,7 +21,7 @@ import pytest
 import desire
 from desire import (
     DRIVE_KEYS, FATIGUE_GATE, MIN_INTENT_SCORE, MAX_EVENTS,
-    default_state, tick, drive_boosts, pick_intent, satisfy, feed, veto,
+    default_state, tick, drive_boosts, pick_intent, satisfy, engage, defer, outreach, feed, veto,
     set_gate, DesireStore,
 )
 
@@ -247,6 +247,41 @@ class TestSatisfy:
         satisfy(s, "murmur", NOW)
         assert json.dumps(s, sort_keys=True) == before
 
+    def test_same_wake_same_verb_is_idempotent(self):
+        s = fresh()
+        s["drives"]["curiosity"] = 0.8
+        s2 = satisfy(s, "explore", NOW, degree=0.5, wake_id="w-retry")
+        s3 = satisfy(s2, "explore", NOW, degree=0.5, wake_id="w-retry")
+        assert s3["drives"]["curiosity"] == s2["drives"]["curiosity"]
+        assert len([e for e in s3["events"] if e.get("wake_id") == "w-retry"]) == 1
+
+
+class TestEngageDeferOutreach:
+    def test_engage_keeps_water_and_rechecks_later(self):
+        s = fresh()
+        s["drives"]["curiosity"] = 0.8
+        before = dict(s["drives"])
+        s2 = engage(s, "explore", NOW, note="只讀了一半", wake_id="w-engage", drive="curiosity")
+        assert s2["drives"] == before
+        assert "curiosity" in s2["recheck_until"]
+        assert pick_intent(s2, {}, NOW + timedelta(minutes=30))["drive"] != "curiosity"
+
+    def test_defer_keeps_water_and_is_idempotent(self):
+        s = fresh()
+        s["drives"]["creation"] = 0.8
+        s2 = defer(s, "creation", NOW, reason="現在想陪她", wake_id="w-defer")
+        s3 = defer(s2, "creation", NOW, reason="重試", wake_id="w-defer")
+        assert s3["drives"]["creation"] == 0.8
+        assert len([e for e in s3["events"] if e.get("wake_id") == "w-defer"]) == 1
+
+    def test_outreach_records_receipt_without_moving_water(self):
+        s = fresh()
+        before = dict(s["drives"])
+        s2 = outreach(s, "text", NOW, note="短訊已送達", wake_id="w-out")
+        s3 = outreach(s2, "text", NOW, note="重試", wake_id="w-out")
+        assert s3["drives"] == before
+        assert len([e for e in s3["events"] if e.get("kind") == "outreach:text"]) == 1
+
 
 class TestFeedVetoGate:
     def test_feed_bumps_drive(self):
@@ -329,7 +364,7 @@ class TestStore:
         s = store.load(NOW)
         for k in DRIVE_KEYS:
             assert k in s["drives"]
-        assert "gates" in s and "events" in s
+        assert "gates" in s and "events" in s and "recheck_until" in s
 
     def test_mutate_flow(self, tmp_path):
         store = DesireStore(str(tmp_path))

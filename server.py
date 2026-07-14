@@ -2408,6 +2408,14 @@ async def _desire_state_payload() -> dict:
         except (ValueError, TypeError):
             continue
 
+    active_rechecks = {}
+    for k, v in (state.get("recheck_until", {}) or {}).items():
+        try:
+            if _dt.fromisoformat(str(v)) > now:
+                active_rechecks[k] = v
+        except (ValueError, TypeError):
+            continue
+
     return {
         "updated_at": state["updated_at"],
         "drives": state["drives"],
@@ -2421,6 +2429,7 @@ async def _desire_state_payload() -> dict:
         "boosts_detail": boosts_detail,
         "intent": state["last_intent"],
         "veto_until": active_vetoes,
+        "recheck_until": active_rechecks,
         # 高位消退態（batch-1 hysteresis）：瓶子摸頂後不漲反落的原因，
         # 不端出來的話前端只能看著水位「自己降」而無從解釋。
         "saturated": state.get("saturated", {}),
@@ -2438,10 +2447,11 @@ async def desire(
     event: str = "",
     reason: str = "",
     value: int = -1,
-    degree: float = 1.0,
+    degree: float = -1.0,
     wake_id: str = "",
+    medium: str = "",
 ) -> str:
-    """慾望系統（只提案不執行）。action=state 看八維驅動條+執念加成+此刻提案；action=feed 餵真實事件（drive=維度或fatigue, amount=±0~1, event=因為發生了什麼）；action=satisfy 缺口真的被填了才用（verb=murmur/dream_feel/explore/chore/browse/create/tease/talk_out/rest, event=做了什麼, degree=填了多少0~1默認1——只填一半就誠實報0.5）；action=engage 做了相關的事但不聲稱滿足（verb+event, 只記帳不動水位）；action=veto 否決當下提案（drive=維度, reason=為什麼不）；action=gate 親密閘（drive=intimacy_ok, value=0/1, 只聽Ruby的話）。satisfy/engage/veto 可帶 wake_id（喚醒 prompt 裡 w 開頭的 id）——自主喚醒觸發的閉環請帶上，讓這次動作跟那次喚醒在 ledger 接成因果鏈。執念來源（2026-07-12 收窄後）：active plan（target_drive）＋trace(affects_desire=1) 刻意掛上的記憶。八維：miss_ruby想Ruby/reflection沉澱/curiosity好奇/duty記掛/social人群/creation創作/libido性/knot心結（零自漲，只由沉重feel落地後自報feed；talk_out說開回落，永不驅動公開發言）。"""
+    """慾望系統（只提案不執行）。action=state 看八維驅動條+執念加成+此刻提案；action=feed 餵真實事件（drive=維度或fatigue, amount=±0~1, event=因為發生了什麼）；action=satisfy 只有缺口真的被填了才用（verb+event+degree，degree 必填且 >0~1）；action=engage 做了相關的事但未滿足（verb+drive+event，水位不動、該維稍後再問）；action=defer 現在不做但不否定它（drive+reason，水位不動）；action=veto 否決提案並讓該維回落；action=outreach 在訊息/貼圖/語音等成功送達 Ruby 後記收據（medium+wake_id，不改水位）；action=gate 親密閘。自主喚醒的 satisfy/engage/defer/veto/outreach 都帶 prompt 裡的 wake_id。執念來源：active plan＋trace(affects_desire=1) 的記憶。八維：miss_ruby/reflection/curiosity/duty/social/creation/libido/knot。"""
     from datetime import datetime as _dt
     action = (action or "state").strip().lower()
     now = _dt.now()
@@ -2460,17 +2470,35 @@ async def desire(
         if action == "satisfy":
             if not verb.strip():
                 return "satisfy 需要 verb（murmur/dream_feel/explore/chore/browse/create/tease/rest）。"
+            if not (0 < degree <= 1):
+                return "satisfy 需要明確 degree（>0 且 ≤1）；尚未真的滿足請用 engage。"
             desire_store.mutate(
                 lambda st: desire_kernel.satisfy(
                     st, verb.strip(), now, note=event, degree=degree, wake_id=wake_id), now)
-            deg_note = f"，程度 {degree:.2f}" if 0 <= degree < 1 else ""
+            deg_note = f"，程度 {degree:.2f}"
             return f"已回落：{verb}（{event or '做完了'}{deg_note}）"
         if action == "engage":
             if not verb.strip():
                 return "engage 需要 verb（做了哪類事）。"
+            if wake_id and not drive.strip():
+                return "自主喚醒的 engage 需要 drive（這次要稍後再問哪一維）。"
             desire_store.mutate(
-                lambda st: desire_kernel.engage(st, verb.strip(), now, note=event, wake_id=wake_id), now)
-            return f"已記錄參與：{verb}（{event or '未註明'}）——水位未動，缺口填上了再 satisfy"
+                lambda st: desire_kernel.engage(
+                    st, verb.strip(), now, note=event, wake_id=wake_id, drive=drive.strip()), now)
+            return f"已記錄參與：{verb}（{event or '未註明'}）——水位未動，稍後再問 {drive or '這件事'}"
+        if action == "defer":
+            if not drive.strip():
+                return "defer 需要 drive。"
+            desire_store.mutate(
+                lambda st: desire_kernel.defer(st, drive.strip(), now, reason=reason, wake_id=wake_id), now)
+            return f"已暫緩 {drive}：水位未動，{desire_kernel.RECHECK_COOLDOWN_HOURS:.0f} 小時後可再提"
+        if action == "outreach":
+            if not wake_id:
+                return "outreach 需要 wake_id，且只能在送達 Ruby 成功後記。"
+            desire_store.mutate(
+                lambda st: desire_kernel.outreach(
+                    st, medium.strip(), now, note=event, wake_id=wake_id), now)
+            return f"已記錄靠近已送達：{medium}"
         if action == "veto":
             if not drive.strip():
                 return "veto 需要 drive。"
@@ -2505,7 +2533,7 @@ async def desire(
             desire_store.mutate(
                 lambda st: desire_kernel.set_gate(st, "intimacy_ok", bool(value), now, note=event), now)
             return f"親密閘已{'開' if value else '關'}（{event or ''}）"
-        return f"不支援的 action: {action}。可用: state/feed/satisfy/engage/veto/gate"
+        return f"不支援的 action: {action}。可用: state/feed/satisfy/engage/defer/veto/outreach/gate"
     except ValueError as exc:
         return f"慾望系統輸入錯誤: {exc}"
     except Exception:
@@ -2659,9 +2687,9 @@ async def api_desire_ledger(request):
     # 寫兩邊；但 ledger 寫失敗不擋主流程，所以以 state 補最近événements。
     try:
         st = desire_store.load()
-        seen = {(e.get("ts"), e.get("kind")) for e in events}
+        seen = {(e.get("ts"), e.get("kind"), e.get("note"), e.get("wake_id")) for e in events}
         for e in st.get("events", []):
-            if (e.get("ts"), e.get("kind")) not in seen:
+            if (e.get("ts"), e.get("kind"), e.get("note"), e.get("wake_id")) not in seen:
                 events.append(e)
         events.sort(key=lambda e: str(e.get("ts", "")))
     except Exception:
@@ -2670,24 +2698,34 @@ async def api_desire_ledger(request):
     receipts: list[dict] = []
     by_wake: dict[str, dict] = {}
     loose: list[dict] = []
-    verbs_close = ("satisfy:", "engage:", "veto:")
+    verbs_close = ("satisfy:", "engage:", "defer:", "veto:")
+
+    # 先建 wake 索引、再接結果：notification 送達與 wake POST 是兩條極近的
+    # 非同步線，極端時 closure 可能先寫進 ledger；單趟掃描會把它誤丟 loose。
+    for e in events:
+        kind = str(e.get("kind", ""))
+        wid = str(e.get("wake_id", "") or "")
+        if not kind.startswith("wake:"):
+            continue
+        r = {
+            "wake_id": wid or "未知",
+            "ts": e.get("ts", ""),
+            "source": "desire",
+            "drive": kind[len("wake:"):],
+            "reason": e.get("note", "") or "未知",
+            "delivery": "delivered",  # 幽靈喚醒從不進帳（送達後才 POST）
+            "choice": "unknown", "verb": "", "degree": None,
+            "closed": False, "result_note": "",
+            "outcomes": [], "outreach": [], "contacted_ruby": False,
+        }
+        receipts.append(r)
+        if wid:
+            by_wake[wid] = r
+
     for e in events:
         kind = str(e.get("kind", ""))
         wid = str(e.get("wake_id", "") or "")
         if kind.startswith("wake:"):
-            r = {
-                "wake_id": wid or "未知",
-                "ts": e.get("ts", ""),
-                "source": "desire",
-                "drive": kind[len("wake:"):],
-                "reason": e.get("note", "") or "未知",
-                "delivery": "delivered",  # 幽靈喚醒從不進帳（送達後才 POST）
-                "choice": "unknown", "verb": "", "degree": None,
-                "closed": False, "result_note": "",
-            }
-            receipts.append(r)
-            if wid:
-                by_wake[wid] = r
             continue
         if wid and wid in by_wake and kind.startswith(verbs_close):
             r = by_wake[wid]
@@ -2702,8 +2740,25 @@ async def api_desire_ledger(request):
                         try: deg = float(p[1:])
                         except ValueError: pass
                 r["degree"] = deg
+            outcome = {
+                "choice": head,
+                "verb": parts[0] if parts else "",
+                "degree": r["degree"] if head == "satisfy" else None,
+                "result_note": e.get("note", ""),
+                "ts": e.get("ts", ""),
+            }
+            r["outcomes"].append(outcome)
             r["closed"] = True
             r["result_note"] = e.get("note", "")
+            continue
+        if wid and wid in by_wake and kind.startswith("outreach:"):
+            r = by_wake[wid]
+            r["outreach"].append({
+                "medium": kind[len("outreach:"):],
+                "result_note": e.get("note", ""),
+                "ts": e.get("ts", ""),
+            })
+            r["contacted_ruby"] = True
             continue
         loose.append(e)
 

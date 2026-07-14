@@ -101,6 +101,28 @@ class TestWakeEvent:
 # 2. ledger 收據
 # ---------------------------------------------------------
 class TestLedgerReceipts:
+    def test_tool_requires_explicit_satisfaction_degree(self, wired):
+        msg = _run(wired.desire(
+            action="satisfy", verb="explore", event="只讀了一點", wake_id="w-degree"
+        ))
+        assert "需要明確 degree" in msg
+        assert not any(e.get("wake_id") == "w-degree" for e in wired.desire_store.load()["events"])
+
+    def test_tool_defer_and_outreach_round_trip(self, wired):
+        _run(srv.api_desire_wake(FakeRequest({
+            "drive": "creation", "wake_id": "w-tool", "reason": "想做東西",
+        })))
+        _run(wired.desire(
+            action="defer", drive="creation", reason="先陪 Ruby", wake_id="w-tool"
+        ))
+        _run(wired.desire(
+            action="outreach", medium="sticker", event="貼圖送達", wake_id="w-tool"
+        ))
+        data = _payload(_run(srv.api_desire_ledger(FakeRequest())))
+        r = next(x for x in data["receipts"] if x["wake_id"] == "w-tool")
+        assert r["outcomes"][0]["choice"] == "defer"
+        assert r["contacted_ruby"] is True
+
     def test_wake_closure_grouped_with_degree(self, wired):
         _run(srv.api_desire_wake(FakeRequest({
             "drive": "curiosity", "wake_id": "w500", "reason": "想去讀那篇文",
@@ -119,6 +141,41 @@ class TestLedgerReceipts:
         assert abs(r["degree"] - 0.5) < 1e-9
         assert r["closed"] is True
         assert r["result_note"] == "讀完了"
+        assert r["outcomes"] == [{
+            "choice": "satisfy", "verb": "explore", "degree": 0.5,
+            "result_note": "讀完了", "ts": r["outcomes"][0]["ts"],
+        }]
+
+    def test_multiple_outcomes_and_outreach_are_not_overwritten(self, wired):
+        _run(srv.api_desire_wake(FakeRequest({
+            "drive": "reflection", "wake_id": "w-multi", "reason": "想沉一沉",
+        })))
+        now = datetime.now()
+        srv.desire_store.mutate(
+            lambda s: dk.satisfy(s, "dream_feel", now, note="寫了 feel", degree=0.4, wake_id="w-multi"))
+        srv.desire_store.mutate(
+            lambda s: dk.engage(s, "browse", now, note="看了一圈", wake_id="w-multi", drive="social"))
+        srv.desire_store.mutate(
+            lambda s: dk.outreach(s, "text", now, note="短訊已送達", wake_id="w-multi"))
+        data = _payload(_run(srv.api_desire_ledger(FakeRequest())))
+        r = next(x for x in data["receipts"] if x["wake_id"] == "w-multi")
+        assert [(x["choice"], x["verb"]) for x in r["outcomes"]] == [
+            ("satisfy", "dream_feel"), ("engage", "browse"),
+        ]
+        assert r["contacted_ruby"] is True
+        assert [x["medium"] for x in r["outreach"]] == ["text"]
+
+    def test_outcome_written_before_wake_post_still_attaches(self, wired):
+        now = datetime.now()
+        srv.desire_store.mutate(
+            lambda s: dk.engage(s, "create", now, note="先做了一點", wake_id="w-race", drive="creation"))
+        _run(srv.api_desire_wake(FakeRequest({
+            "drive": "creation", "wake_id": "w-race", "reason": "手癢了",
+        })))
+        data = _payload(_run(srv.api_desire_ledger(FakeRequest())))
+        r = next(x for x in data["receipts"] if x["wake_id"] == "w-race")
+        assert r["closed"] is True
+        assert r["outcomes"][0]["verb"] == "create"
 
     def test_unclosed_wake_says_unknown(self, wired):
         _run(srv.api_desire_wake(FakeRequest({"drive": "social", "wake_id": "w600"})))

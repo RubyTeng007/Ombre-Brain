@@ -106,7 +106,7 @@ class TestWakeIdChain:
         assert any(e.get("wake_id") == "w9" for e in entries)
 
     def test_tool_passes_wake_id_through(self, wired):
-        _run(wired.desire(action="satisfy", verb="explore", event="測試", wake_id="w42"))
+        _run(wired.desire(action="satisfy", verb="explore", event="測試", degree=0.5, wake_id="w42"))
         state = wired.desire_store.load(NOW)
         tagged = [e for e in state["events"] if e.get("wake_id") == "w42"]
         assert tagged and tagged[-1]["kind"].startswith("satisfy:explore")

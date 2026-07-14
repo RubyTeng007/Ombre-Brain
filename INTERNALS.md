@@ -78,9 +78,10 @@ miss_ruby 零 FIRE（presence-feeding 正確運作）。據此上線：
 - **近高位加權抽選**（`desire.pick_intent`＋`TIE_BAND=0.12`）：與榜首差 ≤0.12
   的維度按分數加權抽一個（取代純 argmax），`PICK_STABILITY_SECONDS=300` 窗內
   種子固定不抖。
-- **satisfy degree ＋ engage**（`desire.satisfy/engage`）：degree=缺口真的填了
-  幾成（eff = 1−degree×(1−mult)）；engage=做了相關的事但不聲稱滿足，只記帳
-  不動水位。MCP desire 工具同步支援 action=engage、satisfy degree 參數。
+- **明確結算**（`desire.satisfy/engage/defer/outreach`）：satisfy 的 degree 必填，
+  表示缺口真的填了幾成（eff = 1−degree×(1−mult)）；engage=做了但沒滿足，
+  defer=現在不做，兩者都不降水位並把該維延後兩小時；outreach=成功送達 Ruby
+  的獨立收據，不改水位。同一 wake／同一結果冪等，一次 wake 可留下多個 outcomes。
 - **互相制約**：explore/browse/create/chore 的 ACTION_SATISFY 各帶 libido ×0.95。
 - **wake 因果鏈**（`POST /api/desire/wake`＋autonomy.ts）：喚醒通知「送達成功」
   後 autonomy 回 POST 一筆 `wake:{drive}`（wake_id 冪等，滾動窗查重）；幽靈喚醒
