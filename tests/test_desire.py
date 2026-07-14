@@ -255,6 +255,18 @@ class TestSatisfy:
         assert s3["drives"]["curiosity"] == s2["drives"]["curiosity"]
         assert len([e for e in s3["events"] if e.get("wake_id") == "w-retry"]) == 1
 
+    def test_same_wake_stays_idempotent_after_event_window_eviction(self):
+        s = fresh()
+        s["drives"]["curiosity"] = 0.8
+        s2 = satisfy(s, "explore", NOW, degree=0.5, wake_id="w-old-retry")
+        first_value = s2["drives"]["curiosity"]
+        for i in range(MAX_EVENTS + 20):
+            s2 = feed(s2, "duty", 0.0, NOW, event=f"evict-{i}")
+        assert not any(e.get("wake_id") == "w-old-retry" for e in s2["events"])
+        retried = satisfy(s2, "explore", NOW, degree=0.5, wake_id="w-old-retry")
+        assert retried["drives"]["curiosity"] == first_value
+        assert "w-old-retry|satisfy:explore" in retried["processed_wake_receipts"]
+
 
 class TestEngageDeferOutreach:
     def test_engage_keeps_water_and_rechecks_later(self):
@@ -349,12 +361,25 @@ class TestStore:
         s = store.load(NOW + timedelta(hours=10))
         assert s["drives"]["miss_ruby"] > default_state(NOW)["drives"]["miss_ruby"]
 
-    def test_corrupted_file_falls_back_to_default(self, tmp_path):
+    def test_corrupted_file_recovers_last_good_without_reset(self, tmp_path):
         store = DesireStore(str(tmp_path))
+        state = default_state(NOW)
+        state["drives"]["miss_ruby"] = 0.73
+        store.save(state)
         with open(store.path, "w") as f:
             f.write("{not json!!")
-        s = store.load(NOW)
-        assert set(s["drives"].keys()) == set(DRIVE_KEYS)
+        with pytest.warns(RuntimeWarning):
+            s = store.load(NOW)
+        assert s["drives"]["miss_ruby"] == 0.73
+
+    def test_corrupted_primary_and_backup_fail_closed(self, tmp_path):
+        store = DesireStore(str(tmp_path))
+        store.save(default_state(NOW))
+        for path in (store.path, store.backup_path):
+            with open(path, "w") as f:
+                f.write("{not json!!")
+        with pytest.raises(RuntimeError, match="refusing|unreadable"):
+            store.load(NOW)
 
     def test_missing_keys_backfilled(self, tmp_path):
         store = DesireStore(str(tmp_path))
@@ -375,3 +400,26 @@ class TestStore:
         # 檔案裡是合法 JSON（atomic write 成功）
         with open(store.path) as f:
             assert "drives" in json.load(f)
+
+    def test_ledger_outbox_retries_without_duplicate(self, tmp_path):
+        store = DesireStore(str(tmp_path))
+        real_append = store._append_ledger
+        store._append_ledger = lambda _events: False
+        state = store.mutate(
+            lambda st: feed(st, "duty", 0.1, NOW, event="ledger outage"), NOW
+        )
+        assert len(state["ledger_pending"]) == 1
+        assert not os.path.exists(store.ledger_path)
+
+        store._append_ledger = real_append
+        store.mutate(lambda st: st, NOW)
+        saved = json.loads(open(store.path, encoding="utf-8").read())
+        assert saved["ledger_pending"] == []
+        lines = open(store.ledger_path, encoding="utf-8").read().splitlines()
+        assert len(lines) == 1
+
+        # Simulate crash after ledger append but before pending-clear commit.
+        saved["ledger_pending"] = [json.loads(lines[0])]
+        store.save(saved)
+        store.mutate(lambda st: st, NOW)
+        assert len(open(store.ledger_path, encoding="utf-8").read().splitlines()) == 1

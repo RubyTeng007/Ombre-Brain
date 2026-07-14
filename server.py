@@ -55,7 +55,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mcp.server.fastmcp import FastMCP
 
-from bucket_manager import BucketManager
+from bucket_manager import BucketManager, normalize_domains
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
@@ -702,8 +702,8 @@ async def breath(
 ) -> str:
     """檢索/浮現記憶。不傳query或傳空=自動浮現,有query=關鍵詞檢索。catalog=True=目錄模式:每桶一行元數據(0次LLM呼叫,最省token),適合開場先看目錄再精準拉取,可配domain過濾。max_tokens控制返回總token上限(默認10000)。domain逗號分隔,valence/arousal 0~1(-1忽略)。max_results控制返回數量上限(默認20,最大50)。importance_min>=1時按重要度批量拉取(不走語義搜索,按importance降序返回最多20條)。"""
     await decay_engine.ensure_started()
-    max_results = min(max_results, 50)
-    max_tokens = min(max_tokens, 20000)
+    max_results = max(1, min(max_results, 50))
+    max_tokens = max(1, min(max_tokens, 20000))
 
     # --- Catalog mode: one metadata line per bucket, zero LLM calls ---
     # --- 目錄模式：一行一桶，0 次 LLM 呼叫，token 預算內裝多少列多少 ---
@@ -712,7 +712,7 @@ async def breath(
             all_buckets = await bucket_mgr.list_all(include_archive=False)
         except Exception as e:
             return f"記憶系統暫時無法訪問: {e}"
-        domain_filter = {d.strip() for d in domain.split(",") if d.strip()}
+        domain_filter = set(normalize_domains([d.strip() for d in domain.split(",") if d.strip()]))
         rows = []
         for b in all_buckets:
             meta = b["metadata"]
@@ -769,14 +769,16 @@ async def breath(
             all_buckets = await bucket_mgr.list_all(include_archive=False)
         except Exception as e:
             return f"記憶系統暫時無法訪問: {e}"
+        importance_domains = set(normalize_domains([d.strip() for d in domain.split(",") if d.strip()]))
         filtered = [
             b for b in all_buckets
             if int(b["metadata"].get("importance", 0)) >= importance_min
             and b["metadata"].get("type") not in ("feel", "plan", "mirage")
             and not b["metadata"].get("digested", False)
+            and (not importance_domains or set(b["metadata"].get("domain", [])) & importance_domains)
         ]
         filtered.sort(key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True)
-        filtered = _select_importance_tiers(filtered, cap=20)
+        filtered = _select_importance_tiers(filtered, cap=min(20, max_results))
         if not filtered:
             return f"沒有重要度 >= {importance_min} 的記憶。"
         results = []
@@ -787,11 +789,12 @@ async def breath(
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                t = count_tokens_approx(summary)
-                if token_used + t > max_tokens:
-                    break
                 imp = b["metadata"].get("importance", 0)
-                results.append(f"[importance:{imp}] [bucket_id:{b['id']}] {summary}")
+                formatted = f"[importance:{imp}] [bucket_id:{b['id']}] {summary}"
+                t = count_tokens_approx(formatted)
+                if token_used + t > max_tokens:
+                    continue
+                results.append(formatted)
                 token_used += t
             except Exception as e:
                 logger.warning(f"importance_min dehydrate failed: {e}")
@@ -812,12 +815,17 @@ async def breath(
                 return "沒有留下過 feel。"
             feels = feels[:max_results]
             results = []
+            token_used = 0
             for f in feels:
                 created = f["metadata"].get("created", "")
                 entry = f"[{created}] [bucket_id:{f['id']}]\n{strip_wikilinks(f['content'])}"
+                needed = count_tokens_approx(entry)
+                if token_used + needed > max_tokens:
+                    continue
                 results.append(entry)
-                if count_tokens_approx("\n---\n".join(results)) > max_tokens:
-                    break
+                token_used += needed
+            if not results:
+                return "feel 存在，但超出這次 token 預算。"
             return "=== 你留下的 feel ===\n" + "\n---\n".join(results)
         except Exception as e:
             logger.error(f"Feel retrieval failed: {e}")
@@ -837,15 +845,19 @@ async def breath(
                 return "還沒有做過夢。"
             dreams = dreams[:max_results]
             results = []
+            token_used = 0
             for d in dreams:
                 created = d["metadata"].get("created", "")
                 consumed_note = d["metadata"].get("consumed", "")
                 src_line = f"\n（素材：{consumed_note}）" if consumed_note else ""
-                results.append(
-                    f"[{created}] [bucket_id:{d['id']}]\n{strip_wikilinks(d['content'])}{src_line}"
-                )
-                if count_tokens_approx("\n---\n".join(results)) > max_tokens:
-                    break
+                entry = f"[{created}] [bucket_id:{d['id']}]\n{strip_wikilinks(d['content'])}{src_line}"
+                needed = count_tokens_approx(entry)
+                if token_used + needed > max_tokens:
+                    continue
+                results.append(entry)
+                token_used += needed
+            if not results:
+                return "夢存在，但超出這次 token 預算。"
             return (
                 "=== 你做過的夢（殘影，不是事實） ===\n" + "\n---\n".join(results)
             )
@@ -862,18 +874,40 @@ async def breath(
             logger.error(f"Failed to list buckets for surfacing / 浮現列桶失敗: {e}")
             return "記憶系統暫時無法訪問。"
 
-        # --- Pinned/protected buckets: always surface as core principles ---
-        # --- 釘選桶：作為核心準則，始終浮現 ---
+        surface_domains = set(normalize_domains([
+            d.strip() for d in domain.split(",") if d.strip()
+        ]))
+
+        # --- Pinned/protected buckets: core principles, still bound by the
+        # caller's explicit domain/count/token contract. ---
         pinned_buckets = [
             b for b in all_buckets
             if b["metadata"].get("pinned") or b["metadata"].get("protected")
+            if not surface_domains or set(b["metadata"].get("domain", [])) & surface_domains
         ]
+        pinned_buckets.sort(
+            key=lambda b: (
+                int(b["metadata"].get("importance", 0)),
+                str(b["metadata"].get("name", b["id"])),
+            ),
+            reverse=True,
+        )
         pinned_results = []
+        token_budget = max_tokens
+        result_slots = max_results
         for b in pinned_buckets:
+            if token_budget <= 0 or result_slots <= 0:
+                break
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                pinned_results.append(f"📌 [核心準則] [bucket_id:{b['id']}] {summary}")
+                formatted = f"📌 [核心準則] [bucket_id:{b['id']}] {summary}"
+                needed = count_tokens_approx(formatted)
+                if needed > token_budget:
+                    continue
+                pinned_results.append(formatted)
+                token_budget -= needed
+                result_slots -= 1
             except Exception as e:
                 logger.warning(f"Failed to dehydrate pinned bucket / 釘選桶脫水失敗: {e}")
                 continue
@@ -906,6 +940,7 @@ async def breath(
             and b["metadata"].get("type") not in ("permanent", "feel", "plan", "mirage")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
+            and (not surface_domains or set(b["metadata"].get("domain", [])) & surface_domains)
             and not _cooling(b["metadata"])
         ]
 
@@ -950,10 +985,6 @@ async def breath(
         # --- Token-budgeted surfacing with diversity + hard cap ---
         # --- 按 token 預算浮現，帶多樣性 + 硬上限 ---
         # Top-1 always surfaces; rest sampled from top-20 for diversity
-        token_budget = max_tokens
-        for r in pinned_results:
-            token_budget -= count_tokens_approx(r)
-
         candidates = list(scored_with_cold)
         if len(candidates) > 1:
             # Cold-start buckets stay at front; shuffle rest from top-20
@@ -966,7 +997,7 @@ async def breath(
                 non_cold = top1 + pool + non_cold[min(20, len(non_cold)):]
             candidates = cold_start + non_cold
         # Hard cap: never surface more than max_results buckets
-        candidates = candidates[:max_results]
+        candidates = candidates[:result_slots]
 
         dynamic_results = []
         surfaced_ids: list[str] = []
@@ -976,12 +1007,13 @@ async def breath(
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                summary_tokens = count_tokens_approx(summary)
-                if summary_tokens > token_budget:
-                    break
-                # NOTE: no touch() here — surfacing should NOT reset decay timer
                 score = decay_engine.calculate_score(b["metadata"])
-                dynamic_results.append(f"[權重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
+                formatted = f"[權重:{score:.2f}] [bucket_id:{b['id']}] {summary}"
+                summary_tokens = count_tokens_approx(formatted)
+                if summary_tokens > token_budget:
+                    continue
+                # NOTE: no touch() here — surfacing should NOT reset decay timer
+                dynamic_results.append(formatted)
                 surfaced_ids.append(b["id"])
                 token_budget -= summary_tokens
             except Exception as e:
@@ -989,13 +1021,30 @@ async def breath(
                 continue
 
         if not pinned_results and not dynamic_results:
+            if pinned_buckets or unresolved:
+                return "記憶存在，但超出這次 token 預算。"
             return "權重池平靜，沒有需要處理的記憶。"
 
-        parts = []
-        if pinned_results:
-            parts.append("=== 核心準則 ===\n" + "\n---\n".join(pinned_results))
-        if dynamic_results:
-            parts.append("=== 浮現記憶 ===\n" + "\n---\n".join(dynamic_results))
+        def _surface_parts() -> list[str]:
+            out = []
+            if pinned_results:
+                out.append("=== 核心準則 ===\n" + "\n---\n".join(pinned_results))
+            if dynamic_results:
+                out.append("=== 浮現記憶 ===\n" + "\n---\n".join(dynamic_results))
+            return out
+
+        parts = _surface_parts()
+        # Headers/separators are part of the public token contract too. Trim
+        # lowest-priority tail entries until the complete response fits.
+        while parts and count_tokens_approx("\n\n".join(parts)) > max_tokens:
+            if dynamic_results:
+                dynamic_results.pop()
+                surfaced_ids.pop()
+            elif pinned_results:
+                pinned_results.pop()
+            parts = _surface_parts()
+        if not parts:
+            return "記憶存在，但超出這次 token 預算。"
 
         # --- Stamp what actually surfaced (cooldown + retrieved_count; not a touch) ---
         # --- 蓋浮現章（供冷卻與 retrieved 計數；不是加固）---
@@ -1074,7 +1123,7 @@ async def breath(
     results = []
     token_used = 0
     ripple_done = False
-    for bucket in matches:
+    for bucket in matches[:max_results]:
         if token_used >= max_tokens:
             break
         try:
@@ -1086,9 +1135,16 @@ async def breath(
                 shift = (q_valence - 0.5) * 0.2  # ±0.1 max shift
                 clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
             summary = await dehydrator.dehydrate(strip_wikilinks(bucket["content"]), clean_meta)
-            summary_tokens = count_tokens_approx(summary)
+            formatted = (
+                f"[語義關聯] [bucket_id:{bucket['id']}] {summary}"
+                if bucket.get("vector_match")
+                else f"[bucket_id:{bucket['id']}] {summary}"
+            )
+            summary_tokens = count_tokens_approx(formatted)
+            if results:
+                summary_tokens += count_tokens_approx("\n---\n")
             if token_used + summary_tokens > max_tokens:
-                break
+                continue
             # --- Two-tier reinforcement (2026-07-12 batch-2): only the strongest
             # hit gets a real touch (activation + ripple) — the rest were merely
             # RETRIEVED, and being listed is not being engaged with. Every hit
@@ -1100,11 +1156,7 @@ async def breath(
                 await bucket_mgr.touch(bucket["id"], ripple=True)
                 ripple_done = True
             await bucket_mgr.mark_surfaced(bucket["id"])
-            if bucket.get("vector_match"):
-                summary = f"[語義關聯] [bucket_id:{bucket['id']}] {summary}"
-            else:
-                summary = f"[bucket_id:{bucket['id']}] {summary}"
-            results.append(summary)
+            results.append(formatted)
             token_used += summary_tokens
         except Exception as e:
             logger.warning(f"Failed to dehydrate search result / 檢索結果脫水失敗: {e}")
@@ -1112,25 +1164,46 @@ async def breath(
 
     # --- Random surfacing: when search returns < 3, 40% chance to float old memories ---
     # --- 隨機浮現：檢索結果不足 3 條時，40% 概率從低權重舊桶裡漂上來 ---
-    if len(matches) < 3 and random.random() < 0.4:
+    remaining_slots = max_results - len(results)
+    if len(results) < 3 and remaining_slots > 0 and token_used < max_tokens and random.random() < 0.4:
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
             matched_ids = {b["id"] for b in matches}
             low_weight = [
                 b for b in all_buckets
                 if b["id"] not in matched_ids
-                and b["metadata"].get("type") not in ("feel", "permanent", "plan")
+                and b["metadata"].get("type") not in ("feel", "permanent", "plan", "mirage")
+                and not b["metadata"].get("pinned", False)
+                and not b["metadata"].get("protected", False)
+                and not b["metadata"].get("resolved", False)
                 and not b["metadata"].get("digested", False)
+                and bucket_mgr.vector_admissible(
+                    b["metadata"], 0.0, q_valence, q_arousal, domain_filter
+                )
                 and decay_engine.calculate_score(b["metadata"]) < 2.0
             ]
             if low_weight:
-                drifted = random.sample(low_weight, min(random.randint(1, 3), len(low_weight)))
-                drift_results = []
+                drifted = random.sample(
+                    low_weight,
+                    min(random.randint(1, 3), len(low_weight), remaining_slots),
+                )
+                first_drift = True
                 for b in drifted:
                     clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                     summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                    drift_results.append(f"[surface_type: random]\n{summary}")
-                results.append("--- 忽然想起來 ---\n" + "\n---\n".join(drift_results))
+                    heading = "--- 忽然想起來 ---\n" if first_drift else ""
+                    formatted = (
+                        f"{heading}[surface_type: random] [bucket_id:{b['id']}]\n{summary}"
+                    )
+                    needed = count_tokens_approx(formatted)
+                    if results:
+                        needed += count_tokens_approx("\n---\n")
+                    if token_used + needed > max_tokens:
+                        continue
+                    results.append(formatted)
+                    token_used += needed
+                    first_drift = False
+                    await bucket_mgr.mark_surfaced(b["id"])
         except Exception as e:
             logger.warning(f"Random surfacing failed / 隨機浮現失敗: {e}")
 
@@ -1592,6 +1665,12 @@ async def pulse(verbose: bool = False, include_archive: bool = False) -> str:
         letter_count = len(letter_store.list_letters())
     except Exception:
         letter_count = 0
+    try:
+        desire_health_state = desire_store.load()
+        desire_pending = len(desire_health_state.get("ledger_pending", []) or [])
+        desire_health = "健康" if desire_pending == 0 else f"待補寫 {desire_pending} 筆"
+    except Exception as exc:
+        desire_health = f"損壞／不可讀（{type(exc).__name__}）"
     status = (
         f"=== Ombre Brain 記憶系統 ===\n"
         f"固化記憶桶: {stats['permanent_count']} 個\n"
@@ -1600,6 +1679,7 @@ async def pulse(verbose: bool = False, include_archive: bool = False) -> str:
         f"承諾桶(plan): {stats.get('plan_count', 0)} 個\n"
         f"蜃景桶(mirage/夢): {stats.get('mirage_count', 0)} 個\n"
         f"信件: {letter_count} 封\n"
+        f"慾望帳本: {desire_health}\n"
         f"歸檔記憶桶: {stats['archive_count']} 個\n"
         f"總存儲大小: {stats['total_size_kb']:.1f} KB\n"
         f"衰減引擎: {'運行中' if decay_engine.is_running else '已停止'}\n"
@@ -2434,6 +2514,7 @@ async def _desire_state_payload() -> dict:
         # 不端出來的話前端只能看著水位「自己降」而無從解釋。
         "saturated": state.get("saturated", {}),
         "events": state.get("events", [])[-10:],
+        "ledger_pending_count": len(state.get("ledger_pending", []) or []),
         "driven_behavior_enabled": False,  # Phase 1 鐵律：永遠只讀
     }
 
@@ -2624,7 +2705,9 @@ async def api_desire_wake(request):
     note = reason if reason else f"{action_name} score={score}".strip()
     try:
         def _record(st):
-            # 冪等：滾動窗內同 wake_id 已存在就不重記（兼容舊 note 內嵌格式）
+            # v3 永久收據優先；舊 note 內嵌格式仍兼容。
+            if desire_kernel._has_wake_event(st, wake_id, "wake"):
+                return st
             for e in st.get("events", []):
                 if e.get("kind", "").startswith("wake:") and (
                         e.get("wake_id") == wake_id or wake_id in e.get("note", "")):
@@ -3081,6 +3164,57 @@ async def api_letters(request):
         return JSONResponse({"letters": letters})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/letters/write", methods=["POST"])
+async def api_letter_machine_write(request):
+    """Single-writer door for durable machine-generated correspondence.
+
+    swap-v2 used to import LetterStore in its own process and mutate the same
+    JSON file. Thread locks cannot coordinate across processes, so concurrent
+    writes could silently lose one letter. All machine writes now serialize
+    inside the Ombre service and carry an idempotency key for safe retries.
+    """
+    from starlette.responses import JSONResponse
+    denied = _require_hook_access(request)
+    if denied:
+        return denied
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON object required"}, status_code=400)
+    idempotency_key = str(body.get("idempotency_key", "")).strip()[:200]
+    if not idempotency_key:
+        return JSONResponse({"error": "idempotency_key is required"}, status_code=400)
+    try:
+        letter_obj = letter_store.write_letter({
+            "author": body.get("author"),
+            "content": body.get("content"),
+            "title": body.get("title"),
+            "letter_date": body.get("letter_date"),
+            "tags": body.get("tags"),
+            "idempotency_key": idempotency_key,
+        })
+        try:
+            await embedding_engine.generate_and_store(
+                f"letter:{letter_obj['id']}",
+                f"{letter_obj.get('title', '')}\n{letter_obj['content']}",
+            )
+        except Exception:
+            pass
+        return JSONResponse({
+            "ok": True,
+            "id": letter_obj["id"],
+            "author": letter_obj["author"],
+            "letter_date": letter_obj["letter_date"],
+        })
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        logger.exception("Machine letter write failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @mcp.custom_route("/api/letter", methods=["POST"])

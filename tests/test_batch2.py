@@ -165,6 +165,36 @@ class TestSurfaceCooldown:
         assert after.get("retrieved_count", 0) == 1
         assert after.get("last_surfaced", "")
 
+    def test_no_query_domain_filter_is_strict(self, wired, bucket_mgr):
+        wanted = _run(bucket_mgr.create(
+            content="編程域裡的記憶", name="編程記憶", domain=["編程"]
+        ))
+        unwanted = _run(bucket_mgr.create(
+            content="戀愛域裡的記憶", name="戀愛記憶", domain=["戀愛"]
+        ))
+        out = _run(wired.breath(domain="編程", max_results=10))
+        assert wanted in out
+        assert unwanted not in out
+
+    def test_pinned_respects_shared_result_cap(self, wired, bucket_mgr):
+        for i in range(3):
+            _run(bucket_mgr.create(
+                content=f"核心準則{i}", name=f"核心準則{i}", domain=["自省"],
+                pinned=True, bucket_type="permanent",
+            ))
+        out = _run(wired.breath(max_results=1, max_tokens=10000))
+        assert out.count("bucket_id:") == 1
+
+    def test_complete_surface_response_respects_token_budget(self, wired, bucket_mgr):
+        for i in range(3):
+            _run(bucket_mgr.create(
+                content=("很長的核心準則" * 20) + str(i), name=f"長準則{i}",
+                domain=["自省"], pinned=True, bucket_type="permanent",
+            ))
+        out = _run(wired.breath(max_results=20, max_tokens=35))
+        from utils import count_tokens_approx
+        assert count_tokens_approx(out) <= 35
+
 
 # ---------------------------------------------------------
 # 4. 兩層加固：搜到 ≠ 用到
@@ -186,6 +216,21 @@ class TestTwoTierSearch:
         assert float(r_meta.get("activation_count", 0)) < 1
         assert int(r_meta.get("retrieved_count", 0)) >= 1
         assert int(w_meta.get("retrieved_count", 0)) >= 1
+
+    def test_random_drift_cannot_escape_explicit_domain(self, wired, bucket_mgr, monkeypatch):
+        wanted = _run(bucket_mgr.create(
+            content="低權重編程舊事", name="編程舊事", domain=["編程"]
+        ))
+        unwanted = _run(bucket_mgr.create(
+            content="低權重戀愛舊事", name="戀愛舊事", domain=["戀愛"]
+        ))
+        monkeypatch.setattr(bucket_mgr, "search", AsyncMock(return_value=[]))
+        wired.decay_engine.calculate_score = lambda _meta: 1.0
+        monkeypatch.setattr(wired.random, "random", lambda: 0.0)
+        monkeypatch.setattr(wired.random, "randint", lambda _a, _b: 3)
+        out = _run(wired.breath(query="完全不命中", domain="編程", max_results=5))
+        assert wanted in out
+        assert unwanted not in out
 
 
 # ---------------------------------------------------------

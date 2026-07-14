@@ -25,6 +25,7 @@ import os
 import random
 import secrets
 import threading
+import warnings
 from datetime import datetime
 from typing import Any
 
@@ -172,7 +173,7 @@ REASON_TEMPLATES = {
 REST_REASON = "有點累了，不想動，就靜靜待著。"
 QUIET_REASON = "心裡挺平靜的，沒什麼特別想做的。"
 
-_STATE_VERSION = 2
+_STATE_VERSION = 3
 
 
 # ---------------------------------------------------------
@@ -200,6 +201,10 @@ def default_state(now: datetime | None = None) -> dict[str, Any]:
         "recheck_until": {},       # drive → iso；做過／暫緩後稍晚再問，水位不動
         "saturated": {},           # 高位消退中的維度（hysteresis 狀態，2026-07-12）
         "events": [],              # 每一筆漲跌的來歷
+        # 永久結果收據不跟 60 筆展示窗一起蒸發；同一 wake 重送只套用一次。
+        "processed_wake_receipts": {},
+        # state 是真相；ledger 是 append-only 副本。待寫事件先隨 state 落盤。
+        "ledger_pending": [],
         "last_intent": None,
     }
 
@@ -511,6 +516,11 @@ def _has_wake_event(state: dict, wake_id: str, kind_prefix: str) -> bool:
     """同一 wake 的同類結果只套用一次；不同動詞仍可各自留下。"""
     if not wake_id:
         return False
+    if _wake_receipt_key(wake_id, kind_prefix) in (
+        state.get("processed_wake_receipts", {}) or {}
+    ):
+        return True
+    # Backward compatibility while a pre-v3 state is being migrated.
     for event in state.get("events", []):
         kind = str(event.get("kind", ""))
         if event.get("wake_id") == wake_id and (kind == kind_prefix or kind.startswith(kind_prefix + ":")):
@@ -518,8 +528,41 @@ def _has_wake_event(state: dict, wake_id: str, kind_prefix: str) -> bool:
     return False
 
 
+def _receipt_kind(kind: str) -> str:
+    """Map event kinds to the idempotency class used by callers."""
+    text = str(kind or "")
+    if text.startswith("wake:"):
+        return "wake"
+    parts = text.split(":")
+    if len(parts) >= 3 and parts[0] == "satisfy" and parts[-1].startswith("d"):
+        try:
+            float(parts[-1][1:])
+            return ":".join(parts[:-1])
+        except ValueError:
+            pass
+    return text
+
+
+def _wake_receipt_key(wake_id: str, kind: str) -> str:
+    return f"{str(wake_id)[:64]}|{_receipt_kind(kind)}"
+
+
+def _register_wake_receipt(state: dict, event: dict) -> None:
+    wake_id = str(event.get("wake_id") or "")[:64]
+    if not wake_id:
+        return
+    key = _wake_receipt_key(wake_id, str(event.get("kind") or ""))
+    state.setdefault("processed_wake_receipts", {}).setdefault(
+        key,
+        str(event.get("event_id") or event.get("ts") or "legacy"),
+    )
+
+
 def _event_signature(event: dict) -> tuple:
-    return (event.get("ts"), event.get("kind"), event.get("note"), event.get("wake_id"))
+    event_id = event.get("event_id")
+    if event_id:
+        return ("id", event_id)
+    return ("legacy", event.get("ts"), event.get("kind"), event.get("note"), event.get("wake_id"))
 
 
 def _log_event(state: dict, now: datetime, kind: str, note: str = "", wake_id: str = "") -> None:
@@ -527,12 +570,14 @@ def _log_event(state: dict, now: datetime, kind: str, note: str = "", wake_id: s
     wake_id（2026-07-12 第三批）：這筆閉環動作對應哪次喚醒——有給才記，
     讓「哪次醒導致哪個選擇」從時間推測變成 ledger 裡的一條 grep。"""
     entry = {
+        "event_id": secrets.token_hex(8),
         "ts": now.isoformat(timespec="seconds"),
         "kind": kind,
         "note": str(note)[:200],
     }
     if wake_id:
         entry["wake_id"] = str(wake_id)[:64]
+        _register_wake_receipt(state, entry)
     events = state.setdefault("events", [])
     events.append(entry)
     del events[:-MAX_EVENTS]
@@ -547,6 +592,7 @@ class DesireStore:
 
     def __init__(self, buckets_dir: str):
         self.path = os.path.join(buckets_dir, "desire_state.json")
+        self.backup_path = os.path.join(buckets_dir, "desire_state.last-good.json")
         self.ledger_path = os.path.join(buckets_dir, "desire_ledger.jsonl")
         self._lock = threading.RLock()
 
@@ -563,25 +609,68 @@ class DesireStore:
         now = now or datetime.now()
         with self._lock:
             state = tick(self._load_unlocked(), now)
+            self._flush_ledger_pending_unlocked(state)
             before = {_event_signature(e) for e in state.get("events", [])}
             new_state = fn(state)
-            self._save_unlocked(new_state)
-            self._append_ledger([
+            new_events = [
                 e for e in new_state.get("events", [])
                 if _event_signature(e) not in before
-            ])
+            ]
+            pending = new_state.setdefault("ledger_pending", [])
+            pending_ids = {
+                _event_signature(e) for e in pending if isinstance(e, dict)
+            }
+            pending.extend(
+                e for e in new_events if _event_signature(e) not in pending_ids
+            )
+            # Write-ahead order: state truth + outbox first, ledger second.
+            self._save_unlocked(new_state)
+            if new_state.get("ledger_pending") and self._flush_ledger_pending_unlocked(new_state):
+                self._save_unlocked(new_state)
             return new_state
 
-    def _append_ledger(self, events: list[dict]) -> None:
-        """寫失敗不擋主流程（ledger 是統計副本，state 才是真相）。"""
+    def _append_ledger(self, events: list[dict]) -> bool:
+        """Idempotently append pending events; return False on I/O failure."""
         if not events:
-            return
+            return True
         try:
+            seen_ids: set[str] = set()
+            if os.path.exists(self.ledger_path):
+                with open(self.ledger_path, "rb") as existing:
+                    existing.seek(0, 2)
+                    size = existing.tell()
+                    existing.seek(max(0, size - 512 * 1024))
+                    for raw in existing.read().decode("utf-8", errors="ignore").splitlines():
+                        try:
+                            item = json.loads(raw)
+                            if isinstance(item, dict) and item.get("event_id"):
+                                seen_ids.add(str(item["event_id"]))
+                        except (TypeError, ValueError):
+                            continue
             with open(self.ledger_path, "a", encoding="utf-8") as f:
                 for e in events:
+                    if e.get("event_id") and str(e["event_id"]) in seen_ids:
+                        continue
                     f.write(json.dumps(e, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            return True
         except OSError:
-            pass
+            return False
+
+    def _flush_ledger_pending_unlocked(self, state: dict) -> bool:
+        pending = state.get("ledger_pending", [])
+        if not isinstance(pending, list):
+            state["ledger_pending"] = []
+            return True
+        valid = [e for e in pending if isinstance(e, dict)]
+        if not valid:
+            state["ledger_pending"] = []
+            return True
+        if not self._append_ledger(valid):
+            return False
+        state["ledger_pending"] = []
+        return True
 
     def save(self, state: dict) -> None:
         with self._lock:
@@ -593,28 +682,71 @@ class DesireStore:
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return default_state()
+        except (OSError, json.JSONDecodeError) as primary_exc:
+            try:
+                with open(self.backup_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                warnings.warn(
+                    f"desire state recovered from last-good backup: {primary_exc}",
+                    RuntimeWarning,
+                )
+            except (OSError, json.JSONDecodeError) as backup_exc:
+                raise RuntimeError(
+                    f"desire state is unreadable; primary={primary_exc}; backup={backup_exc}"
+                ) from primary_exc
         if not isinstance(data, dict) or "drives" not in data:
-            return default_state()
+            raise RuntimeError("desire state is invalid; refusing to reset to defaults")
         # 缺鍵補齊（版本演進容錯）
         base = default_state()
         data["version"] = _STATE_VERSION
         for k in DRIVE_KEYS:
             data.setdefault("drives", {}).setdefault(k, base["drives"][k])
-        for key in ("fatigue", "gates", "veto_until", "recheck_until", "saturated", "events", "updated_at", "last_intent"):
+        for key in (
+            "fatigue", "gates", "veto_until", "recheck_until", "saturated",
+            "events", "updated_at", "last_intent", "ledger_pending",
+        ):
             data.setdefault(key, base[key])
+        if not isinstance(data.get("processed_wake_receipts"), dict):
+            data["processed_wake_receipts"] = {}
+            # One-time v2→v3 migration reads the full ledger, not only the
+            # rolling display window, so old wake retries remain idempotent.
+            historical = list(data.get("events", []))
+            if os.path.exists(self.ledger_path):
+                try:
+                    with open(self.ledger_path, "r", encoding="utf-8") as ledger:
+                        for line in ledger:
+                            try:
+                                event = json.loads(line)
+                                if isinstance(event, dict):
+                                    historical.append(event)
+                            except (TypeError, ValueError):
+                                continue
+                except OSError:
+                    pass
+            for event in historical:
+                if isinstance(event, dict):
+                    _register_wake_receipt(data, event)
         return data
 
     def _save_unlocked(self, state: dict) -> None:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        tmp = f"{self.path}.{secrets.token_hex(4)}.tmp"
+        self._atomic_save_path(self.path, state)
+        # The backup is recovery insurance, not transaction truth. A primary
+        # commit stays successful even if this redundant copy cannot refresh.
+        try:
+            self._atomic_save_path(self.backup_path, state)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _atomic_save_path(path: str, state: dict) -> None:
+        tmp = f"{path}.{secrets.token_hex(4)}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, self.path)
+            os.replace(tmp, path)
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)

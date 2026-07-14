@@ -64,7 +64,7 @@ def normalize_letter(payload: dict[str, Any], existing: dict[str, Any] | None = 
                 tags.append(clean)
 
     now = _now_iso()
-    return {
+    letter = {
         "id": current.get("id") or secrets.token_hex(6),
         "author": author,
         "title": _text(payload.get("title", current.get("title", "")), 200),
@@ -73,6 +73,17 @@ def normalize_letter(payload: dict[str, Any], existing: dict[str, Any] | None = 
         "tags": tags,
         "created_at": current.get("created_at") or now,
     }
+    # Machine writers (notably swap-v2) may retry after a timeout where the
+    # caller cannot know whether the first response was lost. Persisting the
+    # key with the immutable letter lets the single Ombre writer turn those
+    # retries into reads instead of duplicate correspondence.
+    idempotency_key = _text(
+        payload.get("idempotency_key", current.get("idempotency_key", "")),
+        200,
+    )
+    if idempotency_key:
+        letter["idempotency_key"] = idempotency_key
+    return letter
 
 
 class LetterStore:
@@ -98,6 +109,11 @@ class LetterStore:
     def write_letter(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             letters = self._load_unlocked()
+            idempotency_key = _text(payload.get("idempotency_key"), 200)
+            if idempotency_key:
+                for existing in letters:
+                    if existing.get("idempotency_key") == idempotency_key:
+                        return existing
             letter = normalize_letter(payload)
             letters.append(letter)
             self._save_unlocked(letters)

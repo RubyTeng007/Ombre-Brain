@@ -255,8 +255,15 @@ class TestSearchScoring:
         results = await bm.search("学习", limit=50, domain_filter=["编程"])
         for r in results:
             domains = r.get("metadata", {}).get("domain", [])
-            # Should have at least some affinity to 编程
-            assert any("编程" in d for d in domains) or True  # fuzzy match allows some slack
+            assert "編程" in domains
+
+    @pytest.mark.asyncio
+    async def test_empty_domain_filter_does_not_fall_back_to_everything(self, bucket_mgr):
+        await bucket_mgr.create(
+            content="只有戀愛域", name="戀愛域", domain=["戀愛"]
+        )
+        results = await bucket_mgr.search("戀愛", domain_filter=["編程"])
+        assert results == []
 
     @pytest.mark.asyncio
     async def test_emotion_resonance_scoring(self, populated_env):
