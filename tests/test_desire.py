@@ -423,3 +423,61 @@ class TestStore:
         store.save(saved)
         store.mutate(lambda st: st, NOW)
         assert len(open(store.ledger_path, encoding="utf-8").read().splitlines()) == 1
+
+
+# ============================================================
+# 2026-07-16 審計跟進：feed 曾是唯一沒有去重收據的 mutator
+# satisfy/engage/defer/outreach/veto 都有；feed 沒有——所以「Ombre 已套用、
+# 回應在路上斷了」的重試會變成重複加水。而行事曆那條路正好是全系統唯一會重試的。
+# ============================================================
+
+
+class TestFeedIdempotency:
+    def test_same_feed_id_applies_once(self):
+        s = fresh()
+        s = feed(s, "duty", 0.04, NOW, event="花市要到了", feed_id="cal-1")
+        first = s["drives"]["duty"]
+        s = feed(s, "duty", 0.04, NOW, event="花市要到了", feed_id="cal-1")
+        assert s["drives"]["duty"] == first, "同一個 feed_id 不可以加第二次"
+
+    def test_different_feed_id_still_applies(self):
+        s = fresh()
+        base = s["drives"]["duty"]
+        s = feed(s, "duty", 0.04, NOW, event="花市", feed_id="cal-1")
+        s = feed(s, "duty", 0.04, NOW, event="動物園", feed_id="cal-2")
+        assert s["drives"]["duty"] == pytest.approx(base + 0.08), "不同訊號要各自算"
+
+    def test_no_feed_id_keeps_old_behaviour(self):
+        s = fresh()
+        base = s["drives"]["duty"]
+        s = feed(s, "duty", 0.04, NOW, event="x")
+        s = feed(s, "duty", 0.04, NOW, event="x")
+        assert s["drives"]["duty"] == pytest.approx(base + 0.08), "沒給收據就不去重（呼叫端自負）"
+
+    def test_receipt_survives_events_being_trimmed(self):
+        """收據存在的意義就是在 events 被裁掉之後還活著。
+
+        _receipt_kind 若少了 feed 的摺疊規則，註冊的 key 會帶著金額
+        （feed:duty:+0.04）、探詢的 key 不帶（feed:duty），兩邊永遠對不上——
+        去重就只能靠 events 掃描僥倖命中，而 events 會被 MAX_EVENTS 裁掉。
+        裁掉之後靜默失效：看起來修好了，其實沒有。
+        """
+        s = fresh()
+        s = feed(s, "duty", 0.04, NOW, event="花市", feed_id="cal-1")
+        first = s["drives"]["duty"]
+        for i in range(MAX_EVENTS + 5):
+            s = feed(s, "curiosity", 0.0, NOW, event=f"noise{i}")
+        assert not any(e.get("wake_id") == "cal-1" for e in s["events"]), "前提：已被裁掉"
+        s = feed(s, "duty", 0.04, NOW, event="花市", feed_id="cal-1")
+        assert s["drives"]["duty"] == first, "events 裁掉之後收據還是要擋住重播"
+
+    def test_receipt_kind_folds_the_amount(self):
+        assert desire._receipt_kind("feed:duty:+0.04") == "feed:duty"
+        assert desire._receipt_kind("feed:miss_ruby:-0.03") == "feed:miss_ruby"
+        assert desire._receipt_kind("feed:duty:notanumber") == "feed:duty:notanumber"
+
+    def test_has_processed_is_public_and_sees_the_receipt(self):
+        s = fresh()
+        assert desire.has_processed(s, "cal-1", "feed:duty") is False
+        s = feed(s, "duty", 0.04, NOW, event="花市", feed_id="cal-1")
+        assert desire.has_processed(s, "cal-1", "feed:duty") is True

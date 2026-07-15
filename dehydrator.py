@@ -39,6 +39,17 @@ logger = logging.getLogger("ombre_brain.dehydrator")
 
 # --- Dehydration prompt: instructs cheap LLM to compress information ---
 # --- 脫水提示詞：指導廉價 LLM 壓縮信息 ---
+# 提示詞版本。改了下面任何一個 PROMPT 就要往上加一號，否則快取會繼續服務用舊
+# 提示詞產生的摘要——快取鍵含這個字串，加一號就等於讓所有舊列失效。
+# 舊列不會被刪（沒有 TTL、沒有清理），會留在 DB 裡當孤兒佔空間；那是刻意的取捨：
+# 寧可留下不會被讀到的位元組，也不要送出一份不知道是誰產的摘要。
+PROMPT_VERSION = "1"
+
+# 脫水輸入天花板。線上最長的桶約 3982 字，舊值 3000 已經在咬它們了（而且咬掉的是
+# 待辦清單）。留餘裕但不無上限：真的超過就明確標記省略，不靜默切。
+# 改這個值要一起把 PROMPT_VERSION 加一號——摘要的涵蓋範圍變了，舊快取不該再命中。
+DEHYDRATE_INPUT_LIMIT = 8000
+
 DEHYDRATE_PROMPT = """你是一個信息壓縮專家。請將以下內容脫水為緊湊摘要。
 
 壓縮規則：
@@ -213,33 +224,49 @@ class Dehydrator:
         conn.commit()
         conn.close()
 
+    def _cache_key(self, content: str) -> str:
+        """快取鍵＝正文＋模型＋提示詞版本。
+
+        以前只雜湊正文，model 有存欄位但不在 WHERE 裡——所以換模型（server.py 會在
+        執行期改 dehydrator.model）或改提示詞之後，同一份正文照樣命中舊那筆，
+        舊模型的摘要永遠服務下去。而 invalidate_cache() 全 repo、線上都零呼叫，
+        沒有 TTL、沒有版本欄位，唯一的失效途徑是「正文被改」——那只是讓舊列變孤兒，
+        而孤兒也永遠不會被刪。
+        """
+        return hashlib.sha256(
+            "\x00".join([content, str(self.model), PROMPT_VERSION]).encode()
+        ).hexdigest()
+
     def _get_cached_summary(self, content: str) -> str | None:
         """Look up cached dehydration result by content hash."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
         conn = sqlite3.connect(self.cache_db_path)
         row = conn.execute(
             "SELECT summary FROM dehydration_cache WHERE content_hash = ?",
-            (content_hash,)
+            (self._cache_key(content),)
         ).fetchone()
         conn.close()
         return row[0] if row else None
 
     def _set_cached_summary(self, content: str, summary: str):
         """Store dehydration result in cache."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
         conn = sqlite3.connect(self.cache_db_path)
         conn.execute(
             "INSERT OR REPLACE INTO dehydration_cache (content_hash, summary, model) VALUES (?, ?, ?)",
-            (content_hash, summary, self.model)
+            (self._cache_key(content), summary, self.model)
         )
         conn.commit()
         conn.close()
 
     def invalidate_cache(self, content: str):
-        """Remove cached summary for specific content (call when bucket content changes)."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        """Remove cached summary for specific content (call when bucket content changes).
+
+        注意：這個方法目前零呼叫（repo 與線上都是）。留著是因為它是對的，但別把它
+        當成「快取會被清掉」的證據——真正在做失效的是 _cache_key 本身：鍵一變，
+        舊列就再也命中不到。舊列不會被刪，那是已知的取捨（見 PROMPT_VERSION）。
+        """
         conn = sqlite3.connect(self.cache_db_path)
-        conn.execute("DELETE FROM dehydration_cache WHERE content_hash = ?", (content_hash,))
+        conn.execute("DELETE FROM dehydration_cache WHERE content_hash = ?",
+                     (self._cache_key(content),))
         conn.commit()
         conn.close()
 
@@ -398,8 +425,27 @@ class Dehydrator:
         """
         Call LLM API for intelligent dehydration (via OpenAI-compatible client).
         調用 LLM API 執行智能脫水。
+
+        輸入截斷不再是無聲的。3000 字的天花板本來就在，只是沒有人知道它咬到了誰：
+        線上有三個桶超過它，摘要早就是拿截斷版產的、天天在服務中，而其中一條被吃掉
+        的尾巴正好是待辦清單——DEHYDRATE_PROMPT 第 3 條寫的是「保留所有待辦/未完成
+        事項」。天花板提高到能蓋住現有的桶，超過的話明確告訴模型「這裡被切了」，
+        並且記一筆 log 讓它變成看得見的事實而不是猜測。
         """
-        return await self._complete(DEHYDRATE_PROMPT, content[:3000])
+        if len(content) > DEHYDRATE_INPUT_LIMIT:
+            logger.warning(
+                f"Dehydration input truncated at {DEHYDRATE_INPUT_LIMIT} chars "
+                f"(body is {len(content)}) — the tail is not in this summary / "
+                f"脫水輸入被截斷，尾段不在這份摘要裡"
+            )
+            body = (
+                content[:DEHYDRATE_INPUT_LIMIT]
+                + f"\n\n〔以下省略 {len(content) - DEHYDRATE_INPUT_LIMIT} 字，"
+                  f"摘要只涵蓋前面這段〕"
+            )
+        else:
+            body = content
+        return await self._complete(DEHYDRATE_PROMPT, body)
 
     # ---------------------------------------------------------
     # API call: merge

@@ -36,8 +36,18 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
+from typing import NamedTuple
+
 import frontmatter
 from rapidfuzz import fuzz
+
+
+class DeleteResult(NamedTuple):
+    """delete() 的結果。刻意不是 bool：「檔案刪掉了嗎」和「救得回來嗎」是兩件事，
+    混成一個真假值正是 restore 指令會說謊的原因。ok=False 代表桶還在。
+    seq=None 代表刪掉了但沒存下快照——不可復原，別對使用者宣稱可以。"""
+    ok: bool
+    seq: Optional[int]
 
 from utils import generate_bucket_id, sanitize_name, safe_path, now_iso
 
@@ -402,7 +412,9 @@ class BucketManager:
         filename = os.path.basename(file_path)
         new_path = safe_path(target_dir, filename)
         if os.path.normpath(file_path) != os.path.normpath(new_path):
-            os.rename(file_path, new_path)
+            # shutil.move 而非 os.rename：buckets_dir 可能是 iCloud/外掛磁碟，
+            # os.rename 跨檔案系統會丟 EXDEV。archive() 早就為了這個用 shutil.move。
+            shutil.move(file_path, str(new_path))
             logger.info(f"Moved bucket / 移動記憶桶: {filename} → {target_dir}/")
         return new_path
 
@@ -570,10 +582,12 @@ class BucketManager:
     # Delete bucket
     # 刪除桶
     # ---------------------------------------------------------
-    async def delete(self, bucket_id: str, actor=None) -> bool:
+    async def delete(self, bucket_id: str, actor=None) -> "DeleteResult":
         """
-        Delete a memory bucket file.
-        刪除指定的記憶桶文件。
+        Delete a memory bucket file. Returns DeleteResult(ok, seq) — check .ok,
+        never the tuple's truthiness (a NamedTuple is always truthy).
+        刪除指定的記憶桶文件。回傳 DeleteResult(ok, seq)——要看 .ok，
+        不要直接拿整個 tuple 當真假值判斷（NamedTuple 恆為真）。
 
         Snapshots first. This is the one operation with no other way back:
         archive/revive only move the file (it still exists on disk), but delete
@@ -585,12 +599,17 @@ class BucketManager:
         """
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
-            return False
+            return DeleteResult(False, None)
 
+        # snapshot() 回傳的 seq 一定要接住往上傳。以前它被丟掉，呼叫端只好事後用
+        # COUNT(*) 重算一個——快照失敗時那個數字會指向更舊的版本，使用者照著印出來的
+        # restore 指令做，會拿回舊正文而且沒有任何錯誤。快照失敗＝這次刪除不可復原，
+        # 那就要說得出口，不能猜一個看起來能用的號碼。
+        seq: Optional[int] = None
         if self.history is not None:
             try:
                 post = frontmatter.load(file_path)
-                self.history.snapshot(
+                seq = self.history.snapshot(
                     bucket_id, post.content, dict(post.metadata),
                     op="delete", actor=actor,
                 )
@@ -601,10 +620,15 @@ class BucketManager:
             os.remove(file_path)
         except OSError as e:
             logger.error(f"Failed to delete bucket file / 刪除桶文件失敗: {file_path}: {e}")
-            return False
+            return DeleteResult(False, None)
 
+        if seq is None:
+            logger.error(
+                f"Deleted WITHOUT a usable history snapshot (unrecoverable) / "
+                f"刪除了但沒有可用的歷史快照（救不回來）: {bucket_id}"
+            )
         logger.info(f"Deleted bucket / 刪除記憶桶: {bucket_id}")
-        return True
+        return DeleteResult(True, seq)
 
     async def restore(self, bucket_id: str, seq: int, actor=None) -> bool:
         """
@@ -653,33 +677,40 @@ class BucketManager:
             name = sanitize_name(str(meta.get("name", bucket_id)))
             file_path = str(safe_path(subdir, f"{name}_{bucket_id}.md"))
 
+        # --- Put the file in the directory the restored type belongs to, FIRST ---
+        # --- 先把檔案搬到「還原後的型別」該待的目錄，再寫內容 ---
+        # list_all() walks DIRECTORIES, not the type field. A file sitting in
+        # archive/ whose metadata says type:dynamic is a bucket that believes it
+        # is alive but never surfaces and never decays — invisible to everything
+        # except a direct get(), and revive() refuses to repair it because it
+        # only touches type=="archived". That is the one state we must never
+        # leave behind, so the move goes first: if it fails, nothing has changed
+        # and we say so. Writing type:dynamic before the move would put the
+        # failure case squarely on the ghost.
+        # list_all() 走的是「目錄」不是 type 欄位。躺在 archive/ 卻寫著 type:dynamic
+        # 的檔案，是個自以為活著、永不浮現也永不衰減的幽靈——除了直接 get() 對所有
+        # 東西都隱形，而 revive() 只認 type=="archived"，救不了它。那是唯一絕對不能
+        # 留下的狀態，所以搬移排在寫入前面：搬不動就什麼都沒動，並且照實回報。
+        # （archive() 的順序相反卻是對的：它失敗會落在 dynamic/+archived，
+        #   revive()/decay 都修得回來——兩邊都是朝安全的方向失敗。）
+        if os.path.dirname(os.path.realpath(file_path)) != os.path.realpath(
+            os.path.join(target_dir, sanitize_name(domain[0]) if domain else "未分類")
+        ):
+            try:
+                file_path = self._move_bucket(file_path, target_dir, domain)
+            except Exception as e:
+                logger.error(
+                    f"Restore could not relocate the bucket; nothing changed / "
+                    f"還原搬移失敗，桶維持原狀: {bucket_id}: {e}"
+                )
+                return False
+
         post = frontmatter.Post(row["content"], **meta)
         try:
             atomic_write_text(file_path, frontmatter.dumps(post))
         except OSError as e:
             logger.error(f"Restore write failed / 還原寫入失敗: {file_path}: {e}")
             return False
-
-        # --- Put the file back in the directory the restored type belongs to ---
-        # --- 把檔案放回「還原後的型別」該待的目錄 ---
-        # list_all() walks DIRECTORIES, not the type field. Writing type:dynamic
-        # into a file still sitting in archive/ would produce a bucket that
-        # believes it is alive but never surfaces and never decays — invisible
-        # to everything except a direct get(). Restoring an archived bucket to a
-        # pre-archive snapshot hits exactly this.
-        # list_all() 走的是「目錄」不是 type 欄位。把 type:dynamic 寫進一個還躺在
-        # archive/ 的檔案，會產生一個自以為活著、卻永不浮現也永不衰減的幽靈——
-        # 除了直接 get() 之外對所有東西都隱形。還原一個被歸檔的桶正好會撞上這個。
-        try:
-            if os.path.dirname(os.path.realpath(file_path)) != os.path.realpath(
-                os.path.join(target_dir, sanitize_name(domain[0]) if domain else "未分類")
-            ):
-                file_path = self._move_bucket(file_path, target_dir, domain)
-        except Exception as e:
-            logger.warning(
-                f"Restore wrote the file but could not relocate it / "
-                f"還原寫入成功但搬移失敗: {bucket_id}: {e}"
-            )
 
         logger.info(f"Restored bucket / 還原記憶桶: {bucket_id} → seq {seq}")
         return True

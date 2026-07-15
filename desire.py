@@ -478,12 +478,21 @@ def outreach(state: dict, medium: str, now: datetime, note: str = "", wake_id: s
     return new
 
 
-def feed(state: dict, drive: str, amount: float, now: datetime, event: str = "") -> dict:
+def feed(state: dict, drive: str, amount: float, now: datetime, event: str = "",
+         feed_id: str = "") -> dict:
     """
     餵一筆真實事件進某維（漲跌都行，amount 可為負）。
     drive="fatigue" 餵的是疲勞（真實 token 花費等訊號換算後傳入）。
+
+    feed_id：同一筆訊號的去重收據（機制與其他動詞的 wake_id 共用同一張收據表）。
+    feed 曾經是全部 mutator 裡唯一沒有收據的——satisfy/engage/defer/outreach/veto
+    都有。呼叫端重試安全的前提就是這個：Ombre 已經套用、只是回應在路上斷了，
+    下一輪不會再加一次。不傳就退回舊行為（不去重），呼叫端自己保證不重送。
+    （注意：別跟 events 條目裡那個隨機的 event_id 欄位搞混，那是每筆事件的流水號。）
     """
     new = json.loads(json.dumps(state))
+    if _has_wake_event(new, feed_id, f"feed:{drive}"):
+        return new
     amount = _clamp(float(amount), -1.0, 1.0)
     if drive == "fatigue":
         new["fatigue"] = round(_clamp(float(new.get("fatigue", 0.0)) + amount), 4)
@@ -492,7 +501,7 @@ def feed(state: dict, drive: str, amount: float, now: datetime, event: str = "")
         new["drives"][drive] = round(_clamp(cur + amount), 4)
     else:
         raise ValueError(f"未知的 drive: {drive}")
-    _log_event(new, now, f"feed:{drive}:{amount:+.2f}", event)
+    _log_event(new, now, f"feed:{drive}:{amount:+.2f}", event, wake_id=feed_id)
     return new
 
 
@@ -526,6 +535,13 @@ def set_gate(state: dict, gate: str, value: bool, now: datetime, note: str = "")
     return new
 
 
+def has_processed(state: dict, wake_id: str, kind_prefix: str) -> bool:
+    """這筆閉環動作算過了沒。公開給端點用：kernel 的去重是 early-return，回傳的
+    state 跟沒做過長得一樣，所以端點掛在外面的副作用（例如 veto 要建的念頭桶）
+    分辨不出來，會重複做。要在 mutate 的 fn 裡呼叫，才跟動詞看同一份 state。"""
+    return _has_wake_event(state, wake_id, kind_prefix)
+
+
 def _has_wake_event(state: dict, wake_id: str, kind_prefix: str) -> bool:
     """同一 wake 的同類結果只套用一次；不同動詞仍可各自留下。"""
     if not wake_id:
@@ -551,6 +567,15 @@ def _receipt_kind(kind: str) -> str:
     if len(parts) >= 3 and parts[0] == "satisfy" and parts[-1].startswith("d"):
         try:
             float(parts[-1][1:])
+            return ":".join(parts[:-1])
+        except ValueError:
+            pass
+    # feed:miss_ruby:-0.03 → feed:miss_ruby。金額必須摺掉，否則註冊的 key 帶著金額、
+    # 探詢的 key 不帶，兩邊永遠對不上——去重會靜默失效，只剩 events 掃描僥倖命中，
+    # 而 events 會被 MAX_EVENTS 裁掉。收據就是為了在那之後還活著才存在的。
+    if len(parts) >= 3 and parts[0] == "feed":
+        try:
+            float(parts[-1])
             return ":".join(parts[:-1])
         except ValueError:
             pass
