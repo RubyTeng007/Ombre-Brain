@@ -61,6 +61,20 @@ decay:
     base: 1.0                     # Base weight / 基础权重
     arousal_boost: 0.8            # Arousal boost coefficient / 唤醒度加成系数
 
+  # --- Heat / 熱度：可提取度（0~1），與上面的 score 是兩個不同的量 ---
+  # score 管「該不該留」（無界，驅動歸檔）；heat 管「還記不記得清」（驅動注入分層）。
+  # 只作用在「浮現」，不作用在「查詢」——開口問就給全文。
+  heat:
+    halflife_base_days: 7.0       # 一般記憶(imp5/act1/A0.3)實際半衰 ≈ 8.7 天
+                                  # 照本語料校準：候選中位數距上次被用到 9.9 天。
+                                  # 調小→更多記憶消音；調大→漸層消失（20 時 92% 全鮮明）
+    threshold_high: 0.7           # > 此值：全文注入（嚴格 >）
+    threshold_medium: 0.3         # > 此值：截短 +（印象模糊）；<= 此值：不注入、只留墓碑
+    medium_truncate: 60           # 非 JSON 短桶的模糊層字元截斷（JSON 桶改取 summary 欄）
+    danger_min: 0.15              # 危險區下界：低於此＝已經沒了，不撈（重學不是複習）
+    danger_max: 0.35              # 危險區上界：高於此＝還鮮明，不需要救
+                                  # 峰值 = 兩者中點 = 0.25，不是常數，改任一個就跟著跑
+
 # --- Embedding / 向量化配置 ---
 # Uses embedding API for semantic similarity search
 # 通过 embedding API 实现语义相似度搜索

@@ -277,7 +277,24 @@ class Dehydrator:
         if not self.api_available:
             raise RuntimeError("脫水 API 不可用，請配置 OMBRE_API_KEY")
 
-        result = await self._api_dehydrate(content)
+        result, complete = await self._api_dehydrate(content)
+        if not complete:
+            # A truncated summary must NEVER reach the cache. Cached, it stops
+            # being one bad call and becomes the memory's permanent face —
+            # served on every breath, with no error anywhere to say so.
+            # 截斷的摘要絕不能進快取。一旦進了，它就不再是「一次失敗的呼叫」，
+            # 而變成這條記憶的永久臉孔——每次呼吸都供應，而且沒有任何錯誤會說。
+            logger.error(
+                "Dehydration TRUNCATED even after retry — not caching / "
+                "脫水輸出重試後仍被截斷，不進快取: %s…",
+                content[:60],
+            )
+            # Say it in the output, same rule as the blur label: never hand over
+            # a fragment and let the reader believe it is the whole thing.
+            # 在輸出裡說出來，跟「（印象模糊）」同一條規矩：
+            # 絕不遞出一個殘片、讓讀的人以為那就是全部。
+            result = result.rstrip() + "\n（⚠ 這份摘要被壓縮器的輸出上限截斷了，不完整、也沒有進快取。要全文用 breath(query=…) 去問。）"
+            return self._format_output(result, metadata)
         # --- Cache the result ---
         self._set_cached_summary(content, result)
         return self._format_output(result, metadata)
@@ -302,7 +319,21 @@ class Dehydrator:
         if not self.api_available:
             raise RuntimeError("脫水 API 不可用，請檢查 config.yaml 中的 dehydration 配置")
         try:
-            result = await self._api_merge(old_content, new_content)
+            result, complete = await self._api_merge(old_content, new_content)
+            if not complete:
+                # A truncated merge is worse than a truncated summary: the
+                # summary poisons a cache, this overwrites the bucket's own
+                # body — the source of truth — with an amputated version.
+                # Refusing sends _merge_or_create down its existing fail-closed
+                # path, which creates a new bucket instead. That is the right
+                # trade and the code already says so: 重複可救，誤併不可逆.
+                # 截斷的合併比截斷的摘要嚴重：摘要毒的是快取，這個是拿殘肢
+                # 覆蓋桶的正文本身——真相來源。拒絕之後 _merge_or_create 會走
+                # 它既有的 fail-closed 路徑改為新建一個桶。那是對的取捨，
+                # 而且程式碼自己早就寫了：重複可救，誤併不可逆。
+                raise RuntimeError(
+                    "API 合併輸出被 max_tokens 截斷，拒絕寫入（重複可救，誤併不可逆）"
+                )
             if result:
                 return result
             raise RuntimeError("API 合併返回空結果")
@@ -315,46 +346,72 @@ class Dehydrator:
     # API call: dehydration
     # API 調用：脫水壓縮
     # ---------------------------------------------------------
-    async def _api_dehydrate(self, content: str) -> str:
+    async def _complete(self, system_prompt: str, user_msg: str) -> tuple[str, bool]:
+        """
+        One completion, with the output-cap trapdoor closed.
+        Returns (text, complete). complete=False means the model hit max_tokens
+        and the text is cut off mid-token — for JSON output that is a broken
+        blob, for a merge it is silently amputated memory.
+        回傳 (文字, 是否完整)。complete=False 代表模型撞到 max_tokens、
+        字串被切在半路——對 JSON 輸出來說那是壞掉的 blob，對合併來說那是
+        被無聲截肢的記憶。
+
+        We never read finish_reason before. That is how 畫像我們的模樣 ended up
+        cached with its JSON severed at `"下一本共讀書待定", "` — the 1024-token
+        cap cut the model mid-string, and the broken text was written into
+        dehydration_cache.db and served on every single breath from then on.
+        The provider was telling us the whole time; nobody was listening.
+        我們從來沒讀過 finish_reason。這就是「畫像我們的模樣」的 JSON 被切在
+        `"下一本共讀書待定", "` 還進了快取、之後每一次呼吸都供應同一份殘缺的
+        原因——1024 上限把模型切在字串中間。供應商一直在講，只是沒人在聽。
+
+        Retry once with double room: hitting the cap means the model needed more
+        space, and asking again with the same budget would just fail identically.
+        撞到上限就是模型需要更多空間，用同樣的額度再問一次只會一模一樣地失敗。
+        """
+        budget = self.max_tokens
+        text = ""
+        for _ in (1, 2):
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=budget,
+                temperature=self.temperature,
+            )
+            if not response.choices:
+                return "", False
+            choice = response.choices[0]
+            text = choice.message.content or ""
+            if getattr(choice, "finish_reason", None) != "length":
+                return text, True
+            logger.warning(
+                f"LLM output hit the {budget}-token cap, retrying with double room / "
+                f"輸出撞到 {budget} token 上限，加倍重試"
+            )
+            budget *= 2
+        return text, False
+
+    async def _api_dehydrate(self, content: str) -> tuple[str, bool]:
         """
         Call LLM API for intelligent dehydration (via OpenAI-compatible client).
         調用 LLM API 執行智能脫水。
         """
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": DEHYDRATE_PROMPT},
-                {"role": "user", "content": content[:3000]},
-            ],
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-        )
-        if not response.choices:
-            return ""
-        return response.choices[0].message.content or ""
+        return await self._complete(DEHYDRATE_PROMPT, content[:3000])
 
     # ---------------------------------------------------------
     # API call: merge
     # API 調用：合併
     # ---------------------------------------------------------
-    async def _api_merge(self, old_content: str, new_content: str) -> str:
+    async def _api_merge(self, old_content: str, new_content: str) -> tuple[str, bool]:
         """
         Call LLM API for intelligent merge (via OpenAI-compatible client).
         調用 LLM API 執行智能合併。
         """
         user_msg = f"舊記憶：\n{old_content[:2000]}\n\n新內容：\n{new_content[:2000]}"
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": MERGE_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-        )
-        if not response.choices:
-            return ""
-        return response.choices[0].message.content or ""
+        return await self._complete(MERGE_PROMPT, user_msg)
 
 
 

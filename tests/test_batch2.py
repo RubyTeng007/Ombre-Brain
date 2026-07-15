@@ -34,6 +34,15 @@ def wired(test_config, bucket_mgr, mock_embedding_engine, mock_dehydrator, monke
     decay_stub = MagicMock()
     decay_stub.ensure_started = AsyncMock()
     decay_stub.calculate_score = lambda meta: 5.0
+    # Heat stubs (2026-07-15 batch): everything reads fully vivid, so these
+    # tests keep testing what they are about (cooldown, domain, token budget)
+    # and not the heat tiers — those live in test_batch5.
+    # 熱度樁：一律讀成完全鮮明，讓這些測試繼續測它們原本要測的東西
+    # （冷卻、域、token 預算），熱度分層在 test_batch5。
+    decay_stub.calculate_heat = lambda meta: 1.0
+    decay_stub.heat_tier = lambda heat: "vivid"
+    decay_stub.review_priority = lambda heat: 0.0
+    decay_stub.heat_truncate = 60
     monkeypatch.setattr(srv, "config", test_config)
     monkeypatch.setattr(srv, "bucket_mgr", bucket_mgr)
     monkeypatch.setattr(srv, "embedding_engine", mock_embedding_engine)
@@ -176,14 +185,31 @@ class TestSurfaceCooldown:
         assert wanted in out
         assert unwanted not in out
 
-    def test_pinned_respects_shared_result_cap(self, wired, bucket_mgr):
+    def test_pinned_do_not_spend_the_dynamic_result_cap(self, wired, bucket_mgr):
+        """Contract CHANGED 2026-07-15 (was: test_pinned_respects_shared_result_cap).
+
+        Pinned buckets used to count against max_results. That starved the
+        dynamic pool dead in real use: 5 pinned buckets and the documented
+        opening call (max_results=5) meant candidates[:0] — 360 eligible
+        memories, zero surfaced, at any token budget.
+
+        Pinned are RESIDENT, not surfaced, so max_results now caps DYNAMIC
+        results only. Capping pinned at "half the slots" was rejected: it only
+        pushes the bug one bucket away, and a 6th pinned bucket revives it.
+        契約已改：釘選是常駐不是被浮現，max_results 現在只管動態結果。
+        """
         for i in range(3):
             _run(bucket_mgr.create(
                 content=f"核心準則{i}", name=f"核心準則{i}", domain=["自省"],
                 pinned=True, bucket_type="permanent",
             ))
+        dyn = _run(bucket_mgr.create(content="動態記憶", name="動態記憶"))
         out = _run(wired.breath(max_results=1, max_tokens=10000))
-        assert out.count("bucket_id:") == 1
+        # All 3 pinned still show...
+        assert out.count("[核心準則]") == 3
+        # ...and the single dynamic slot is still honoured, not eaten.
+        assert dyn in out
+        assert out.count("bucket_id:") == 4
 
     def test_complete_surface_response_respects_token_budget(self, wired, bucket_mgr):
         for i in range(3):

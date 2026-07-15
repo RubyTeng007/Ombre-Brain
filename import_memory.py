@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 from utils import count_tokens_approx, now_iso
+from bucket_history import Actor
 
 logger = logging.getLogger("ombre_brain.import")
 
@@ -653,6 +654,12 @@ class ImportEngine:
                     old_a = bucket["metadata"].get("arousal", 0.3)
                     await self.bucket_mgr.update(
                         bucket["id"],
+                        # A bulk import merging into a bucket that already had
+                        # content is one of the most destructive writes here —
+                        # and the one least likely to be watched while it runs.
+                        # 大量匯入去合併一個本來就有內容的桶，是這裡最具破壞性
+                        # 的寫入之一——也是最不可能有人盯著它跑的那一種。
+                        actor=Actor("ruby", "import:merge"),
                         content=merged,
                         tags=list(set(bucket["metadata"].get("tags", []) + tags)),
                         importance=max(bucket["metadata"].get("importance", 5), importance),

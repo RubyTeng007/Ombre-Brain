@@ -24,7 +24,33 @@ import asyncio
 import logging
 from datetime import datetime
 
+from utils import NON_DECAYING_TYPES, is_decay_exempt, parse_bucket_ts
+from bucket_history import ACTOR_DECAY
+
 logger = logging.getLogger("ombre_brain.decay")
+
+# Fixed scores for the types that never decay. Membership lives in ONE place
+# (utils.NON_DECAYING_TYPES) and is shared with calculate_heat; only the values
+# are local, because score and heat answer different questions about the same
+# exempt set.
+# 不衰減桶型的固定分。成員資格只有一份（utils.NON_DECAYING_TYPES），與熱度共用；
+# 只有「值」留在本地，因為分數和熱度對同一組豁免問的是不同的問題。
+_EXEMPT_SCORES = {
+    "permanent": 999.0,
+    "feel": 50.0,
+    "plan": 50.0,
+    "mirage": 30.0,
+}
+
+# Fail at import, not inside calculate_score: run_decay_cycle swallows every
+# exception from it, so a KeyError there would silently look like "skipped".
+# 在載入時就炸，不要炸在 calculate_score 裡面：run_decay_cycle 會吞掉它拋的
+# 所有例外，KeyError 在那裡看起來就只是「跳過」。
+if set(_EXEMPT_SCORES) != set(NON_DECAYING_TYPES):
+    raise RuntimeError(
+        "decay exemption drift / 衰減豁免清單漂移: "
+        f"NON_DECAYING_TYPES={NON_DECAYING_TYPES} vs _EXEMPT_SCORES={tuple(_EXEMPT_SCORES)}"
+    )
 
 
 class DecayEngine:
@@ -48,6 +74,27 @@ class DecayEngine:
         emotion_cfg = decay_cfg.get("emotion_weights", {})
         self.emotion_base = emotion_cfg.get("base", 1.0)
         self.arousal_boost = emotion_cfg.get("arousal_boost", 0.8)
+
+        # --- Heat params (retrievability, a separate 0-1 quantity) ---
+        # --- 熱度參數（可提取度，獨立的 0~1 量）---
+        # halflife_base_days=7 is calibrated against THIS corpus, not copied:
+        # kiwi-mem's 3-day half-life would push our median bucket (9.9 days
+        # since last engaged) to heat 0.10 and mute ~90% of the pool. Ours is a
+        # long-lived store, not a high-churn chat companion.
+        # 7 天是照我們自己的語料校準的，不是抄來的：kiwi-mem 的 3 天半衰期
+        # 會把我們的中位桶（距上次真正被用到 9.9 天）壓到 0.10，九成記憶消音。
+        heat_cfg = decay_cfg.get("heat", {})
+        self.heat_halflife_base = float(heat_cfg.get("halflife_base_days", 7.0))
+        self.heat_high = float(heat_cfg.get("threshold_high", 0.7))
+        self.heat_medium = float(heat_cfg.get("threshold_medium", 0.3))
+        self.heat_truncate = int(heat_cfg.get("medium_truncate", 60))
+        # Danger zone for review priority — cortexgraph's shipped defaults.
+        # 0.25 is NOT a constant anywhere: it is the midpoint of these two, so
+        # moving either moves the peak.
+        # 危險區（複習優先度）——cortexgraph 實裝預設。0.25 不是常數，
+        # 是這兩個的中點，改任一個峰值就跟著跑。
+        self.danger_min = float(heat_cfg.get("danger_min", 0.15))
+        self.danger_max = float(heat_cfg.get("danger_max", 0.35))
 
         self.bucket_mgr = bucket_mgr
         # Optional: embedding engine for the daily vector-hygiene sweep
@@ -87,6 +134,30 @@ class DecayEngine:
         hours = days_since * 24.0
         return 1.0 + 1.0 * math.exp(-hours / 36.0)
 
+    @staticmethod
+    def _days_since_active(metadata: dict) -> float:
+        """
+        Days since this bucket was last ENGAGED with (touch), not merely shown
+        (mark_surfaced). One parser for both score and heat — two would drift.
+        距上次「真正被用到」（touch）的天數，不是「被看到」（mark_surfaced）。
+        分數與熱度共用一個解析器——兩個遲早會不一致。
+
+        Uses parse_bucket_ts, which normalizes tz-aware timestamps to local
+        naive. The old inline parse fell into its 30-day fallback on any
+        tz-aware value (datetime.now() is naive → TypeError), silently aging a
+        fresh memory to a month old. Zero live buckets carry an offset today
+        (verified 2026-07-15: 648/648 naive), so this changes no current score
+        — it just closes the trapdoor for a hand-edited file.
+        用 parse_bucket_ts（會把帶時區的正規化成本地 naive）。舊的行內解析
+        碰到帶時區的值會掉進 30 天 fallback（datetime.now() 是 naive → TypeError），
+        把新記憶靜默算成一個月大。今天 live 沒有任何桶帶時區（2026-07-15 驗過
+        648/648 naive），所以這不改變任何現有分數，只是把手編輯的活門關上。
+        """
+        ts = parse_bucket_ts(metadata.get("last_active", metadata.get("created", "")))
+        if ts is None:
+            return 30.0
+        return max(0.0, (datetime.now() - ts).total_seconds() / 86400)
+
     def calculate_score(self, metadata: dict) -> float:
         """
         Calculate current activity score for a memory bucket.
@@ -102,42 +173,29 @@ class DecayEngine:
         if not isinstance(metadata, dict):
             return 0.0
 
-        # --- Pinned/protected buckets: never decay, importance locked to 10 ---
+        # --- Exempt buckets: never decay, fixed score by type ---
+        # --- 豁免桶：不衰減，依型別給固定分 ---
+        # Pinned/protected is checked FIRST and separately: a pinned bucket of
+        # any type is locked at the top, so this order must stay ahead of the
+        # type map (a pinned feel bucket scores 999, not 50).
+        # 釘選/保護要先檢查且分開檢查：任何型別的釘選桶都鎖在頂端，
+        # 所以這個順序必須排在型別表前面（釘選的 feel 桶是 999 不是 50）。
+        # Values live here; membership lives in utils.NON_DECAYING_TYPES,
+        # shared with calculate_heat so the two can never drift apart.
+        # 值在這裡；成員資格在 utils.NON_DECAYING_TYPES，與熱度共用，永不分家。
+        # feel/plan = 50 (sediment), mirage = 30 (a dream is residue, not
+        # sediment), permanent = 999.
         if metadata.get("pinned") or metadata.get("protected"):
             return 999.0
-
-        # --- Permanent buckets never decay ---
-        if metadata.get("type") == "permanent":
-            return 999.0
-
-        # --- Feel buckets: never decay, fixed moderate score ---
-        if metadata.get("type") == "feel":
-            return 50.0
-
-        # --- Plan buckets (promise ledger): never decay, fixed score.
-        # They only surface in dream's tail; the fixed value is for displays. ---
-        # --- plan 桶（承諾帳本）：不衰減，固定分。只在 dream 尾端浮現，固定值僅供顯示。---
-        if metadata.get("type") == "plan":
-            return 50.0
-
-        # --- Dream buckets (2026-07-12 batch-2): own private channel, never
-        # decay-cycled; lower fixed value than feel — a dream is residue,
-        # not sediment. ---
-        # --- dream 桶（第二批）：獨立私人通道、不進衰減循環；固定值低於
-        # feel——夢是殘影，不是沉澱。---
-        if metadata.get("type") == "mirage":
-            return 30.0
+        bucket_type = metadata.get("type")
+        if bucket_type in NON_DECAYING_TYPES:
+            return _EXEMPT_SCORES[bucket_type]
 
         importance = max(1, min(10, int(metadata.get("importance", 5))))
         activation_count = max(1.0, float(metadata.get("activation_count", 1)))
 
         # --- Days since last activation ---
-        last_active_str = metadata.get("last_active", metadata.get("created", ""))
-        try:
-            last_active = datetime.fromisoformat(str(last_active_str))
-            days_since = max(0.0, (datetime.now() - last_active).total_seconds() / 86400)
-        except (ValueError, TypeError):
-            days_since = 30
+        days_since = self._days_since_active(metadata)
 
         # --- Emotion weight ---
         try:
@@ -190,6 +248,125 @@ class DecayEngine:
         return round(base_score * resolved_factor * urgency_boost, 4)
 
     # ---------------------------------------------------------
+    # Heat: how retrievable a memory still is. A SEPARATE quantity from score.
+    # 熱度：這條記憶還有多想得起來。與 score 是「兩個」量，不是同一個。
+    #
+    # score answers "should this stay?"    → unbounded (live range 0.18–40.75),
+    #                                        drives archive triage.
+    # heat  answers "do I still recall it?" → a true 0-1 probability-shaped
+    #                                        number, drives injection tier.
+    # score 問「該不該留」→ 無界（live 實測 0.18–40.75），管歸檔分流。
+    # heat  問「還記不記得清」→ 真的 0~1，管注入分層。
+    #
+    # These were conflated, which is exactly why there was no middle tier: the
+    # only way to score low was resolved(×0.05)/digested(×0.2), and surfacing
+    # excludes both — so "fading" and "can surface" were mutually exclusive and
+    # the surfacing pool's floor sat at 1.09. Applying 0.7/0.3 to score would
+    # have tiered 86% / 13% / ONE bucket, and the 13% were all resolved, i.e.
+    # already excluded: a no-op.
+    # 這兩件事被混在一起，正是「沒有中間格」的根因：低分的唯一來路是
+    # resolved(×0.05)/digested(×0.2)，而浮現把兩者都排除——所以「正在淡掉」和
+    # 「能被浮現」互斥，浮現池的地板卡在 1.09。0.7/0.3 套在 score 上會分成
+    # 86%/13%/一個桶，而那 13% 全是 resolved（本來就被排除）＝空操作。
+    #
+    # Form is kiwi-mem's (2^(-age/half_life), main.py:868 + database.py:804-904);
+    # the stability model is ours — kiwi-mem has only two half-lives (3d/7d),
+    # we scale continuously. NOTE: the "retrievability" framing is Ombre's own
+    # design, NOT inherited: cortexgraph's score is unbounded too (verified
+    # 2026-07-15, decay.py:26-78) and has no retrievability concept.
+    # 形式抄 kiwi-mem；穩定度模型是我們自己的（它只有 3天/7天 兩檔，我們連續）。
+    # 注意：「可提取度」這個框架是 Ombre 自己的設計，不是繼承來的——
+    # cortexgraph 的 score 一樣無界（2026-07-15 驗證），它沒有可提取度概念。
+    #
+    # calculate_score above is UNTOUCHED by this addition: arousal appearing
+    # twice and the weight flip at 3 days are deliberate and correct.
+    # 上面的 calculate_score 完全未被本次新增改動：arousal 出現兩次、
+    # 三天處權重翻轉，都是刻意且正確的。
+    # ---------------------------------------------------------
+    def calculate_heat(self, metadata: dict) -> float:
+        """
+        Retrievability of a memory, 0.0–1.0. 1.0 = fully vivid, 0.25 = you'd
+        fail to recall it three times in four.
+        記憶的可提取度 0.0–1.0。1.0＝完全鮮明，0.25＝四次有三次想不起來。
+
+        heat = 2 ^ (-days_since / H)
+        H    = halflife_base × (importance/5) × (activation^0.3) × emotion_weight
+
+        Exempt buckets return 1.0 — same exemption set as calculate_score.
+        豁免桶回 1.0——與 calculate_score 同一組豁免。
+        """
+        if not isinstance(metadata, dict):
+            return 0.0
+        if is_decay_exempt(metadata):
+            return 1.0
+
+        days_since = self._days_since_active(metadata)
+
+        importance = max(1, min(10, int(metadata.get("importance", 5) or 5)))
+        try:
+            activation = max(1.0, float(metadata.get("activation_count", 1) or 1))
+        except (ValueError, TypeError):
+            activation = 1.0
+        try:
+            arousal = max(0.0, min(1.0, float(metadata.get("arousal", 0.3))))
+        except (ValueError, TypeError):
+            arousal = 0.3
+
+        # Same emotion coefficients as the score — one claim ("high arousal
+        # makes memory durable"), so retuning it must move both.
+        # 情感係數與分數共用——同一個主張（高喚醒讓記憶耐久），
+        # 重新調校時兩邊必須一起動。
+        emotion_weight = self.emotion_base + arousal * self.arousal_boost
+        half_life = (
+            self.heat_halflife_base
+            * (importance / 5.0)
+            * (activation ** 0.3)
+            * emotion_weight
+        )
+        return max(0.0, min(1.0, 2.0 ** (-days_since / max(0.1, half_life))))
+
+    def heat_tier(self, heat: float) -> str:
+        """
+        Injection tier for a heat value: vivid | faded | lost.
+        注入分層：鮮明 | 模糊 | 已失去。
+
+        Boundaries are STRICT > (copied exactly from kiwi-mem main.py:885-903):
+        heat == 0.7 is 'faded', heat == 0.3 is 'lost'.
+        邊界是嚴格 >（逐字照抄 kiwi-mem）：0.7 算模糊，0.3 算已失去。
+        """
+        if heat > self.heat_high:
+            return "vivid"
+        if heat > self.heat_medium:
+            return "faded"
+        return "lost"
+
+    def review_priority(self, heat: float) -> float:
+        """
+        How badly a memory needs resurfacing before it is lost, 0.0–1.0.
+        Peaks at the danger-zone midpoint (0.25 by default) and is hard-gated
+        to 0.0 outside [danger_min, danger_max] — past the floor it is already
+        gone, and digging it up is relearning, not review.
+        一條記憶在消失前多需要被撈上來，0.0–1.0。峰值在危險區中點（預設 0.25），
+        窗口外硬歸零——低於地板就是已經沒了，挖它是重學不是複習。
+
+        Ported from cortexgraph review.py:15-58. The x fed to 1-x² is NOT the
+        heat: it is heat re-centered on the midpoint and rescaled to [-1, 1].
+        Feeding raw heat in would peak at 0 (i.e. on already-dead memories) —
+        the exact inversion of the intent.
+        移植自 cortexgraph review.py:15-58。餵進 1-x² 的 x 不是熱度本身，
+        是「以中點為原點、重新縮放到 [-1,1]」後的偏移量。直接餵熱度會讓峰值
+        落在 0（已經死掉的記憶）——與本意完全相反。
+        """
+        if heat < self.danger_min or heat > self.danger_max:
+            return 0.0
+        midpoint = (self.danger_min + self.danger_max) / 2.0
+        range_half = (self.danger_max - self.danger_min) / 2.0
+        if range_half <= 0:
+            return 0.0
+        normalized = (heat - midpoint) / range_half
+        return max(0.0, min(1.0, 1.0 - normalized ** 2))
+
+    # ---------------------------------------------------------
     # Execute one decay cycle
     # 執行一輪衰減週期
     # Scan all dynamic buckets → score → archive those below threshold
@@ -217,9 +394,14 @@ class DecayEngine:
         for bucket in buckets:
             meta = bucket.get("metadata", {})
 
-            # Skip permanent / pinned / protected / feel / plan buckets
-            # 跳過固化桶、釘選/保護桶、feel 桶和 plan 桶
-            if meta.get("type") in ("permanent", "feel", "plan", "mirage") or meta.get("pinned") or meta.get("protected"):
+            # Skip permanent / pinned / protected / feel / plan / mirage buckets
+            # 跳過固化桶、釘選/保護桶、feel、plan、mirage 桶
+            # Was a local tuple — decay_engine used to carry two separate
+            # representations of this same set (this tuple and calculate_score's
+            # if-chain). Now both go through the one shared predicate.
+            # 這裡本來是一個本地 tuple——decay_engine 自己曾有兩份同一組豁免的
+            # 寫法（這個 tuple 和 calculate_score 的 if 串）。現在共用一個判斷。
+            if is_decay_exempt(meta):
                 continue
 
             checked += 1
@@ -236,7 +418,7 @@ class DecayEngine:
                     days_since = 999
                 if imp <= 4 and days_since > 30:
                     try:
-                        await self.bucket_mgr.update(bucket["id"], resolved=True)
+                        await self.bucket_mgr.update(bucket["id"], resolved=True, actor=ACTOR_DECAY)
                         meta["resolved"] = True  # refresh local meta so resolved_factor applies this cycle
                         auto_resolved += 1
                         logger.info(
@@ -262,7 +444,7 @@ class DecayEngine:
             # --- 低於閾值 → 歸檔（模擬遺忘）---
             if score < self.threshold:
                 try:
-                    success = await self.bucket_mgr.archive(bucket["id"])
+                    success = await self.bucket_mgr.archive(bucket["id"], actor=ACTOR_DECAY)
                     if success:
                         archived += 1
                         logger.info(

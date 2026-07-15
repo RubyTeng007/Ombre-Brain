@@ -202,6 +202,20 @@ def default_state(now: datetime | None = None) -> dict[str, Any]:
         "saturated": {},           # 高位消退中的維度（hysteresis 狀態，2026-07-12）
         "events": [],              # 每一筆漲跌的來歷
         # 永久結果收據不跟 60 筆展示窗一起蒸發；同一 wake 重送只套用一次。
+        #
+        # ⚠ 不要清這個 dict。不要加 TTL、不要加「只留最近 N 筆」、不要在遷移時
+        # 順手砍掉。2026-07-15 起它是 Session A 喚醒帳本的承重結構：autonomy.ts
+        # 的 fireDesire() 敢無限重試補記帳，唯一的理由就是「重送同一個 wake 只會
+        # 被套用一次」——而那個保證完全來自這裡的永久性。清掉任何一筆收據，
+        # 那一筆的重試就會變成重複記帳，而且不會有任何錯誤訊息告訴你。
+        # 真的必須加保留窗口的話，先確定窗口大於 A 的最大重試窗口，並且是跟
+        # Ruby 一起決定的，不是自己判斷的。
+        # ⚠ Do not clear this dict — no TTL, no last-N cap, no migration sweep.
+        # Since 2026-07-15 it is the load-bearing half of Session A's wake
+        # ledger: fireDesire() dares to retry forever only because replaying a
+        # wake applies exactly once, and that guarantee lives entirely in this
+        # dict's permanence. Dropping a receipt turns its retry into a double
+        # entry, silently.
         "processed_wake_receipts": {},
         # state 是真相；ledger 是 append-only 副本。待寫事件先隨 state 落盤。
         "ledger_pending": [],

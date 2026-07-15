@@ -26,6 +26,7 @@
 # ============================================================
 
 import os
+import json
 import math
 import random
 import secrets
@@ -166,7 +167,14 @@ class BucketManager:
     天然兼容 Obsidian 直接瀏覽和編輯。
     """
 
-    def __init__(self, config: dict, embedding_engine=None):
+    def __init__(self, config: dict, embedding_engine=None, history=None):
+        # --- Optional bucket_history.BucketHistory: snapshots every
+        # destructive write so it can be undone. None = no history recorded
+        # (tests, imports). Injected like embedding_engine.
+        # --- 可選的歷史表：每次破壞性寫入前存快照，讓它可以被還原。
+        # None = 不記歷史（測試、匯入腳本）。比照 embedding_engine 注入。---
+        self.history = history
+
         # --- Read storage paths from config / 從配置中讀取存儲路徑 ---
         self.base_dir = config["buckets_dir"]
         self.permanent_dir = os.path.join(self.base_dir, "permanent")
@@ -403,10 +411,18 @@ class BucketManager:
     # 更新桶
     # Supports: content, tags, importance, valence, arousal, name, resolved
     # ---------------------------------------------------------
-    async def update(self, bucket_id: str, **kwargs) -> bool:
+    async def update(self, bucket_id: str, actor=None, **kwargs) -> bool:
         """
         Update bucket content or metadata fields.
         更新桶的內容或元數據字段。
+
+        actor: a bucket_history.Actor saying who is doing this. Snapshots the
+        pre-change state so the write is recoverable. Defaults to an unattributed
+        system write rather than refusing — an unattributed history row is still
+        worth far more than no row.
+        actor：bucket_history.Actor，說明這是誰做的。會先存變更前的快照讓這次寫入
+        可復原。沒傳就記成無歸屬的系統寫入而不是拒絕——沒有歸屬的歷史列，
+        仍然遠比沒有列有價值。
         """
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
@@ -417,6 +433,28 @@ class BucketManager:
         except Exception as e:
             logger.warning(f"Failed to load bucket for update / 加載桶失敗: {file_path}: {e}")
             return False
+
+        # --- Snapshot BEFORE any mutation ---
+        # --- 任何變更之前先存快照 ---
+        # This sits inside update() rather than at the call sites on purpose:
+        # update() is the single choke point every destructive metadata/content
+        # write funnels through, so nothing can forget to checkpoint. (Letta
+        # requires an explicit checkpoint_block call, which can be forgotten.)
+        # touch()/mark_surfaced() deliberately do NOT come through here — they
+        # only bump counters, and snapshotting every surfacing would bury the
+        # real edits in noise.
+        # 這放在 update() 裡而不是放在各呼叫點，是刻意的：update() 是所有破壞性
+        # 寫入的唯一收口，所以不可能有人忘記存檔。（Letta 要求明確呼叫 checkpoint，
+        # 那是會被忘記的。）touch()/mark_surfaced() 刻意不走這裡——它們只加計數器，
+        # 每次浮現都存快照會把真正的編輯埋進雜訊裡。
+        if self.history is not None:
+            self.history.snapshot(
+                bucket_id,
+                post.content,
+                dict(post.metadata),
+                op="update",
+                actor=actor,
+            )
 
         # --- Pinned/protected buckets: lock importance to 10, ignore importance changes ---
         # --- 釘選/保護桶：importance 不可修改，強制保持 10 ---
@@ -532,14 +570,32 @@ class BucketManager:
     # Delete bucket
     # 刪除桶
     # ---------------------------------------------------------
-    async def delete(self, bucket_id: str) -> bool:
+    async def delete(self, bucket_id: str, actor=None) -> bool:
         """
         Delete a memory bucket file.
         刪除指定的記憶桶文件。
+
+        Snapshots first. This is the one operation with no other way back:
+        archive/revive only move the file (it still exists on disk), but delete
+        unlinks it and drops the embedding. Before this snapshot existed,
+        trace(delete=True) was the single truly irreversible call in the system.
+        先存快照。這是唯一沒有別條退路的操作：archive/revive 只是搬檔案（檔案還在），
+        但 delete 會 unlink 並刪掉向量。在有這個快照之前，trace(delete=True)
+        是整個系統裡唯一真正不可逆的呼叫。
         """
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
+
+        if self.history is not None:
+            try:
+                post = frontmatter.load(file_path)
+                self.history.snapshot(
+                    bucket_id, post.content, dict(post.metadata),
+                    op="delete", actor=actor,
+                )
+            except Exception as e:
+                logger.warning(f"Pre-delete snapshot failed / 刪除前快照失敗: {bucket_id}: {e}")
 
         try:
             os.remove(file_path)
@@ -549,6 +605,96 @@ class BucketManager:
 
         logger.info(f"Deleted bucket / 刪除記憶桶: {bucket_id}")
         return True
+
+    async def restore(self, bucket_id: str, seq: int, actor=None) -> bool:
+        """
+        Restore a bucket to the state recorded at history `seq`.
+        把桶還原到歷史第 seq 版的狀態。
+
+        The restore is itself a write, so it snapshots the current state first —
+        which means an unwanted restore is itself undoable, and you can land on
+        any seq rather than stepping ±1. Works on a deleted bucket too: the file
+        is recreated from the snapshot.
+        還原本身也是一次寫入，所以它會先把當下狀態存起來——這代表「還原錯了」
+        本身也可以再還原回去，而且能直接跳到任一版而不是一步步 ±1。
+        對已刪除的桶也有效：檔案會從快照重建。
+        """
+        if self.history is None:
+            return False
+        row = self.history.get(bucket_id, seq)
+        if not row:
+            return False
+
+        try:
+            meta = json.loads(row["meta"])
+        except Exception as e:
+            logger.error(f"Restore failed, unreadable snapshot / 快照無法解析: {bucket_id}#{seq}: {e}")
+            return False
+
+        domain = meta.get("domain", ["未分類"])
+        target_dir = self._dir_for_type(meta.get("type", "dynamic"))
+
+        file_path = self._find_bucket_file(bucket_id)
+        if file_path:
+            try:
+                current = frontmatter.load(file_path)
+                self.history.snapshot(
+                    bucket_id, current.content, dict(current.metadata),
+                    op="restore", actor=actor,
+                )
+            except Exception as e:
+                logger.warning(f"Pre-restore snapshot failed / 還原前快照失敗: {bucket_id}: {e}")
+        else:
+            # Bucket was deleted — recreate it where its snapshot says it lives.
+            # 桶已被刪除——照快照說它該在的地方重建。
+            primary = sanitize_name(domain[0]) if domain else "未分類"
+            subdir = os.path.join(target_dir, primary)
+            os.makedirs(subdir, exist_ok=True)
+            name = sanitize_name(str(meta.get("name", bucket_id)))
+            file_path = str(safe_path(subdir, f"{name}_{bucket_id}.md"))
+
+        post = frontmatter.Post(row["content"], **meta)
+        try:
+            atomic_write_text(file_path, frontmatter.dumps(post))
+        except OSError as e:
+            logger.error(f"Restore write failed / 還原寫入失敗: {file_path}: {e}")
+            return False
+
+        # --- Put the file back in the directory the restored type belongs to ---
+        # --- 把檔案放回「還原後的型別」該待的目錄 ---
+        # list_all() walks DIRECTORIES, not the type field. Writing type:dynamic
+        # into a file still sitting in archive/ would produce a bucket that
+        # believes it is alive but never surfaces and never decays — invisible
+        # to everything except a direct get(). Restoring an archived bucket to a
+        # pre-archive snapshot hits exactly this.
+        # list_all() 走的是「目錄」不是 type 欄位。把 type:dynamic 寫進一個還躺在
+        # archive/ 的檔案，會產生一個自以為活著、卻永不浮現也永不衰減的幽靈——
+        # 除了直接 get() 之外對所有東西都隱形。還原一個被歸檔的桶正好會撞上這個。
+        try:
+            if os.path.dirname(os.path.realpath(file_path)) != os.path.realpath(
+                os.path.join(target_dir, sanitize_name(domain[0]) if domain else "未分類")
+            ):
+                file_path = self._move_bucket(file_path, target_dir, domain)
+        except Exception as e:
+            logger.warning(
+                f"Restore wrote the file but could not relocate it / "
+                f"還原寫入成功但搬移失敗: {bucket_id}: {e}"
+            )
+
+        logger.info(f"Restored bucket / 還原記憶桶: {bucket_id} → seq {seq}")
+        return True
+
+    def _dir_for_type(self, bucket_type: str) -> str:
+        """Which directory a bucket of this type lives in. list_all() walks
+        directories, so type and location must never disagree.
+        某個型別的桶該待在哪個目錄。list_all() 走目錄，所以型別和位置永遠不能矛盾。"""
+        return {
+            "permanent": self.permanent_dir,
+            "archived": self.archive_dir,
+            "feel": self.feel_dir,
+            "mirage": self.mirage_dir,
+            "plan": self.plan_dir,
+        }.get(bucket_type, self.dynamic_dir)
 
     def vector_admissible(
         self,
@@ -1060,10 +1206,17 @@ class BucketManager:
     # Called by decay engine to simulate "forgetting"
     # 由衰減引擎調用，模擬"遺忘"
     # ---------------------------------------------------------
-    async def archive(self, bucket_id: str) -> bool:
+    async def archive(self, bucket_id: str, actor=None) -> bool:
         """
         Move a bucket into the archive directory (preserving domain subdirs).
         將指定桶移入歸檔目錄（保留域子目錄結構）。
+
+        Archiving is already reversible on its own (the file still exists, and
+        revive() brings it back), so the snapshot here isn't insurance — it's
+        the record of the system forgetting something on its own initiative,
+        which is the one kind of write nobody was around to witness.
+        歸檔本來就可逆（檔案還在，revive() 就搬得回來），所以這裡的快照不是保險，
+        是「系統自己主動忘掉一件事」的紀錄——那是唯一沒有人在場見證的那種寫入。
         """
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
@@ -1072,6 +1225,11 @@ class BucketManager:
         try:
             # Read once, get domain info and update type / 一次性讀取
             post = frontmatter.load(file_path)
+            if self.history is not None:
+                self.history.snapshot(
+                    bucket_id, post.content, dict(post.metadata),
+                    op="archive", actor=actor,
+                )
             domain = post.get("domain", ["未分類"])
             primary_domain = sanitize_name(domain[0]) if domain else "未分類"
             archive_subdir = os.path.join(self.archive_dir, primary_domain)
@@ -1102,7 +1260,7 @@ class BucketManager:
     # forgetting is reversible when something genuinely reminds us.
     # 語義通道勾迴歸檔記憶時調用——真的被想起來，就回來。
     # ---------------------------------------------------------
-    async def revive(self, bucket_id: str, resolved: bool = True) -> bool:
+    async def revive(self, bucket_id: str, resolved: bool = True, actor=None) -> bool:
         """
         Move an archived bucket back to dynamic/. Comes back resolved by default
         so a revival doesn't flood the surfacing pool.
@@ -1115,6 +1273,11 @@ class BucketManager:
             post = frontmatter.load(file_path)
             if post.get("type") != "archived":
                 return False
+            if self.history is not None:
+                self.history.snapshot(
+                    bucket_id, post.content, dict(post.metadata),
+                    op="revive", actor=actor,
+                )
             post["type"] = "dynamic"
             post["resolved"] = resolved
             post["last_active"] = now_iso()

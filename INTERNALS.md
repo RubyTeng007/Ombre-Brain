@@ -1,7 +1,67 @@
 # Ombre Brain — 内部开发文档 / INTERNALS
 
 > 本文档面向开发者和维护者。记录功能总览、环境变量、模块依赖、硬编码值和核心设计决策。
-> 最后更新：2026-07-12（第三批 no-regret；0 章節之後的細節以程式碼為準）
+> 最后更新：2026-07-15（記憶批：漸層模糊／危險區複習／可復原；0 章節之後的細節以程式碼為準）
+
+## 1.0 2026-07-15 記憶批（漸層模糊、危險區複習、dream 可復原；Ruby 逐項拍板）
+
+**這批最重要的一句話：score 和 heat 是兩個量，不是同一個。**
+
+- **heat（新增，`decay_engine.calculate_heat`）** = 可提取度，真的 0~1。
+  `heat = 2^(-days_since / H)`，`H = 7 × (importance/5) × (activation^0.3) × emotion_weight`。
+  `calculate_score` **一個字都沒動**（648 個 live 桶逐位元比對驗證過）——它繼續管歸檔分流。
+  - **為什麼要新增而不是沿用 score**：score 無界（live 實測 0.18–40.75，中位數 5.29），
+    把 0.7/0.3 套上去會分成 86%/13%/**一個桶**，而那 13% 全是 resolved
+    ——breath 本來就整批排除它們，所以實際效果是 **0%**。
+    更根本的：低分的唯一來路是 `resolved ×0.05` / `digested ×0.2`，而浮現排除兩者，
+    所以「正在淡掉」與「能被浮現」在舊模型裡**互斥**，浮現池地板卡在 1.09。
+  - **H0=7 是照本語料校準的，不是抄的**：候選中位數「距上次真正被用到」9.9 天。
+    kiwi-mem 的 3 天半衰期會讓九成記憶消音（它是高汰換聊天伴侶，我們是長壽深存）。
+    實跑 360 個候選 → 60% 鮮明 / 36% 模糊 / 4% 已失去。
+  - **「retrievability」這個框架是 Ombre 自己的**，不是繼承：cortexgraph 的 score 一樣無界
+    （`decay.py:26-78`，`(use_count+1)^0.6 × decay × strength`，strength 上看 2.0），
+    它沒有可提取度概念。不要對外說這是抄來的。
+- **三格注入（抄 kiwi-mem `main.py:885-903`）**：`>0.7` 全文；`>0.3` 取脫水 JSON 的
+  `summary` 欄 + 後綴 `（印象模糊）`；`<=0.3` 不注入。邊界是**嚴格 `>`**（0.7 算模糊、0.3 算已失去）。
+  - **截短方式與 kiwi-mem 不同且必須不同**：它是 `content[:60]` 生硬切片；我們注入的是脫水器的
+    JSON，切 60 字會切出 `{"core_facts": ["事實1…` 這種垃圾。改走既有語意層級退化。
+    非 JSON（短桶 <100 token、或壞掉的快取）才退回它的字元切片。
+  - **第三格我們有 else 分支，kiwi-mem 沒有**（它直接消失，只在模型看不到的 log 記數）。
+    我們留**墓碑**：不給內容，只點名 + 指出 `breath(query=…)`。理由是 Ruby 的原則——
+    「安靜截斷讓你以為那就是全部」發生在桶層級也一樣是說謊。
+  - **只作用在浮現，不作用在查詢**：全文就在硬碟上，開口問還回「（印象模糊）」是演的。
+- **危險區複習（移植 cortexgraph `review.py:15-58`）**：`floor(動態slot/3)` 讓給「快要失去的」。
+  - `1-x²` 的 **x 不是 heat**，是 `(heat − 中點)/半寬`，範圍 **[-1, 1]**。直接餵 heat 峰值會落在 0
+    （已死的記憶）——與本意完全相反。
+  - **0.25 不是常數**，是 `danger_min 0.15` 與 `danger_max 0.35` 的中點，改任一個峰值就跑掉。
+  - 危險區桶**不 touch**，只 `mark_surfaced`：撈上來但沒真的用到，它會繼續淡。**不自動搶救。**
+- **豁免清單收斂成一份**：`utils.NON_DECAYING_TYPES` + `is_decay_exempt()`，heat 與 decay 共用。
+  收斂前**已經漂了**：`server.py` 有三種順序／子集，`decay_engine` 自己內部有兩種寫法
+  （`calculate_score` 的 if 串 vs `run_decay_cycle` 的 tuple）。
+  `_EXEMPT_SCORES` 與清單不一致時**在 import 就炸**——不能炸在 `calculate_score` 裡面，
+  因為 `run_decay_cycle` 會吞掉它拋的所有例外，KeyError 在那裡看起來只會像「跳過」。
+- **釘選桶不再佔 `max_results`**：它們是常駐不是被浮現。舊行為讓 5 個釘選 + 開場的
+  `max_results=5` → `candidates[:0]` → **360 個候選、零浮現**，且與 token 額度無關。
+  （「釘選最多吃一半」被否決：只是把 bug 推遠一個桶，第六個釘選桶就復發。）
+  ⚠ **slot 修好後 token 立刻接手當瓶頸**：5 個釘選脫水後 ≈3970 tok，`max_tokens=4000`
+  仍然一條動態都塞不下。兩個都要調（實測建議 8000/6 起跳）。
+- **`bucket_history.py`（新增）**：每次破壞性寫入前存全量快照，掛在 `bucket_manager.update()`
+  這個唯一收口（不掛 dream——**`dream()` 完全唯讀，一個字都不寫**；破壞在它之後那串
+  `trace(resolved=1)` / `hold(feel=True)`）。`touch`/`mark_surfaced` 刻意不走這裡。
+  - **觀察 vs 自陳是兩個欄位，永不合併**：`actor_type`/`actor_id` 在工具邊界蓋章、呼叫者無法謊報；
+    `self_reported_during` 是 Cyan 自己申報的，欄名自帶警語。這是 mirage 桶的同一條規矩：
+    不同的知識論地位，不同的容器。
+  - **抄 Letta `orm/block_history.py`**：獨立 PK + `UNIQUE(bucket_id, seq)`、全量快照非 diff、
+    `actor_id` 是純字串非外鍵。**不抄它的 undo/redo 指標**：它的 `checkpoint_block_async`
+    會刪掉所有 `seq > current` 的列，undo 之後再編輯 redo 鏈永久消失。我們讓「還原」就是一次
+    普通寫入（所以還原前也存快照），能還原到**任意 seq** 而不只 ±1。
+  - `trace(bucket_id, history=True)` 看修改史；`trace(bucket_id, restore_seq=N)` 還原。
+    `trace(delete=True)` 從此可救——它本來是全系統唯一真正不可逆的呼叫。
+- **已知破口（補不了，先寫下來）**：直接用 Obsidian 改 `.md` 檔，歷史表不會知道，沒有 hook 能攔。
+
+**這批沒做（刻意）**：雙時間軸真值（graphiti）——要先跟 Ruby 談「什麼叫作廢」；
+賺來的釘選（kiwi-mem 自動上鎖）——Ruby 同意砍掉，理由是「不要讓使用頻率決定我是誰」；
+`query_diversity` 訊號——該餵危險區排序而非改錨點，但這批 heat 已經夠複雜。
 
 ## 0.9 2026-07-12 第三批 no-regret（Codex 第三方評審採納項，Ruby 全權授權）
 

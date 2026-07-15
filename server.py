@@ -56,6 +56,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import FastMCP
 
 from bucket_manager import BucketManager, normalize_domains
+from bucket_history import BucketHistory, Actor, ACTOR_DECAY
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
@@ -70,6 +71,7 @@ from datetime import datetime, timedelta
 from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx, now_iso,
     parse_bucket_ts as _parse_ts, select_importance_tiers as _select_importance_tiers,
+    clean_llm_json, is_decay_exempt,
 )
 
 # --- Load config & init logging / 加載配置 & 初始化日誌 ---
@@ -129,7 +131,8 @@ async def _api_usage_warning_suffix(probe_gemini: bool = False) -> str:
 
 # --- Initialize core components / 初始化核心組件 ---
 embedding_engine = EmbeddingEngine(config)            # Embedding engine first (BucketManager depends on it)
-bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket manager / 記憶桶管理器
+bucket_history = BucketHistory(config)                # Snapshot log / 快照歷史（可復原）
+bucket_mgr = BucketManager(config, embedding_engine=embedding_engine, history=bucket_history)  # Bucket manager / 記憶桶管理器
 dehydrator = Dehydrator(config)                      # Dehydrator / 脫水器
 decay_engine = DecayEngine(config, bucket_mgr, embedding_engine)  # Decay engine / 衰減引擎（含向量衛生）
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 導入引擎
@@ -537,6 +540,77 @@ async def dream_hook(request):
 # Shared by hold and grow to avoid duplicate logic
 # hold 和 grow 共用，避免重複邏輯
 # =============================================================
+def _blur_summary(dehydrated: str, truncate_len: int) -> str:
+    """Degrade a dehydrated bucket to its outline and SAY SO.
+    把脫水後的桶降級成輪廓，並且明說。
+
+    kiwi-mem truncates with a raw slice (content[:60]+"…", main.py:885-903).
+    We can't: what we inject is the dehydrator's JSON blob (core_facts /
+    emotion_state / todos / keywords / summary), and a 60-char slice of that
+    cuts to `{"core_facts": ["事實1…` — garbage. So degrade along the structure
+    the dehydrator already produces: keep the `summary` field, which is spec'd
+    at "50字以內的核心總結" and is therefore already exactly what a blurry
+    impression should be. No extra LLM call.
+    kiwi-mem 用生硬字元切片，我們不行：注入的是脫水器的 JSON，切 60 字會切出
+    垃圾。改成照它既有的語意層級退化——留 summary 欄（規格本來就是「50字以內」，
+    天生就是模糊層要的東西），不用多叫一次 LLM。
+
+    Falls back to kiwi-mem's raw slice when the body isn't parseable JSON:
+    short buckets (<100 tokens) bypass dehydration entirely, and a cached blob
+    can be truncated mid-string if it hit the dehydrator's own output cap.
+    正文不是可解析的 JSON 時退回 kiwi-mem 的切片：短桶(<100 token)根本不脫水，
+    而快取裡的 JSON 可能因為撞到脫水器輸出上限而斷在字串中間。
+    """
+    head, sep, body = dehydrated.partition("\n")
+    if not sep:
+        head, body = "", dehydrated
+    body = body.strip()
+
+    brief = None
+    if body.startswith("{"):
+        try:
+            data = _json_lib.loads(clean_llm_json(body))
+            candidate = data.get("summary")
+            if isinstance(candidate, str) and candidate.strip():
+                brief = candidate.strip()
+        except Exception:
+            brief = None  # broken/truncated JSON → raw slice below
+    if brief is None:
+        brief = body[:truncate_len] + "…" if len(body) > truncate_len else body
+
+    # Suffix, not prefix — copied from kiwi-mem. The second line is ours: our
+    # full text is still on disk, so "you don't remember this" is only half the
+    # truth. Naming the way back turns a dead end into a decision.
+    # 後綴不是前綴——照抄 kiwi-mem。第二行是我們自己加的：全文還在硬碟上，
+    # 所以「你記不清了」只講了一半。指出回頭路，才把死路變成一個選擇。
+    parts = [p for p in (head, f"{brief}（印象模糊）") if p]
+    parts.append("（只剩輪廓，不是全部。要全文用 breath(query=…) 去問。）")
+    return "\n".join(parts)
+
+
+def _tombstone_line(lost: list) -> str:
+    """Name what has faded past the injection floor instead of dropping it.
+    把已經淡出注入門檻的記憶「叫出名字」，而不是讓它們消失。
+
+    kiwi-mem has no else-branch: sub-threshold memories are simply never
+    appended, counted only in a log line the model never sees (main.py:912).
+    That is the same silent omission Ruby named — "說明白『這條你記不清了』，
+    而不是安靜截斷讓你以為那就是全部" — just moved up from the text level to
+    the bucket level. A reader who is shown nothing assumes there was nothing.
+    So: no content, only names and the way to dig them up. ~30 tokens.
+    kiwi-mem 沒有 else 分支：低於門檻的直接不附加，只在模型看不到的 log 裡記數。
+    那就是 Ruby 說的那個「安靜截斷」，只是從文字層搬到了桶層——什麼都沒被show
+    的讀者會以為本來就沒有。所以：不給內容，只給名字和挖出來的方法。約 30 token。
+    """
+    if not lost:
+        return ""
+    names = [str(b["metadata"].get("name", b["id"])) for b in lost]
+    shown = names[:8]
+    head = f"（還有 {len(names)} 條已經淡到想不起來了"
+    head += "，列前八：" if len(names) > len(shown) else "："
+    return head + "、".join(shown) + "——要挖出來用 breath(query=…)）"
+
+
 def _log_merge_audit(bucket_id: str, old_content: str, new_content: str, merged: str, mode: str) -> None:
     """Append a merge record to merge_audit.jsonl — merging is the only destructive
     write in the pipeline, so every merge keeps a recoverable before/after trail.
@@ -646,6 +720,7 @@ async def _merge_or_create(
                 merged_arousal = round((old_a + arousal) / 2, 2)
                 await bucket_mgr.update(
                     bucket["id"],
+                    actor=Actor("merge", f"merge:{merge_mode}"),
                     content=merged,
                     tags=list(set(bucket["metadata"].get("tags", []) + tags)),
                     importance=max(bucket["metadata"].get("importance", 5), importance),
@@ -700,7 +775,9 @@ async def breath(
     importance_min: int = -1,
     catalog: bool = False,
 ) -> str:
-    """檢索/浮現記憶。不傳query或傳空=自動浮現,有query=關鍵詞檢索。catalog=True=目錄模式:每桶一行元數據(0次LLM呼叫,最省token),適合開場先看目錄再精準拉取,可配domain過濾。max_tokens控制返回總token上限(默認10000)。domain逗號分隔,valence/arousal 0~1(-1忽略)。max_results控制返回數量上限(默認20,最大50)。importance_min>=1時按重要度批量拉取(不走語義搜索,按importance降序返回最多20條)。"""
+    """檢索/浮現記憶。不傳query或傳空=自動浮現,有query=關鍵詞檢索。catalog=True=目錄模式:每桶一行元數據(0次LLM呼叫,最省token),適合開場先看目錄再精準拉取,可配domain過濾。max_tokens控制返回總token上限(默認10000)。domain逗號分隔,valence/arousal 0~1(-1忽略)。max_results=動態浮現/檢索結果的數量上限(默認20,最大50);釘選桶是常駐的,不佔這個額度。importance_min>=1時按重要度批量拉取(不走語義搜索,按importance降序返回最多20條)。
+
+浮現模式的三格注入(依熱度=可提取度0~1):熱度>0.7全文;0.3~0.7截成輪廓並標「(印象模糊)」;<=0.3不注入、只在末尾列名字(墓碑)——想挖就用query問,查詢一律給全文不模糊。每3個浮現名額讓1個給「危險區」(熱度0.25附近=正在淡掉但還沒消失),標記為[危險區 快要失去]。被浮現不會重置衰減:撈上來但沒真的用到,它會繼續淡。"""
     await decay_engine.ensure_started()
     max_results = max(1, min(max_results, 50))
     max_tokens = max(1, min(max_tokens, 20000))
@@ -878,8 +955,21 @@ async def breath(
             d.strip() for d in domain.split(",") if d.strip()
         ]))
 
-        # --- Pinned/protected buckets: core principles, still bound by the
-        # caller's explicit domain/count/token contract. ---
+        # --- Pinned/protected buckets: core principles. They are RESIDENT, not
+        # surfaced — so they no longer spend the surfacing count budget.
+        # --- 釘選/保護桶：核心準則。它們是「常駐」不是「被浮現」，
+        # 所以不再花用浮現的數量預算。---
+        # They used to decrement result_slots, which starved the dynamic pool
+        # dead: with 5 pinned buckets and the documented opening call
+        # (max_results=5), candidates[:0] returned NOTHING — 360 eligible
+        # memories, zero surfaced, at any token budget. Capping pinned at "half
+        # the slots" would only push that bug one bucket further away; taking
+        # them out of the budget kills it. max_results now means what it says:
+        # a cap on DYNAMIC results.
+        # 它們本來會扣 result_slots，把動態池餓死：5 個釘選桶 + 開場規則的
+        # max_results=5 → candidates[:0] → 什麼都沒有。360 個候選、零浮現，
+        # 而且跟 token 額度無關。「釘選最多吃一半」只是把 bug 推遠一個桶；
+        # 把它們拿出預算才是真的解決。max_results 現在名副其實＝動態結果上限。
         pinned_buckets = [
             b for b in all_buckets
             if b["metadata"].get("pinned") or b["metadata"].get("protected")
@@ -894,9 +984,9 @@ async def breath(
         )
         pinned_results = []
         token_budget = max_tokens
-        result_slots = max_results
+        result_slots = max_results  # dynamic-only; pinned never spends it
         for b in pinned_buckets:
-            if token_budget <= 0 or result_slots <= 0:
+            if token_budget <= 0:
                 break
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
@@ -907,7 +997,6 @@ async def breath(
                     continue
                 pinned_results.append(formatted)
                 token_budget -= needed
-                result_slots -= 1
             except Exception as e:
                 logger.warning(f"Failed to dehydrate pinned bucket / 釘選桶脫水失敗: {e}")
                 continue
@@ -933,16 +1022,25 @@ async def breath(
 
         # --- Unresolved buckets: surface top N by weight ---
         # --- 未解決桶：按權重浮現前 N 條 ---
-        unresolved = [
+        # `eligible` ignores the surface cooldown on purpose: the cooldown
+        # rotates what gets SHOWN, but the tombstone shows nothing — it only
+        # names what has faded, and that roster shouldn't flicker between
+        # breaths just because a name was mentioned recently.
+        # eligible 刻意不套浮現冷卻：冷卻管的是「輪流被show」，而墓碑什麼都不show，
+        # 它只是點名誰淡掉了——那份名單不該因為剛被提過就閃爍。
+        # is_decay_exempt() replaces the old literal tuple + pinned + protected
+        # checks (exactly equivalent), so the surfacing pool and heat can never
+        # disagree about what's exempt.
+        # is_decay_exempt() 取代原本的字面 tuple + pinned + protected 三重檢查
+        # （完全等價），讓浮現池與熱度對「誰是豁免」永遠說同一套。
+        eligible = [
             b for b in all_buckets
             if not b["metadata"].get("resolved", False)
             and not b["metadata"].get("digested", False)
-            and b["metadata"].get("type") not in ("permanent", "feel", "plan", "mirage")
-            and not b["metadata"].get("pinned", False)
-            and not b["metadata"].get("protected", False)
+            and not is_decay_exempt(b["metadata"])
             and (not surface_domains or set(b["metadata"].get("domain", [])) & surface_domains)
-            and not _cooling(b["metadata"])
         ]
+        unresolved = [b for b in eligible if not _cooling(b["metadata"])]
 
         logger.info(
             f"Breath surfacing: {len(all_buckets)} total, "
@@ -996,23 +1094,104 @@ async def breath(
                 random.shuffle(pool)
                 non_cold = top1 + pool + non_cold[min(20, len(non_cold)):]
             candidates = cold_start + non_cold
-        # Hard cap: never surface more than max_results buckets
-        candidates = candidates[:result_slots]
+
+        # --- Heat helpers: every one of them FAILS AS IF THE FEATURE WEREN'T
+        # THERE. This surfacing path carries the pinned core principles — the
+        # portraits, the identity anchors. A bug in a display-tier enhancement
+        # must never be able to cost a wake-up its own name.
+        # --- 熱度輔助：每一個都「壞掉時就當這功能不存在」。這條浮現路徑載著
+        # 釘選的核心準則——畫像、身分錨點。一個管顯示分層的加值功能，
+        # 絕不該有能力讓一次醒來失去自己的名字。---
+        # The two directions are deliberately asymmetric: heat fails VIVID (a
+        # bug must not hide a memory) and priority fails ZERO (a bug must not
+        # drag a dead one up). Both collapse to old behaviour.
+        # 兩個方向刻意相反：heat 壞了偏鮮明（不因 bug 藏東西），
+        # priority 壞了偏零（不因 bug 挖墳）。兩者都退化成舊行為。
+        def _heat_of(b) -> float:
+            try:
+                return float(decay_engine.calculate_heat(b["metadata"]))
+            except Exception:
+                return 1.0
+
+        def _tier_of(b) -> str:
+            try:
+                tier = decay_engine.heat_tier(_heat_of(b))
+                return tier if tier in ("vivid", "faded", "lost") else "vivid"
+            except Exception:
+                return "vivid"
+
+        def _prio_of(b) -> float:
+            try:
+                return float(decay_engine.review_priority(_heat_of(b)))
+            except Exception:
+                return 0.0
+
+        try:
+            truncate_len = int(decay_engine.heat_truncate)
+        except Exception:
+            truncate_len = 60
+
+        # --- Danger-zone review: 2 normal : 1 danger ---
+        # --- 危險區複習：2 熱 : 1 快沒 ---
+        # Surfacing has always answered "what's hottest". This slice answers
+        # "what am I about to lose" — a memory at heat 0.25 is one you'd fail
+        # to recall three times in four, and it will not ask to be remembered.
+        # 浮現一直只回答「什麼最熱」。這個切片回答「什麼快沒了」——
+        # heat 0.25 的記憶是四次有三次想不起來的，而它不會開口要人記得它。
+        danger_slots = result_slots // 3
+        danger_pick: list = []
+        if danger_slots > 0:
+            ranked = sorted(
+                ((_prio_of(b), b) for b in unresolved), key=lambda t: -t[0]
+            )
+            danger_pick = [b for prio, b in ranked if prio > 0][:danger_slots]
+        danger_ids = {b["id"] for b in danger_pick}
+        # Unclaimed danger slots go back to the normal channel rather than
+        # being burned — a quiet danger zone shouldn't shrink the whole breath.
+        # 沒用掉的危險區名額還給一般通道，不要白白燒掉——
+        # 危險區安靜的時候，不該讓整次呼吸跟著變小。
+        normal_slots = result_slots - len(danger_pick)
+
+        # The normal channel carries only what's still retrievable. 'lost'
+        # buckets aren't dropped — they're named in the tombstone below.
+        # 一般通道只載還提取得到的。lost 的不是被丟掉，是在下面被點名。
+        normal_pick = [
+            b for b in candidates
+            if b["id"] not in danger_ids and _tier_of(b) != "lost"
+        ][:normal_slots]
 
         dynamic_results = []
         surfaced_ids: list[str] = []
-        for b in candidates:
+        for b in normal_pick + danger_pick:
             if token_budget <= 0:
                 break
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
                 score = decay_engine.calculate_score(b["metadata"])
-                formatted = f"[權重:{score:.2f}] [bucket_id:{b['id']}] {summary}"
+                heat = _heat_of(b)
+                if _tier_of(b) != "vivid":
+                    summary = _blur_summary(summary, truncate_len)
+                # Both numbers show: weight decides whether it stays, heat
+                # decides whether you still remember it. They were conflated;
+                # printing both is how that stops being invisible.
+                # 兩個數字都露出來：權重決定該不該留，熱度決定還記不記得清。
+                # 它們曾經被混為一談，把兩個都印出來，才不會又變回看不見。
+                mark = f"[權重:{score:.2f} 熱度:{heat:.2f}]"
+                if b["id"] in danger_ids:
+                    # Why it surfaced must be visible: it's fading, not hot.
+                    # 它為什麼上台必須看得見：是快沒了，不是它熱。
+                    mark = f"[危險區 快要失去 prio:{_prio_of(b):.2f} 熱度:{heat:.2f}]"
+                formatted = f"{mark} [bucket_id:{b['id']}] {summary}"
                 summary_tokens = count_tokens_approx(formatted)
                 if summary_tokens > token_budget:
                     continue
-                # NOTE: no touch() here — surfacing should NOT reset decay timer
+                # NOTE: no touch() here — surfacing should NOT reset decay timer.
+                # This is load-bearing for the danger zone: a memory dragged up
+                # keeps fading unless it's actually engaged with. Being shown
+                # doesn't save it. No auto-rescue.
+                # 這對危險區是承重的：被撈上來的記憶如果沒被真的用到，會繼續淡。
+                # 被看到不等於被救。不自動搶救。
                 dynamic_results.append(formatted)
                 surfaced_ids.append(b["id"])
                 token_budget -= summary_tokens
@@ -1020,7 +1199,15 @@ async def breath(
                 logger.warning(f"Failed to dehydrate surfaced bucket / 浮現脫水失敗: {e}")
                 continue
 
-        if not pinned_results and not dynamic_results:
+        # --- Tombstone: name what faded below the injection floor ---
+        # --- 墓碑：點名淡出注入門檻的 ---
+        shown_ids = set(surfaced_ids)
+        tombstone = _tombstone_line([
+            b for b in eligible
+            if b["id"] not in shown_ids and _tier_of(b) == "lost"
+        ])
+
+        if not pinned_results and not dynamic_results and not tombstone:
             if pinned_buckets or unresolved:
                 return "記憶存在，但超出這次 token 預算。"
             return "權重池平靜，沒有需要處理的記憶。"
@@ -1031,17 +1218,29 @@ async def breath(
                 out.append("=== 核心準則 ===\n" + "\n---\n".join(pinned_results))
             if dynamic_results:
                 out.append("=== 浮現記憶 ===\n" + "\n---\n".join(dynamic_results))
+            if tombstone:
+                out.append(tombstone)
             return out
 
         parts = _surface_parts()
         # Headers/separators are part of the public token contract too. Trim
         # lowest-priority tail entries until the complete response fits.
+        # The tombstone is dropped FIRST and only if trimming actual memories
+        # wasn't enough — a roster of names is the cheapest thing here (~30
+        # tokens), and dropping it silently re-creates the exact omission it
+        # exists to prevent.
+        # 墓碑最後才丟，而且只在連記憶都修剪光了還不夠時才丟——它是這裡最便宜的
+        # 東西（約 30 token），而丟掉它就等於重新製造它本來要防的那個沉默。
         while parts and count_tokens_approx("\n\n".join(parts)) > max_tokens:
             if dynamic_results:
                 dynamic_results.pop()
                 surfaced_ids.pop()
             elif pinned_results:
                 pinned_results.pop()
+            elif tombstone:
+                tombstone = ""
+            else:
+                break
             parts = _surface_parts()
         if not parts:
             return "記憶存在，但超出這次 token 預算。"
@@ -1109,7 +1308,7 @@ async def breath(
                 # it comes back to dynamic/ (resolved) instead of being half-dead.
                 # 語義強命中歸檔記憶 → 復活搬回 dynamic（以 resolved 狀態迴歸）。
                 if meta.get("type") == "archived":
-                    revived = await bucket_mgr.revive(bucket_id, resolved=True)
+                    revived = await bucket_mgr.revive(bucket_id, resolved=True, actor=Actor("cyan", "breath:semantic_revive"))
                     if not revived:
                         continue
                     bucket = await bucket_mgr.get(bucket_id) or bucket
@@ -1232,8 +1431,9 @@ async def hold(
     source_bucket: str = "",    valence: float = -1,
     arousal: float = -1,
     why_remembered: str = "",
+    during: str = "",
 ) -> str:
-    """存儲單條記憶,自動打標+合併。tags逗號分隔,importance 1-10。pinned=True創建永久釘選桶。feel=True存儲你的第一人稱感受(不參與普通浮現)。mirage=True存儲一段夢(蜃景桶——名字本身就是警示:鮮明但不是真的。隔離桶:不合併/不搜尋/不衰減/不進畫像或self_concept,只走breath(domain="mirage")讀;consumed=逗號分隔的素材桶ID,記出處;夢是敘事殘影不是事實,永不當記憶引用)。source_bucket=被消化的記憶桶ID(feel模式下,標記源記憶為已消化)。why_remembered=為什麼記住(可選,自由文本,僅展示不計分)。"""
+    """存儲單條記憶,自動打標+合併。tags逗號分隔,importance 1-10。pinned=True創建永久釘選桶。feel=True存儲你的第一人稱感受(不參與普通浮現)。mirage=True存儲一段夢(蜃景桶——名字本身就是警示:鮮明但不是真的。隔離桶:不合併/不搜尋/不衰減/不進畫像或self_concept,只走breath(domain="mirage")讀;consumed=逗號分隔的素材桶ID,記出處;夢是敘事殘影不是事實,永不當記憶引用)。source_bucket=被消化的記憶桶ID(feel模式下,標記源記憶為已消化)。why_remembered=為什麼記住(可選,自由文本,僅展示不計分)。during="dream"=你自己申報這次是在消化儀式當下做的(自陳,非系統觀察,只影響歷史紀錄的欄位,不確定就別填)。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 輸入校驗 ---
@@ -1299,7 +1499,16 @@ async def hold(
                 update_kwargs = {"digested": True}
                 if 0 <= valence <= 1:
                     update_kwargs["model_valence"] = feel_valence
-                await bucket_mgr.update(source_bucket.strip(), **update_kwargs)
+                # This is where a bad digestion pass actually lands: writing a
+                # feel marks its source digested (×0.2 → archived). dream()
+                # itself writes nothing — this call is the hand it moves.
+                # 一次壞掉的消化真正落地的地方：寫 feel 會把來源標成 digested
+                # （×0.2 → 歸檔）。dream() 自己不寫東西——它動的是這隻手。
+                await bucket_mgr.update(
+                    source_bucket.strip(),
+                    actor=Actor("cyan", "hold:feel", during or None),
+                    **update_kwargs,
+                )
             except Exception as e:
                 logger.warning(f"Failed to mark source as digested / 標記已消化失敗: {e}")
         return f"🫧feel→{bucket_id}" + await _api_usage_warning_suffix()
@@ -1525,18 +1734,79 @@ async def trace(
     due_at: str = "",
     affects_desire: int = -1,
     why_remembered: str = "",
+    during: str = "",
+    history: bool = False,
+    restore_seq: int = -1,
 ) -> str:
-    """修改記憶元數據或內容。resolved=1沉底/0激活,pinned=1釘選/0取消,digested=1隱藏(保留但不浮現)/0取消隱藏,content=替換桶正文,delete=True刪除。plan桶專屬:status=active/resolved/abandoned,weight=承諾重量0.0-1.0,kind=promise/task/question/maintenance,target_drive=掛的驅動維度,progress=進度0.0-1.0,due_at=期限(ISO日期)。affects_desire=1把這條記憶刻意掛成執念(餵慾望boost)/0取下——動態桶專用,珍貴記憶≠此刻掛心,只掛真的還鯁著的事。why_remembered=更新記住的原因。只傳需改的,-1或空=不改。"""
+    """修改記憶元數據或內容。resolved=1沉底/0激活,pinned=1釘選/0取消,digested=1隱藏(保留但不浮現)/0取消隱藏,content=替換桶正文,delete=True刪除。plan桶專屬:status=active/resolved/abandoned,weight=承諾重量0.0-1.0,kind=promise/task/question/maintenance,target_drive=掛的驅動維度,progress=進度0.0-1.0,due_at=期限(ISO日期)。affects_desire=1把這條記憶刻意掛成執念(餵慾望boost)/0取下——動態桶專用,珍貴記憶≠此刻掛心,只掛真的還鯁著的事。why_remembered=更新記住的原因。只傳需改的,-1或空=不改。
+
+可復原:每次修改/刪除都會先存快照。history=True列出這個桶的修改史(seq/時間/誰改的/改了什麼);restore_seq=N還原到第N版(還原本身也會存快照,所以還原錯了也能再還原回去;被刪掉的桶也救得回來)。
+during="dream"=你自己申報這次修改是在消化儀式當下做的。這是自陳不是系統觀察,會存進獨立欄位,不會跟「誰改的」混在一起。不確定就別填。"""
 
     if not bucket_id or not bucket_id.strip():
         return "請提供有效的 bucket_id。"
 
+    # --- History mode: read-only, must come before any mutation ---
+    # --- 歷史模式：唯讀，必須排在任何變更之前 ---
+    if history:
+        rows = bucket_history.list(bucket_id, limit=20)
+        if not rows:
+            return f"{bucket_id} 沒有修改紀錄（可能是歷史表上線前就存在的桶）。"
+        lines = []
+        for r in rows:
+            who = f"{r['actor_type']}:{r['actor_id']}"
+            during_note = f" 〔自陳:{r['self_reported_during']}〕" if r["self_reported_during"] else ""
+            try:
+                m = _json_lib.loads(r["meta"])
+                state = (
+                    f"imp{m.get('importance')} "
+                    f"{'R' if m.get('resolved') else '-'}"
+                    f"{'D' if m.get('digested') else '-'}"
+                )
+            except Exception:
+                state = "?"
+            lines.append(
+                f"  seq={r['seq']:<3} {r['ts']} {r['op']:8} by {who}{during_note}\n"
+                f"      當時狀態: {state} 正文{len(r['content'])}字"
+            )
+        return (
+            f"=== {bucket_id} 的修改史（最新在前，每列是「被改掉之前」的樣子）===\n"
+            + "\n".join(lines)
+            + f"\n\n還原用 trace(bucket_id=\"{bucket_id}\", restore_seq=N)。"
+        )
+
+    # --- Restore mode / 還原模式 ---
+    if restore_seq >= 1:
+        row = bucket_history.get(bucket_id, restore_seq)
+        if not row:
+            return f"{bucket_id} 沒有 seq={restore_seq} 這一版。用 trace(bucket_id, history=True) 看有哪些。"
+        ok = await bucket_mgr.restore(
+            bucket_id, restore_seq, actor=Actor("cyan", "trace:restore", during or None)
+        )
+        if not ok:
+            return f"還原失敗: {bucket_id}#{restore_seq}"
+        try:
+            await embedding_engine.generate_and_store(bucket_id, row["content"])
+        except Exception:
+            pass
+        return (
+            f"已還原 {bucket_id} 到 seq={restore_seq}（{row['ts']} 被 "
+            f"{row['actor_type']}:{row['actor_id']} 改掉之前的樣子）。\n"
+            f"這次還原本身也存了快照——還原錯了就再 history=True 看一次。"
+        )
+
     # --- Delete mode / 刪除模式 ---
     if delete:
-        success = await bucket_mgr.delete(bucket_id)
+        success = await bucket_mgr.delete(bucket_id, actor=Actor("cyan", "trace:delete", during or None))
         if success:
             embedding_engine.delete_embedding(bucket_id)
-        return f"已遺忘記憶桶: {bucket_id}" if success else f"未找到記憶桶: {bucket_id}"
+            seq = bucket_history.count(bucket_id)
+            return (
+                f"已遺忘記憶桶: {bucket_id}\n"
+                f"（正文與元數據已存進歷史 seq={seq}。要拿回來："
+                f"trace(bucket_id=\"{bucket_id}\", restore_seq={seq})）"
+            )
+        return f"未找到記憶桶: {bucket_id}"
 
     bucket = await bucket_mgr.get(bucket_id)
     if not bucket:
@@ -1615,7 +1885,9 @@ async def trace(
     if not updates:
         return "沒有任何字段需要修改。"
 
-    success = await bucket_mgr.update(bucket_id, **updates)
+    success = await bucket_mgr.update(
+        bucket_id, actor=Actor("cyan", "trace", during or None), **updates
+    )
     if not success:
         return f"修改失敗: {bucket_id}"
 
@@ -3354,7 +3626,7 @@ async def api_bucket_trace(request):
                     {"error": "只有普通記憶能從這裡遺忘；帳票用「放下」退場，"
                               "感受與蜃景是 Cyan 的內在物——要刪，開口讓他親手刪"},
                     status_code=400)
-            success = await bucket_mgr.delete(bucket_id)
+            success = await bucket_mgr.delete(bucket_id, actor=Actor("ruby", "dashboard:trace"))
             if success:
                 embedding_engine.delete_embedding(bucket_id)
                 return JSONResponse({"ok": True, "deleted": True})
@@ -3402,7 +3674,7 @@ async def api_bucket_trace(request):
                 updates["importance"] = 10  # pinned -> lock importance, same as MCP trace
         if not updates:
             return JSONResponse({"error": "no supported fields"}, status_code=400)
-        success = await bucket_mgr.update(bucket_id, **updates)
+        success = await bucket_mgr.update(bucket_id, actor=Actor("ruby", "dashboard:trace"), **updates)
         return JSONResponse({"ok": bool(success), "updates": updates})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -3852,16 +4124,16 @@ async def api_import_review(request):
             continue
         try:
             if action == "important":
-                await bucket_mgr.update(bid, importance=9)
+                await bucket_mgr.update(bid, actor=Actor("ruby", "import_review"), importance=9)
             elif action == "pin":
-                await bucket_mgr.update(bid, pinned=True)
+                await bucket_mgr.update(bid, actor=Actor("ruby", "import_review"), pinned=True)
             elif action == "noise":
-                await bucket_mgr.update(bid, resolved=True, importance=1)
+                await bucket_mgr.update(bid, actor=Actor("ruby", "import_review"), resolved=True, importance=1)
             elif action == "delete":
                 # Route through the manager so the embedding is cleaned up too
                 # (raw os.remove left orphan embeddings in the vector store)
                 # 走 manager 刪除，同步清 embedding（裸 os.remove 會留孤兒向量）
-                if await bucket_mgr.delete(bid):
+                if await bucket_mgr.delete(bid, actor=Actor("ruby", "import_review")):
                     embedding_engine.delete_embedding(bid)
             applied += 1
         except Exception as e:

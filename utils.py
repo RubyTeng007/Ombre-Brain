@@ -273,6 +273,36 @@ def parse_bucket_ts(value):
     return ts
 
 
+# ---------------------------------------------------------
+# Bucket types that sit outside the decay lifecycle.
+# 不參與衰減生命週期的桶型。
+#
+# ONE list, shared by decay_engine.calculate_score (how vivid → archive triage)
+# and decay_engine.calculate_heat (how retrievable → injection tier). Kept here
+# rather than in either caller because a second copy is not a hypothetical risk:
+# on 2026-07-15 decay_engine already carried two representations of this same
+# set (five if-branches in calculate_score, a tuple in run_decay_cycle), and
+# server.py carried it in three different orders/subsets.
+# 一份清單，衰減分與熱度共用。放這裡而不是放在任一呼叫端，是因為「第二份」
+# 不是假設性風險：2026-07-15 盤點時 decay_engine 自己就有兩種寫法，
+# server.py 有三種順序／子集。
+# ---------------------------------------------------------
+NON_DECAYING_TYPES = ("permanent", "feel", "plan", "mirage")
+
+
+def is_decay_exempt(metadata: dict) -> bool:
+    """Whether a bucket is outside the decay lifecycle entirely: never scored
+    down, never archived, and heat pinned at 1.0 (always injected in full).
+    桶是否完全不參與衰減：不掉分、不歸檔、熱度恆為 1.0（永遠全文注入）。"""
+    if not isinstance(metadata, dict):
+        return False
+    return bool(
+        metadata.get("pinned")
+        or metadata.get("protected")
+        or metadata.get("type") in NON_DECAYING_TYPES
+    )
+
+
 def select_importance_tiers(filtered: list, cap: int = 20) -> list:
     """
     Pick up to `cap` buckets from an importance-desc-sorted list, but reserve
