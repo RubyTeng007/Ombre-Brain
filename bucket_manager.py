@@ -562,9 +562,18 @@ class BucketManager:
         elif post.get("type") == "archived" and "resolved" in kwargs and not kwargs["resolved"]:
             # --- Revive: re-activating an archived bucket pulls it back to dynamic/ ---
             # --- 復活：對歸檔桶 resolved=0 視為喚回，搬回 dynamic/ 重新參與生命週期 ---
+            # Move FIRST, write second — restore()'s reasoning applies here
+            # too: writing type:dynamic and then failing the move leaves a
+            # file in archive/ that believes it is alive (list_all can't see
+            # it, revive() refuses it). Move-first fails toward a repairable
+            # state: a dynamic/-located file still saying archived.
+            # 先搬再寫——restore() 的理由同樣適用：先寫 type:dynamic 再搬失敗，
+            # 會在 archive/ 留下自以為活著的幽靈（list_all 看不見、revive()
+            # 不認）。先搬的失敗方向是可修復的：檔案已在 dynamic/、type 還是
+            # archived，revive() 修得回來。
+            file_path = self._move_bucket(file_path, self.dynamic_dir, domain)
             post["type"] = "dynamic"
             atomic_write_text(file_path, frontmatter.dumps(post))
-            file_path = self._move_bucket(file_path, self.dynamic_dir, domain)
             logger.info(f"Revived bucket from archive / 歸檔桶復活: {bucket_id}")
 
         logger.info(f"Updated bucket / 更新記憶桶: {bucket_id}")
@@ -1328,11 +1337,20 @@ class BucketManager:
                     bucket_id, post.content, dict(post.metadata),
                     op="revive", actor=actor,
                 )
+            # Move FIRST, write second (same reasoning as restore()): a ghost
+            # in archive/ claiming type:dynamic is the one unrecoverable
+            # state; a dynamic/-located file still saying archived is exactly
+            # what this function repairs on the next call.
+            # 先搬再寫（與 restore() 同一套理由）：archive/ 裡寫著 type:dynamic
+            # 的幽靈是唯一救不回的狀態；檔案在 dynamic/ 而 type 還是 archived，
+            # 正是本函數下次呼叫就能修好的形狀。
+            file_path = self._move_bucket(
+                file_path, self.dynamic_dir, post.get("domain", ["未分類"]),
+            )
             post["type"] = "dynamic"
             post["resolved"] = resolved
             post["last_active"] = now_iso()
             atomic_write_text(file_path, frontmatter.dumps(post))
-            self._move_bucket(file_path, self.dynamic_dir, post.get("domain", ["未分類"]))
             logger.info(f"Revived bucket / 復活記憶桶: {bucket_id}")
             return True
         except Exception as e:

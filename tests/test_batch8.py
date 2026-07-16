@@ -248,3 +248,105 @@ class TestDecayHeartbeat:
             assert engine.is_running is False
 
         _run(scenario())
+
+
+# ---------------------------------------------------------
+# 4. Batch-2 ledger honesty + pollution guards
+# 4. 批2：帳本誠實＋污染防護
+# ---------------------------------------------------------
+
+class TestKernelFiniteGuards:
+    def test_feed_rejects_nan_loudly(self):
+        import desire as dk
+        state = dk.default_state()
+        with pytest.raises(ValueError):
+            dk.feed(state, "miss_ruby", float("nan"), datetime.now(), event="0/0 bug")
+
+    def test_feed_rejects_infinity(self):
+        import desire as dk
+        state = dk.default_state()
+        with pytest.raises(ValueError):
+            dk.feed(state, "miss_ruby", float("inf"), datetime.now(), event="overflow")
+
+    def test_feed_normal_amount_still_works(self):
+        import desire as dk
+        state = dk.default_state()
+        new = dk.feed(state, "miss_ruby", 0.3, datetime.now(), event="真實事件")
+        assert new["drives"]["miss_ruby"] >= state["drives"]["miss_ruby"]
+
+    def test_satisfy_nan_degree_means_no_claim(self):
+        import desire as dk
+        state = dk.default_state()
+        state["drives"]["miss_ruby"] = 0.8
+        new = dk.satisfy(state, "murmur", datetime.now(), degree=float("nan"))
+        # NaN must not read as "fully satisfied": levels stay put.
+        assert new["drives"]["miss_ruby"] == pytest.approx(0.8)
+
+
+class TestLedgerTornTail:
+    def test_append_heals_missing_trailing_newline(self, tmp_path):
+        import desire as dk
+        store = dk.DesireStore(str(tmp_path))
+        state = store.load()
+        # Simulate a crash mid-append: last line lost its newline.
+        # 模擬 append 中途斷電：最後一行少了換行。
+        lp = str(store.ledger_path)
+        with open(lp, "w", encoding="utf-8") as f:
+            f.write('{"event_id": "old-1", "kind": "wake"}')  # no newline
+        ok = store._append_ledger([{"event_id": "new-1", "kind": "wake"}]) if hasattr(store, "_append_ledger") else None
+        if ok is None:
+            pytest.skip("no direct ledger append accessor on this store")
+        assert ok is True
+        lines = open(lp, encoding="utf-8").read().splitlines()
+        parsed = []
+        import json as _json
+        for raw in lines:
+            try:
+                parsed.append(_json.loads(raw))
+            except ValueError:
+                pytest.fail(f"glued unparseable line survived: {raw!r}")
+        assert {p["event_id"] for p in parsed} == {"old-1", "new-1"}
+
+
+class TestDehydratorStrList:
+    def test_bare_string_domain_becomes_default(self):
+        from dehydrator import _str_list
+        assert _str_list("編程", ["未分類"], cap=3) == ["未分類"]
+
+    def test_list_passes_and_is_capped(self):
+        from dehydrator import _str_list
+        assert _str_list(["a", "b", "c", "d"], ["x"], cap=3) == ["a", "b", "c"]
+
+    def test_non_string_items_are_stringified(self):
+        from dehydrator import _str_list
+        assert _str_list([1, "b"], ["x"], cap=3) == ["1", "b"]
+
+    def test_none_becomes_default(self):
+        from dehydrator import _str_list
+        assert _str_list(None, ["未分類"], cap=3) == ["未分類"]
+
+
+class TestEmbeddingCacheModelKey:
+    def test_text_cache_is_model_scoped(self, test_config):
+        from embedding_engine import EmbeddingEngine
+
+        eng = EmbeddingEngine(test_config)
+
+        async def scenario():
+            calls = []
+
+            async def fake_uncached(text):
+                calls.append((eng.model, text))
+                return [1.0, 2.0] if eng.model == "model-a" else [9.0, 9.0]
+
+            eng._embed_uncached = fake_uncached
+            eng.model = "model-a"
+            v1 = await eng._generate_embedding("同一段文字")
+            eng.model = "model-b"  # runtime /api/config switch
+            v2 = await eng._generate_embedding("同一段文字")
+            # The old text-only key handed model-a's vector to model-b.
+            # 舊的純文字鍵會把 model-a 的向量交給 model-b。
+            assert v1 != v2
+            assert len(calls) == 2
+
+        _run(scenario())

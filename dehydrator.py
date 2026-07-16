@@ -45,6 +45,25 @@ logger = logging.getLogger("ombre_brain.dehydrator")
 # 寧可留下不會被讀到的位元組，也不要送出一份不知道是誰產的摘要。
 PROMPT_VERSION = "1"
 
+
+def _str_list(value, default: list, cap: int) -> list:
+    """Coerce an LLM-returned field to a list of strings.
+    把 LLM 回傳的欄位強制成字串列表。
+
+    A cheap model answering `"domain": "編程"` (bare string) used to slide
+    straight through `[:3]` and get character-split downstream into garbage
+    domains like ["編","程"] — permanent pollution. valence/arousal were
+    validated; domain/tags were not. Non-list → default; items → str.
+    廉價模型回 `"domain": "編程"`（裸字串）曾直接通過 `[:3]`，在下游被逐字
+    拆成 ["編","程"] 垃圾域——永久性污染。valence/arousal 有校驗，
+    domain/tags 沒有。非 list → 預設；元素 → 字串化。
+    """
+    if not isinstance(value, list):
+        return list(default)
+    out = [str(v).strip() for v in value if str(v).strip()]
+    return out[:cap] if out else list(default)
+
+
 # 脫水輸入天花板。線上最長的桶約 3982 字，舊值 3000 已經在咬它們了（而且咬掉的是
 # 待辦清單）。留餘裕但不無上限：真的超過就明確標記省略，不靜默切。
 # 改這個值要一起把 PROMPT_VERSION 加一號——摘要的涵蓋範圍變了，舊快取不該再命中。
@@ -582,10 +601,10 @@ class Dehydrator:
             valence, arousal = 0.5, 0.3
 
         return {
-            "domain": result.get("domain", ["未分類"])[:3],
+            "domain": _str_list(result.get("domain"), ["未分類"], cap=3),
             "valence": valence,
             "arousal": arousal,
-            "tags": result.get("tags", [])[:15],
+            "tags": _str_list(result.get("tags"), [], cap=15),
             "suggested_name": str(result.get("suggested_name", ""))[:20],
         }
 
@@ -695,10 +714,10 @@ class Dehydrator:
             validated.append({
                 "name": str(item.get("name", ""))[:20],
                 "content": str(item.get("content", "")),
-                "domain": item.get("domain", ["未分類"])[:3],
+                "domain": _str_list(item.get("domain"), ["未分類"], cap=3),
                 "valence": valence,
                 "arousal": arousal,
-                "tags": item.get("tags", [])[:15],
+                "tags": _str_list(item.get("tags"), [], cap=15),
                 "importance": importance,
             })
         return validated

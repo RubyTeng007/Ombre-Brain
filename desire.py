@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import secrets
@@ -412,7 +413,13 @@ def satisfy(state: dict, action: str, now: datetime, note: str = "", degree: flo
     1.0＝完整滿足（原行為）；0.5＝只填了一半，回落減半；0＝沒填上，不動。
     「做了相關的事」但不聲稱滿足 → 用 engage()，不要用低 degree 硬報。"""
     try:
-        degree = _clamp(float(degree))
+        degree = float(degree)
+        # NaN would ride _clamp to 1.0 = "fully satisfied"; a poisoned degree
+        # must mean "no claim", not the maximal one.
+        # NaN 會被 _clamp 抬成 1.0＝「完整滿足」；壞數字該當「沒有主張」。
+        if not math.isfinite(degree):
+            degree = 0.0
+        degree = _clamp(degree)
     except (ValueError, TypeError):
         degree = 1.0
     new = json.loads(json.dumps(state))
@@ -493,7 +500,15 @@ def feed(state: dict, drive: str, amount: float, now: datetime, event: str = "",
     new = json.loads(json.dumps(state))
     if _has_wake_event(new, feed_id, f"feed:{drive}"):
         return new
-    amount = _clamp(float(amount), -1.0, 1.0)
+    amount = float(amount)
+    # NaN slid through _clamp as +1.0 (min/max keep the first comparand on
+    # NaN comparisons): a caller's 0/0 bug became a silent full-strength
+    # feed. A poisoned number must fail loudly, not top up a drive.
+    # NaN 會從 _clamp 溜成 +1.0（min/max 遇 NaN 比較保留первый參數）：
+    # 呼叫端一個 0/0 bug 就變成靜默滿額餵入。壞數字要大聲失敗，不能加水位。
+    if not math.isfinite(amount):
+        raise ValueError(f"feed amount is not finite: {amount!r}")
+    amount = _clamp(amount, -1.0, 1.0)
     if drive == "fatigue":
         new["fatigue"] = round(_clamp(float(new.get("fatigue", 0.0)) + amount), 4)
     elif drive in DRIVE_KEYS:
@@ -686,6 +701,19 @@ class DesireStore:
                                 seen_ids.add(str(item["event_id"]))
                         except (TypeError, ValueError):
                             continue
+            # Self-heal a torn tail: a crash mid-append can leave the last
+            # line without its newline; appending straight after it would
+            # glue two records into one unparseable line and silently drop
+            # BOTH from every reader. One newline fixes it.
+            # 自癒斷尾：append 中途斷電會讓最後一行少換行，直接續寫會把兩筆
+            # 黏成一行垃圾、兩筆都從所有讀取端靜默消失。補一個換行就好。
+            if os.path.exists(self.ledger_path):
+                with open(self.ledger_path, "rb+") as f:
+                    f.seek(0, os.SEEK_END)
+                    if f.tell() > 0:
+                        f.seek(-1, os.SEEK_END)
+                        if f.read(1) != b"\n":
+                            f.write(b"\n")
             with open(self.ledger_path, "a", encoding="utf-8") as f:
                 for e in events:
                     if e.get("event_id") and str(e["event_id"]) in seen_ids:

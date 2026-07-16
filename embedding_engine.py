@@ -87,7 +87,7 @@ class EmbeddingEngine:
         )
         self.last_error = ""
         self.last_success = False
-        self._text_cache: "OrderedDict[str, list[float]]" = OrderedDict()
+        self._text_cache: "OrderedDict[tuple[str, str], list[float]]" = OrderedDict()
         # (model, id_prefix) -> (signature, ids, parsed_vectors); see _load_vectors
         self._matrix_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
 
@@ -226,14 +226,21 @@ class EmbeddingEngine:
             text = self.local_query_prefix + text
         # Truncate to avoid token limits
         truncated = text[:2000]
-        cached = self._text_cache.get(truncated)
+        # Key includes the model: /api/config can swap the embedding model at
+        # runtime, and a text-only key would hand back the OLD model's vector
+        # to be stamped and stored under the NEW model's name — permanent,
+        # undetectable vector-space pollution when dimensions match.
+        # 鍵要含模型：/api/config 可在執行期換嵌入模型，只用文字當鍵會把舊模型
+        # 的向量拿去蓋新模型的章存進庫——維度相同時是永久且不可偵測的污染。
+        cache_key = (self.model, truncated)
+        cached = self._text_cache.get(cache_key)
         if cached is not None:
-            self._text_cache.move_to_end(truncated)
+            self._text_cache.move_to_end(cache_key)
             return list(cached)
         embedding = await self._embed_uncached(truncated)
         if embedding:
-            self._text_cache[truncated] = list(embedding)
-            self._text_cache.move_to_end(truncated)
+            self._text_cache[cache_key] = list(embedding)
+            self._text_cache.move_to_end(cache_key)
             while len(self._text_cache) > _TEXT_CACHE_MAXSIZE:
                 self._text_cache.popitem(last=False)
         return embedding
