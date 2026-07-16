@@ -394,6 +394,10 @@ async def health_check(request):
             "status": "ok",
             "buckets": stats["permanent_count"] + stats["dynamic_count"],
             "decay_engine": "running" if decay_engine.is_running else "stopped",
+            # Flag alone can lie (loop alive, every cycle dying mid-way);
+            # the heartbeat carries the last completed cycle + overdue verdict.
+            # 旗標會說謊（迴圈活著、每輪中途死）；心跳帶最後一輪完成紀錄＋逾期判定。
+            "decay_heartbeat": decay_engine.heartbeat(),
         })
     except Exception as e:
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
@@ -876,6 +880,24 @@ async def breath(
     def _excluded(meta: dict) -> bool:
         return bool(exclude_set) and bool(set(meta.get("domain", []) or []) & exclude_set)
 
+    # A hand-edited bucket (importance: null / "high") must cost itself its
+    # ranking, never the whole breath: these casts sit under sort keys and
+    # filters where one bad value used to abort the entire surfacing call.
+    # 手編輯壞掉的桶（importance: null／字串）只能賠上它自己的排序，
+    # 不能賠上整口呼吸：這些轉型墊在排序鍵與過濾器底下，
+    # 一個壞值曾經能讓整次浮現直接拋錯。
+    def _meta_int(meta: dict, key: str, default: int) -> int:
+        try:
+            return int(meta.get(key, default) or default)
+        except (ValueError, TypeError):
+            return default
+
+    def _meta_float(meta: dict, key: str, default: float) -> float:
+        try:
+            return float(meta.get(key, default) or default)
+        except (ValueError, TypeError):
+            return default
+
     # --- Catalog mode: one metadata line per bucket, zero LLM calls ---
     # --- 目錄模式：一行一桶，0 次 LLM 呼叫，token 預算內裝多少列多少 ---
     if catalog:
@@ -891,7 +913,12 @@ async def breath(
                 continue  # feel/mirage(夢) 是私人通道，目錄也不列
             if domain_filter and not (set(meta.get("domain", [])) & domain_filter):
                 continue
-            if _excluded(meta):
+            # Pinned buckets are exempt from exclude_domain here too — the
+            # tool doc promises it for every mode, and catalog used to be the
+            # one mode that quietly broke the promise.
+            # 釘選桶在目錄模式同樣豁免排除——工具文檔對所有模式承諾了這件事，
+            # 目錄模式曾是唯一偷偷破例的。
+            if _excluded(meta) and not (meta.get("pinned") or meta.get("protected")):
                 continue
             rows.append(b)
         if not rows:
@@ -945,13 +972,13 @@ async def breath(
         importance_domains = set(normalize_domains([d.strip() for d in domain.split(",") if d.strip()]))
         filtered = [
             b for b in all_buckets
-            if int(b["metadata"].get("importance", 0)) >= importance_min
+            if _meta_int(b["metadata"], "importance", 0) >= importance_min
             and b["metadata"].get("type") not in ("feel", "plan", "mirage")
             and not b["metadata"].get("digested", False)
             and (not importance_domains or set(b["metadata"].get("domain", [])) & importance_domains)
             and not _excluded(b["metadata"])
         ]
-        filtered.sort(key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True)
+        filtered.sort(key=lambda b: _meta_int(b["metadata"], "importance", 0), reverse=True)
         filtered = _select_importance_tiers(filtered, cap=min(20, max_results))
         if not filtered:
             return f"沒有重要度 >= {importance_min} 的記憶。"
@@ -1074,7 +1101,7 @@ async def breath(
         ]
         pinned_buckets.sort(
             key=lambda b: (
-                int(b["metadata"].get("importance", 0)),
+                _meta_int(b["metadata"], "importance", 0),
                 str(b["metadata"].get("name", b["id"])),
             ),
             reverse=True,
@@ -1169,8 +1196,8 @@ async def breath(
 
         cold_start = [
             b for b in unresolved
-            if float(b["metadata"].get("activation_count", 0)) == 0
-            and int(b["metadata"].get("importance", 0)) >= 8
+            if _meta_float(b["metadata"], "activation_count", 0.0) == 0
+            and _meta_int(b["metadata"], "importance", 0) >= 8
             and _is_recent(b["metadata"])
         ][:2]
         cold_start_ids = {b["id"] for b in cold_start}
@@ -2090,6 +2117,26 @@ async def pulse(verbose: bool = False, include_archive: bool = False) -> str:
         desire_health = "健康" if desire_pending == 0 else f"待補寫 {desire_pending} 筆"
     except Exception as exc:
         desire_health = f"損壞／不可讀（{type(exc).__name__}）"
+    # Heartbeat, not just the flag: pulse is what a session actually reads,
+    # so a silently-halted decay loop must be visible right here.
+    # 心跳而不只是旗標：session 真正會讀的是 pulse，
+    # 衰減靜默停擺必須在這一行就看得見。
+    try:
+        hb = decay_engine.heartbeat()
+        if not hb["running"]:
+            decay_line = "已停止"
+        elif hb["overdue"]:
+            decay_line = f"⚠️ 逾期（旗標運行中，但上輪完成於 {hb['last_cycle_at'] or '從未'}——去查 log）"
+        else:
+            res = hb.get("last_cycle_result") or {}
+            decay_line = (
+                f"運行中（上輪 {str(hb['last_cycle_at'])[:16]} 完成："
+                f"檢查 {res.get('checked', '?')}、歸檔 {res.get('archived', '?')}）"
+                if hb.get("last_cycle_at")
+                else "運行中（本進程尚未跑過一輪）"
+            )
+    except Exception:
+        decay_line = "運行中" if decay_engine.is_running else "已停止"
     status = (
         f"=== Ombre Brain 記憶系統 ===\n"
         f"固化記憶桶: {stats['permanent_count']} 個\n"
@@ -2101,7 +2148,7 @@ async def pulse(verbose: bool = False, include_archive: bool = False) -> str:
         f"慾望帳本: {desire_health}\n"
         f"歸檔記憶桶: {stats['archive_count']} 個\n"
         f"總存儲大小: {stats['total_size_kb']:.1f} KB\n"
-        f"衰減引擎: {'運行中' if decay_engine.is_running else '已停止'}\n"
+        f"衰減引擎: {decay_line}\n"
     )
 
     # --- Compact by default: health summary only, skip the heavy bucket list ---
@@ -4369,6 +4416,7 @@ async def api_system_status(request):
 
         return JSONResponse({
             "decay_engine": "running" if decay_engine.is_running else "stopped",
+            "decay_heartbeat": decay_engine.heartbeat(),
             "metabolism": metabolism,
             "embedding_enabled": embedding_engine.enabled,
             "api_usage_ok": usage.get("ok", False),

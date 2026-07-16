@@ -153,12 +153,49 @@ class DecayEngine:
         # --- Background task control / 後臺任務控制 ---
         self._task: asyncio.Task | None = None
         self._running = False
+        # --- Heartbeat: proof of the last cycle, not just a flag ---
+        # --- 心跳：上一輪真的跑過的證據，而不只是一面旗 ---
+        # The 2026-07 ten-day silent halt was found by a person, not a
+        # dashboard: _running stayed True while every cycle died mid-loop.
+        # These fields let /health and pulse show *when* the last cycle
+        # actually completed and what it did.
+        # 2026-07 那次十天靜默停擺是人發現的，不是儀表：迴圈每輪中途死，
+        # _running 卻一直是 True。這兩個欄位讓 /health 和 pulse 能回答
+        # 「上一輪什麼時候真的跑完、做了什麼」。
+        self._last_cycle_at: str | None = None
+        self._last_cycle_result: dict | None = None
 
     @property
     def is_running(self) -> bool:
         """Whether the decay engine is running in the background.
         衰減引擎是否正在後臺運行。"""
         return self._running
+
+    def heartbeat(self) -> dict:
+        """Liveness evidence for dashboards: running flag + last completed
+        cycle + overdue verdict (no cycle within 2× the check interval).
+        給儀表的存活證據：運行旗標＋最後一輪完成紀錄＋是否逾期
+        （超過 2× 檢查間隔沒有任何一輪跑完）。"""
+        overdue = False
+        if self._running:
+            if self._last_cycle_at is None:
+                overdue = True
+            else:
+                ts = parse_bucket_ts(self._last_cycle_at)
+                if ts is None:
+                    overdue = True
+                else:
+                    age_h = (datetime.now() - ts).total_seconds() / 3600
+                    try:
+                        overdue = age_h > 2 * float(self.check_interval)
+                    except (ValueError, TypeError):
+                        overdue = age_h > 48
+        return {
+            "running": self._running,
+            "last_cycle_at": self._last_cycle_at,
+            "last_cycle_result": self._last_cycle_result,
+            "overdue": overdue,
+        }
 
     # ---------------------------------------------------------
     # Core: calculate decay score for a single bucket
@@ -240,8 +277,21 @@ class DecayEngine:
         if bucket_type in NON_DECAYING_TYPES:
             return _EXEMPT_SCORES[bucket_type]
 
-        importance = max(1, min(10, int(metadata.get("importance", 5))))
-        activation_count = max(1.0, float(metadata.get("activation_count", 1)))
+        # Hand-edited buckets are supported input (Obsidian workflow), so a
+        # poison value (null / "high") must degrade to the default, not raise:
+        # this function sits under surfacing sort keys and the decay loop,
+        # where one bad bucket used to take the whole breath / cycle with it.
+        # 手編輯的桶是明文支援的輸入（Obsidian 工作流），毒值（null／字串）
+        # 必須退回預設而不是拋錯：這函數墊在浮現排序與衰減迴圈底下，
+        # 一顆壞桶曾經能把整口呼吸／整輪衰減一起帶走。
+        try:
+            importance = max(1, min(10, int(metadata.get("importance", 5) or 5)))
+        except (ValueError, TypeError):
+            importance = 5
+        try:
+            activation_count = max(1.0, float(metadata.get("activation_count", 1) or 1))
+        except (ValueError, TypeError):
+            activation_count = 1.0
 
         # --- Days since last activation ---
         days_since = self._days_since_active(metadata)
@@ -483,7 +533,10 @@ class DecayEngine:
             buckets = await self.bucket_mgr.list_all(include_archive=False)
         except Exception as e:
             logger.error(f"Failed to list buckets for decay / 衰減週期列桶失敗: {e}")
-            return {"checked": 0, "archived": 0, "lowest_score": 0, "error": str(e)}
+            result = {"checked": 0, "archived": 0, "lowest_score": 0, "error": str(e)}
+            self._last_cycle_at = datetime.now().isoformat()
+            self._last_cycle_result = result
+            return result
 
         checked = 0
         archived = 0
@@ -492,6 +545,16 @@ class DecayEngine:
 
         for bucket in buckets:
             meta = bucket.get("metadata", {})
+            # A hand-mangled file can carry a non-dict metadata; skip it
+            # instead of aborting the cycle for every bucket after it.
+            # 手改壞的檔案可能讓 metadata 不是 dict；跳過它，
+            # 不讓它之後的所有桶陪葬整輪衰減。
+            if not isinstance(meta, dict):
+                logger.warning(
+                    f"Skipping bucket with non-dict metadata / 跳過 metadata 損壞的桶: "
+                    f"{bucket.get('id', '?')}"
+                )
+                continue
 
             # Skip permanent / pinned / protected / feel / plan / mirage buckets
             # 跳過固化桶、釘選/保護桶、feel、plan、mirage 桶
@@ -508,13 +571,19 @@ class DecayEngine:
             # --- Auto-resolve: imp≤4 + >30 days old + not resolved → auto resolve ---
             # --- 自動結案：重要度≤4 + 超過30天 + 未解決 → 自動 resolve ---
             if not meta.get("resolved", False):
-                imp = int(meta.get("importance", 5))
-                last_active_str = meta.get("last_active", meta.get("created", ""))
                 try:
-                    last_active = datetime.fromisoformat(str(last_active_str))
-                    days_since = (datetime.now() - last_active).total_seconds() / 86400
+                    imp = int(meta.get("importance", 5) or 5)
                 except (ValueError, TypeError):
-                    days_since = 999
+                    imp = 5
+                # Shared parser, and the fail direction is retention: the old
+                # inline parse fell to days_since=999 on any tz-aware stamp
+                # (naive−aware TypeError), auto-resolving a memory written
+                # yesterday. _days_since_active returns 30.0 on unparseable,
+                # which can never cross the >30 gate below.
+                # 共用解析器，失敗方向是保留：舊的行內解析碰到帶時區的時間戳
+                # 會掉到 999 天，把昨天寫的記憶自動結案。_days_since_active
+                # 解析不了時回 30.0，永遠跨不過下面的 >30 門檻。
+                days_since = self._days_since_active(meta)
                 if imp <= 4 and days_since > 30:
                     try:
                         await self.bucket_mgr.update(bucket["id"], resolved=True, actor=ACTOR_DECAY)
@@ -568,6 +637,8 @@ class DecayEngine:
             "lowest_score": lowest_score if checked > 0 else 0,
             **hygiene,
         }
+        self._last_cycle_at = datetime.now().isoformat()
+        self._last_cycle_result = result
         logger.info(f"Decay cycle complete / 衰減週期完成: {result}")
         return result
 
@@ -637,6 +708,21 @@ class DecayEngine:
             return
         self._running = True
         self._task = asyncio.create_task(self._background_loop())
+        # If the loop task ever dies outside its own except (e.g. a bad
+        # config type making asyncio.sleep raise), flip the flag so /health
+        # stops claiming "running" for a corpse.
+        # 迴圈 task 若死在自己的 except 之外（例如壞掉的 config 型別讓
+        # asyncio.sleep 拋錯），把旗標翻回來——/health 不替屍體說「運行中」。
+        def _on_task_done(task: "asyncio.Task") -> None:
+            self._running = False
+            if not task.cancelled():
+                exc = task.exception()
+                if exc is not None:
+                    logger.error(
+                        f"Decay loop task died unexpectedly / 衰減迴圈 task 意外死亡: {exc!r}"
+                    )
+
+        self._task.add_done_callback(_on_task_done)
         logger.info(
             f"Decay engine started, interval: {self.check_interval}h / "
             f"衰減引擎已啟動，檢查間隔: {self.check_interval} 小時"

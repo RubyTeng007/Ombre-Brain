@@ -498,7 +498,10 @@ class BucketManager:
                 # Remember pre-pin importance so unpin can restore it
                 # 記住釘選前的重要度，取消釘選時恢復
                 if not was_pinned and "importance_prepin" not in post.metadata:
-                    post["importance_prepin"] = int(post.get("importance", 5))
+                    try:
+                        post["importance_prepin"] = int(post.get("importance", 5) or 5)
+                    except (ValueError, TypeError):
+                        post["importance_prepin"] = 5
                 post["importance"] = 10  # pinned → lock importance to 10
             elif was_pinned and "importance_prepin" in post.metadata:
                 post["importance"] = max(1, min(10, int(post.metadata.pop("importance_prepin"))))

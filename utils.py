@@ -318,7 +318,10 @@ def select_importance_tiers(filtered: list, cap: int = 20) -> list:
     reserved_ids = set()
     tiers_seen = set()
     for b in sorted(filtered, key=_last_active, reverse=True):
-        tier = int(b["metadata"].get("importance", 0))
+        try:
+            tier = int(b["metadata"].get("importance", 0) or 0)
+        except (ValueError, TypeError):
+            tier = 0
         if tier not in tiers_seen:
             tiers_seen.add(tier)
             reserved_ids.add(b["id"])

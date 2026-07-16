@@ -48,6 +48,9 @@ def wired(test_config, bucket_mgr, mock_embedding_engine, mock_dehydrator, monke
     decay_stub.is_running = True
     decay_stub.ensure_started = AsyncMock()
     decay_stub.calculate_score = lambda meta: 5.0
+    decay_stub.heartbeat = MagicMock(return_value={
+        "running": True, "last_cycle_at": None, "last_cycle_result": None, "overdue": False,
+    })
     usage_stub = MagicMock()
     usage_stub.check_all = AsyncMock(return_value={"ok": True, "warnings": []})
     letters_stub = MagicMock()
