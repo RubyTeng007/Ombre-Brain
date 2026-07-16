@@ -889,6 +889,7 @@ class BucketManager:
         domain_filter: list[str] = None,
         query_valence: float = None,
         query_arousal: float = None,
+        exclude_domains: list[str] = None,
     ) -> list[dict]:
         """
         Multi-dimensional indexed search for memory buckets.
@@ -896,6 +897,8 @@ class BucketManager:
 
         domain_filter: pre-filter by domain (None = search all)
         query_valence/arousal: emotion coordinates for resonance scoring
+        exclude_domains: drop buckets carrying ANY of these domains (the
+        inverse of domain_filter; batch-7 檔1)
         """
         if not query or not query.strip():
             return []
@@ -909,6 +912,19 @@ class BucketManager:
         # --- feel 是獨立私人通道，永遠不進普通搜索；plan 只活在 dream 尾端，
         # 排除在搜索外也保證合併管線永遠不會把普通記憶併進 plan。---
         all_buckets = [b for b in all_buckets if b["metadata"].get("type") not in ("feel", "plan", "mirage")]
+
+        # --- exclude_domains applies at the POOL level, not as a post-filter:
+        # BM25 (layer 1.6) re-adds strong keyword hits from all_buckets, so an
+        # exclusion any later would leak through that rejoin path.
+        # --- 排除落在「底池」層而不是事後過濾：BM25（第1.6層）會從 all_buckets
+        # 補回強關鍵詞命中，排除放後面就會被那條補回路徑漏過。---
+        if exclude_domains:
+            ex_set = {d.lower() for d in normalize_domains(exclude_domains)}
+            if ex_set:
+                all_buckets = [
+                    b for b in all_buckets
+                    if not ({d.lower() for d in b["metadata"].get("domain", []) or []} & ex_set)
+                ]
 
         if not all_buckets:
             return []

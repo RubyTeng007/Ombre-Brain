@@ -26,6 +26,7 @@ from datetime import datetime
 
 from utils import NON_DECAYING_TYPES, is_decay_exempt, parse_bucket_ts
 from bucket_history import ACTOR_DECAY
+from bucket_manager import normalize_domains
 
 logger = logging.getLogger("ombre_brain.decay")
 
@@ -95,6 +96,54 @@ class DecayEngine:
         # 是這兩個的中點，改任一個峰值就跟著跑。
         self.danger_min = float(heat_cfg.get("danger_min", 0.15))
         self.danger_max = float(heat_cfg.get("danger_max", 0.35))
+
+        # --- Per-domain metabolism factors (2026-07-16 batch-7 檔1) ---
+        # Multiplies the heat HALF-LIFE only. calculate_score (archive triage)
+        # is untouched: a fast-metabolizing bucket fades from surfacing sooner
+        # but is archived on the same schedule — 「淡忘不刪除」 holds. Verified
+        # before shipping: lost-tier buckets never occupy surfacing slots
+        # (server.py's normal_pick filters tier != lost BEFORE slicing), so
+        # accelerating heat cannot create tombstones that hog the breath.
+        # --- per-domain 代謝係數（檔1）：只乘熱度「半衰期」。score（歸檔分流）
+        # 不動——代謝快的桶更早淡出浮現，但歸檔節奏照舊。實作前已讀碼驗證：
+        # lost 桶不佔浮現名額（normal_pick 先濾 lost 再切名額），
+        # 加速 heat 不會製造霸名額的墓碑。---
+        # Empty config = factor 1.0 everywhere = feature off. Unknown domains
+        # fail OPEN to `default` (the taxonomy is LLM-assigned with no
+        # whitelist, so an unrecognized domain must never be punished).
+        # Non-positive factors are config nonsense and are dropped: a 0 here
+        # would floor the half-life and hide memories — heat must fail vivid.
+        # 空配置＝全 1.0＝功能關閉。未知域 fail-open 用 default（taxonomy 是
+        # LLM 軟給的、無白名單，不認得的域絕不能被罰）。非正數係數直接丟棄：
+        # 0 會把半衰期打到地板、把記憶藏起來——heat 壞掉必須偏鮮明。
+        metab_cfg = decay_cfg.get("metabolism_factor", {}) or {}
+        try:
+            self.metabolism_default = float(metab_cfg.get("default", 1.0))
+        except (ValueError, TypeError):
+            self.metabolism_default = 1.0
+        if self.metabolism_default <= 0:
+            self.metabolism_default = 1.0
+        self.metabolism_factors: dict[str, float] = {}
+        for key, value in metab_cfg.items():
+            if key == "default":
+                continue
+            try:
+                factor = float(value)
+            except (ValueError, TypeError):
+                continue
+            if factor <= 0:
+                continue
+            # Normalize the config side the same way bucket domains are
+            # normalized at write time, so a simplified-Chinese key still lands.
+            # config 端照桶寫入時的同一套正規化，簡體鍵也能對上。
+            for norm in normalize_domains([str(key)]):
+                self.metabolism_factors[norm] = factor
+        try:
+            self.metabolism_exempt_importance = int(
+                decay_cfg.get("metabolism_exempt_importance", 8)
+            )
+        except (ValueError, TypeError):
+            self.metabolism_exempt_importance = 8
 
         self.bucket_mgr = bucket_mgr
         # Optional: embedding engine for the daily vector-hygiene sweep
@@ -294,6 +343,10 @@ class DecayEngine:
 
         Exempt buckets return 1.0 — same exemption set as calculate_score.
         豁免桶回 1.0——與 calculate_score 同一組豁免。
+
+        H additionally carries metabolism_factor(domains) — per-domain
+        half-life scaling (2026-07-16 batch-7); see metabolism_factor below.
+        H 另乘 per-domain 代謝係數（檔1），見下方 metabolism_factor。
         """
         if not isinstance(metadata, dict):
             return 0.0
@@ -322,8 +375,54 @@ class DecayEngine:
             * (importance / 5.0)
             * (activation ** 0.3)
             * emotion_weight
+            * self.metabolism_factor(metadata)
         )
         return max(0.0, min(1.0, 2.0 ** (-days_since / max(0.1, half_life))))
+
+    def metabolism_factor(self, metadata: dict) -> float:
+        """
+        Per-domain metabolism multiplier for the heat half-life, 2026-07-16
+        batch-7 檔1. <1 = fades faster (engineering chatter), >1 = retained
+        longer (relationship memory).
+        per-domain 代謝係數（乘在熱度半衰期上）：<1 淡得快（工程流水），
+        >1 留得久（關係記憶）。
+
+        Rules / 規則:
+        - Multi-domain takes the MAX factor — lean preservative. A dual-domain
+          memory (「凌晨三點陪 debug」＝編程×戀愛) inherits its slowest
+          metabolism; acceleration can only ever hit pure-engineering buckets.
+          多域取最大＝偏保留：雙域記憶跟著最慢的代謝走，加速永遠只落在
+          純工程桶上。
+        - Unknown / empty domains fail OPEN to `default` (1.0).
+          未知／未分類域 fail-open 用 default（1.0）。
+        - importance >= metabolism_exempt_importance never accelerates: the
+          factor floors at 1.0 (protective >1 factors are kept). Lessons and
+          incidents (檔0 rule: importance >= 7-8) must not be fast-forgotten.
+          importance 達豁免線的桶不加速：係數下限 1.0（保護性 >1 照舊）。
+          教訓／事故不加速淡忘。
+        - Any error returns 1.0 — the feature fails as if it weren't there,
+          same contract as the surfacing heat helpers.
+          任何錯誤回 1.0——壞掉時就當這功能不存在，與浮現側熱度輔助同一契約。
+        """
+        try:
+            domains = metadata.get("domain", []) or []
+            if domains:
+                factor = max(
+                    self.metabolism_factors.get(str(d), self.metabolism_default)
+                    for d in domains
+                )
+            else:
+                factor = self.metabolism_default
+            if factor < 1.0:
+                try:
+                    importance = max(1, min(10, int(metadata.get("importance", 5) or 5)))
+                except (ValueError, TypeError):
+                    importance = 5
+                if importance >= self.metabolism_exempt_importance:
+                    factor = 1.0
+            return factor
+        except Exception:
+            return 1.0
 
     def heat_tier(self, heat: float) -> str:
         """

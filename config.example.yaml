@@ -75,6 +75,24 @@ decay:
     danger_max: 0.35              # 危險區上界：高於此＝還鮮明，不需要救
                                   # 峰值 = 兩者中點 = 0.25，不是常數，改任一個就跟著跑
 
+  # --- Per-domain 代謝係數（2026-07-16 批7 檔1）---
+  # 乘在 heat 的「半衰期」上：<1 淡得快（工程流水），>1 留得久（關係記憶）。
+  # 只動 heat（浮現分層），不動 score（歸檔分流）——「淡忘不刪除」不變。
+  # 多域桶取最大係數（偏保留：雙域記憶跟最慢的代謝走，加速只落在純工程桶）。
+  # 未列出的域走 default（fail-open：taxonomy 是 LLM 軟給的，不認得不能罰）。
+  # 整段註釋掉＝全 1.0＝功能關閉。
+  # metabolism_factor:
+  #   編程: 0.5
+  #   工作: 0.5
+  #   AI: 0.7
+  #   數字: 0.7
+  #   硬件: 0.7
+  #   戀愛: 1.5
+  #   人際: 1.3
+  #   內心: 1.3
+  #   default: 1.0
+  # metabolism_exempt_importance: 8   # importance >= 此值不加速（教訓/事故不快忘），保護性 >1 照舊
+
 # --- Embedding / 向量化配置 ---
 # Uses embedding API for semantic similarity search
 # 通过 embedding API 实现语义相似度搜索
@@ -107,6 +125,15 @@ scoring_weights:
   emotion_resonance: 2.0
   time_proximity: 1.5
   importance: 1.0
+
+# --- Surfacing quotas / 浮現配額（2026-07-16 批7 檔1）---
+# 純工程桶（domains ⊆ eng_domains，非空）在浮現名額裡的護欄——不是牆：
+# 超額的工程桶讓位給非工程桶；非工程候選不夠時工程桶回填，名額永不浪費。
+# 含任一非工程域的多域桶不算純工程，不受配額影響。
+surfacing:
+  eng_domains: [編程, 工作, AI, 數字, 硬件]   # 工程域集合（配額與 breath 判定共用）
+  eng_quota_ratio: 0.3333       # 一般名額純工程上限 = ceil(名額 × ratio)（≈1/3，寬）
+  dz_eng_quota_ratio: 0.5       # 危險區名額純工程上限 = floor(名額 × ratio)（1/2，嚴）
 
 # --- Fuzzy matching / 模糊匹配参数 ---
 matching:

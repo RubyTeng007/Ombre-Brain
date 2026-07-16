@@ -1,7 +1,46 @@
 # Ombre Brain — 内部开发文档 / INTERNALS
 
 > 本文档面向开发者和维护者。记录功能总览、环境变量、模块依赖、硬编码值和核心设计决策。
-> 最后更新：2026-07-15（記憶批：漸層模糊／危險區複習／可復原；0 章節之後的細節以程式碼為準）
+> 最后更新：2026-07-16（批7 記憶代謝檔1：配額＋代謝率＋exclude；0 章節之後的細節以程式碼為準）
+
+## 1.1 2026-07-16 批7 記憶代謝檔1（配額＋per-domain 代謝率＋exclude_domain；Ruby 拍板方向、Cyan 定案）
+
+設計書：`cyan-vps-work/design/MEMORY_METABOLISM.md` §3。背景實測（live，部署前 baseline）：
+動態池 532 桶中純工程 187（35.2%）、危險區 24 桶中工程 3、浮現池 top-20 工程 7/20、
+平均 heat 工程 0.742 > 關係 0.680（工程記憶新鮮所以 heat 反而高——domain-blind 的具象證據）。
+
+- **§3.3 必答題的讀碼答案（本批最重要的一句）**：lost-tier（heat≤0.3）高分桶**不佔浮現名額**。
+  `normal_pick` 是「先濾 `_tier_of != "lost"`、後切 `[:normal_slots]`」（server.py 浮現段），
+  lost 桶只進墓碑點名（約 30 token、不佔額）。所以**代謝係數只乘 heat、不乘 score**：
+  score 繼續管排序＋歸檔分流（`run_decay_cycle` 的 score<0.3），歸檔節奏不變，「淡忘不刪除」不變。
+- **per-domain 代謝係數（`decay_engine.metabolism_factor`）**：`calculate_heat` 的半衰期 H 另乘
+  factor。config：`decay.metabolism_factor`（map 含 `default`）＋`decay.metabolism_exempt_importance`（8）。
+  規則：多域取**最大**（偏保留——雙域記憶跟最慢的代謝走，數學上加速只可能落在純工程桶：
+  非工程域的 factor 全部 ≥1）；未知/空域 fail-open 用 default 1.0（taxonomy 是 LLM 軟給的）；
+  importance ≥ 豁免線時 factor **下限 1.0**（教訓/事故不加速；保護性 >1 照舊——是地板不是天花板）；
+  非正數配置直接丟棄（0 會把半衰期打到地板「藏記憶」——heat 壞掉必須偏鮮明）；任何錯誤回 1.0。
+  **空配置＝全 1.0＝功能關閉**（測試 fixture 因此逐位不變）。
+- **浮現工程配額（`server._pick_with_eng_quota`）**：純工程桶＝**非空** domains ⊆
+  `surfacing.eng_domains`（默認{編程,工作,AI,數字,硬件}）；空 domains／含任一非工程域＝不算。
+  一般名額封頂 `ceil(名額 × eng_quota_ratio)`（默認 1/3，寬）、危險區封頂
+  `floor(名額 × dz_eng_quota_ratio)`（默認 0.5，嚴——危險區是 07-16 實測漏風口）。
+  **回填不變量**：非工程候選不夠時被排開的工程桶回填（附加在後），選取數恆＝min(limit, 候選數)
+  ——`test_two_to_one_split` 的 danger+normal==total 算術因此不用改。判定 helper 放 server 本地
+  而非 DecayEngine 方法：batch2 的 wired 測試把 decay_engine 換成 MagicMock，掛方法會被樁污染成永真。
+- **`breath(exclude_domain=…)`**：domain 過濾的取反（交集判定），**四模式一致**
+  （浮現/query/catalog/importance_min——設計書只要求前兩者，統一是為了不留「靜默忽略參數」的坑）。
+  浮現模式**釘選桶豁免**（刻意偏離「嚴格對稱」：使用規則釘選桶帶 domain=AI，
+  不豁免的話頻道開場 exclude 工程域會把身分錨點一起排掉——防污染護欄不能讓醒來失去名字）。
+  query 模式排除落在 `bucket_manager.search` 的**底池層**（不是事後過濾）：BM25 第1.6層會從
+  all_buckets 補回強命中，排除放後面會被那條路徑漏過；向量通道與隨機浮現在 server 側同步把關。
+- **儀表（驗證靠儀表不靠人）**：`/api/status` 新增 `metabolism` 塊（純工程桶佔比／危險區組成／
+  工程與關係平均 heat），dashboard 設置頁渲染。與配額共用同一組判定，儀表不會與引擎各說各話。
+- **部署順序依賴**：頻道端 CLAUDE.md 開場的 `exclude_domain` 必須在 Ombre server 之後上
+  （舊 server 收到未知參數會報錯）；反向安全（新參數有默認值）。
+- **本批不動的（鐵律）**：全局 λ=0.05；arousal 權重三天翻轉（§1.0：刻意設計）；
+  `NON_DECAYING_TYPES` 唯一份；calculate_score 一個字不動；decay_engine :194/:412 的
+  importance 空值坑是另一個 plan（f017f）的事，本批不順手修。
+- 測試：`tests/test_batch7.py`（36 條，全部斷言規則而非值）；全套 399 pass。
 
 ## 1.0 2026-07-15 記憶批（漸層模糊、危險區複習、dream 可復原；Ruby 逐項拍板）
 

@@ -1400,11 +1400,18 @@ async function loadSettingsStatus() {
     const noticeEl = document.getElementById('settings-env-notice');
     if (d.using_env_password) noticeEl.style.display = 'block';
     else noticeEl.style.display = 'none';
+    const m = d.metabolism || {};
+    const metabolismLines = (m.dynamic_count ?? null) !== null ? `
+      <b>純工程桶佔比</b>：${m.pure_eng_pct ?? '?'}%（${m.pure_eng_count ?? '?'}/${m.dynamic_count ?? '?'}）<br>
+      <b>危險區組成</b>：${m.danger_zone_total ?? '?'} 桶，其中工程 ${m.danger_zone_eng ?? '?'}<br>
+      <b>平均熱度</b>：工程 ${m.avg_heat_pure_eng ?? '—'} / 關係 ${m.avg_heat_relation ?? '—'}<br>
+    ` : '';
     el.innerHTML = `
       <b>版本</b>：${d.version}<br>
       <b>Bucket 總數</b>：${(d.buckets?.total ?? 0)} （永久:${d.buckets?.permanent ?? 0} / 動態:${d.buckets?.dynamic ?? 0} / 歸檔:${d.buckets?.archive ?? 0}）<br>
       <b>衰減引擎</b>：${d.decay_engine}<br>
       <b>向量搜索</b>：${d.embedding_enabled ? '已啟用' : '未啟用'}<br>
+      ${metabolismLines}
     `;
   } catch(e) {
     el.textContent = '加載失敗: ' + e;

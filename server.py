@@ -38,6 +38,7 @@
 
 import os
 import sys
+import math
 import random
 import logging
 import asyncio
@@ -611,6 +612,78 @@ def _tombstone_line(lost: list) -> str:
     return head + "、".join(shown) + "——要挖出來用 breath(query=…)）"
 
 
+# --- Surfacing domain quota (2026-07-16 batch-7 檔1) ---
+# The pool is 35% pure-engineering (187/532 measured on live, 2026-07-16) and
+# surfacing ranks domain-blind, so engineering chatter competes with
+# relationship memory for the same breath. The quota is a GUARDRAIL, not a
+# wall: engineering picks are capped per channel, but when there aren't
+# enough non-engineering candidates the deferred ones backfill — a quota can
+# re-allocate a breath, never shrink it.
+# --- 浮現 domain 配額（檔1）---
+# 動態池 35% 是純工程桶（2026-07-16 live 實測 187/532），浮現排序 domain-blind，
+# 工程流水跟關係記憶搶同一口呼吸。配額是護欄不是牆：每通道封頂工程名額，
+# 但非工程候選不夠時被排開的工程桶回填——配額只重新分配呼吸，永不縮小它。
+
+_ENG_DOMAINS_DEFAULT = ("編程", "工作", "AI", "數字", "硬件")
+
+
+def _eng_domain_set() -> frozenset:
+    """Engineering-domain set from config (surfacing.eng_domains). Falls back
+    to the design default; an empty/broken value disables the quota (fail
+    open — a config typo must show more memory, never hide it).
+    工程域集合（config: surfacing.eng_domains）。壞值＝配額停用（fail-open：
+    config 打錯只能多看見，不能藏記憶）。"""
+    try:
+        raw = (config.get("surfacing", {}) or {}).get("eng_domains", _ENG_DOMAINS_DEFAULT)
+        return frozenset(normalize_domains([str(d).strip() for d in raw if str(d).strip()]))
+    except Exception:
+        return frozenset()
+
+
+def _is_pure_eng(meta: dict, eng_domains: frozenset) -> bool:
+    """Pure-engineering bucket = non-empty domains ⊆ eng_domains.
+    A bucket carrying ANY non-engineering domain (戀愛/人際/內心/日常…) is NOT
+    pure — dual-domain memories (「凌晨三點陪 debug」) are never quota-capped.
+    Unclassified (empty domains) is not pure either: fail open.
+    純工程桶＝非空 domains ⊆ 工程域集合。含任一非工程域的多域桶不算純工程
+    （雙域記憶永不被配額壓制）；未分類（空 domains）也不算：fail-open。"""
+    if not eng_domains:
+        return False
+    domains = meta.get("domain", []) or []
+    return bool(domains) and set(domains) <= eng_domains
+
+
+def _pick_with_eng_quota(ordered: list, limit: int, quota: int, eng_domains: frozenset) -> list:
+    """Fill up to `limit` slots from `ordered`, capping pure-engineering picks
+    at `quota`. Deferred engineering buckets BACKFILL leftover slots (appended
+    after their rank, deprioritized within the breath). Invariant: the pick
+    count equals min(limit, len(ordered)) — the quota re-allocates slots,
+    it never burns them. (test_two_to_one_split's danger+normal==total
+    arithmetic depends on this.)
+    照序選滿 limit 個名額，純工程桶最多佔 quota 席；被排開的工程桶回填剩餘
+    名額（附加在後，呼吸內順位降低）。不變量：選取數＝min(limit, 候選數)——
+    配額只重新分配名額，永不燒掉名額。"""
+    picked: list = []
+    deferred_eng: list = []
+    eng_used = 0
+    for b in ordered:
+        if len(picked) >= limit:
+            break
+        if _is_pure_eng(b["metadata"], eng_domains):
+            if eng_used < quota:
+                picked.append(b)
+                eng_used += 1
+            else:
+                deferred_eng.append(b)
+        else:
+            picked.append(b)
+    for b in deferred_eng:
+        if len(picked) >= limit:
+            break
+        picked.append(b)
+    return picked
+
+
 def _log_merge_audit(bucket_id: str, old_content: str, new_content: str, merged: str, mode: str) -> None:
     """Append a merge record to merge_audit.jsonl — merging is the only destructive
     write in the pipeline, so every merge keeps a recoverable before/after trail.
@@ -772,18 +845,36 @@ async def breath(
     query: str = "",
     max_tokens: int = 10000,
     domain: str = "",
+    exclude_domain: str = "",
     valence: float = -1,
     arousal: float = -1,
     max_results: int = 20,
     importance_min: int = -1,
     catalog: bool = False,
 ) -> str:
-    """檢索/浮現記憶。不傳query或傳空=自動浮現,有query=關鍵詞檢索。catalog=True=目錄模式:每桶一行元數據(0次LLM呼叫,最省token),適合開場先看目錄再精準拉取,可配domain過濾。max_tokens控制返回總token上限(默認10000)。domain逗號分隔,valence/arousal 0~1(-1忽略)。max_results=動態浮現/檢索結果的數量上限(默認20,最大50);釘選桶是常駐的,不佔這個額度。importance_min>=1時按重要度批量拉取(不走語義搜索,按importance降序返回最多20條)。
+    """檢索/浮現記憶。不傳query或傳空=自動浮現,有query=關鍵詞檢索。catalog=True=目錄模式:每桶一行元數據(0次LLM呼叫,最省token),適合開場先看目錄再精準拉取,可配domain過濾。max_tokens控制返回總token上限(默認10000)。domain逗號分隔,valence/arousal 0~1(-1忽略)。exclude_domain逗號分隔=排除含任一這些域的桶(domain交集判定取反,各模式通用;釘選桶是常駐核心準則,不受排除影響)——伴侶場景開場可用 exclude_domain="編程,工作,AI,數字,硬件" 不撈工程。max_results=動態浮現/檢索結果的數量上限(默認20,最大50);釘選桶是常駐的,不佔這個額度。importance_min>=1時按重要度批量拉取(不走語義搜索,按importance降序返回最多20條)。
 
-浮現模式的三格注入(依熱度=可提取度0~1):熱度>0.7全文;0.3~0.7截成輪廓並標「(印象模糊)」;<=0.3不注入、只在末尾列名字(墓碑)——想挖就用query問,查詢一律給全文不模糊。每3個浮現名額讓1個給「危險區」(熱度0.25附近=正在淡掉但還沒消失),標記為[危險區 快要失去]。被浮現不會重置衰減:撈上來但沒真的用到,它會繼續淡。"""
+浮現模式的三格注入(依熱度=可提取度0~1):熱度>0.7全文;0.3~0.7截成輪廓並標「(印象模糊)」;<=0.3不注入、只在末尾列名字(墓碑)——想挖就用query問,查詢一律給全文不模糊。每3個浮現名額讓1個給「危險區」(熱度0.25附近=正在淡掉但還沒消失),標記為[危險區 快要失去]。純工程桶(domains⊆工程域)在一般/危險區名額各有配額上限,超額讓位、不足回填。被浮現不會重置衰減:撈上來但沒真的用到,它會繼續淡。"""
     await decay_engine.ensure_started()
     max_results = max(1, min(max_results, 50))
     max_tokens = max(1, min(max_tokens, 20000))
+
+    # --- exclude_domain (batch-7 檔1): the inverse of the domain filter.
+    # One parse shared by every mode; matching mirrors the include side
+    # (normalize + set intersection), just negated. Pinned buckets are exempt
+    # in surfacing: they are RESIDENT core principles, and a pollution guard
+    # must never cost a wake-up its identity anchors (the usage-rules pinned
+    # bucket carries domain=AI and would otherwise vanish from openings).
+    # --- exclude_domain（檔1）：domain 過濾的取反。四模式共用一次解析；
+    # 判定與 include 同款（正規化＋集合交集），只是取反。浮現模式的釘選桶
+    # 豁免排除：它們是常駐核心準則，防污染的護欄絕不能讓一次醒來失去身分
+    # 錨點（使用規則釘選桶帶 domain=AI，不豁免會從開場消失）。---
+    exclude_set = set(normalize_domains([
+        d.strip() for d in exclude_domain.split(",") if d.strip()
+    ]))
+
+    def _excluded(meta: dict) -> bool:
+        return bool(exclude_set) and bool(set(meta.get("domain", []) or []) & exclude_set)
 
     # --- Catalog mode: one metadata line per bucket, zero LLM calls ---
     # --- 目錄模式：一行一桶，0 次 LLM 呼叫，token 預算內裝多少列多少 ---
@@ -799,6 +890,8 @@ async def breath(
             if meta.get("type") in ("feel", "mirage"):
                 continue  # feel/mirage(夢) 是私人通道，目錄也不列
             if domain_filter and not (set(meta.get("domain", [])) & domain_filter):
+                continue
+            if _excluded(meta):
                 continue
             rows.append(b)
         if not rows:
@@ -856,6 +949,7 @@ async def breath(
             and b["metadata"].get("type") not in ("feel", "plan", "mirage")
             and not b["metadata"].get("digested", False)
             and (not importance_domains or set(b["metadata"].get("domain", [])) & importance_domains)
+            and not _excluded(b["metadata"])
         ]
         filtered.sort(key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True)
         filtered = _select_importance_tiers(filtered, cap=min(20, max_results))
@@ -1042,6 +1136,7 @@ async def breath(
             and not b["metadata"].get("digested", False)
             and not is_decay_exempt(b["metadata"])
             and (not surface_domains or set(b["metadata"].get("domain", [])) & surface_domains)
+            and not _excluded(b["metadata"])
         ]
         unresolved = [b for b in eligible if not _cooling(b["metadata"])]
 
@@ -1141,13 +1236,38 @@ async def breath(
         # to recall three times in four, and it will not ask to be remembered.
         # 浮現一直只回答「什麼最熱」。這個切片回答「什麼快沒了」——
         # heat 0.25 的記憶是四次有三次想不起來的，而它不會開口要人記得它。
+        # --- Engineering quota (batch-7 檔1): per-channel cap on PURE-eng picks.
+        # The danger zone was the measured leak (07-16: one of two slots went
+        # to a stale engineering note), so it gets its own tighter cap. Ratios
+        # from config; ceil for the normal channel (generous), floor for the
+        # danger zone (strict). Backfill inside _pick_with_eng_quota keeps
+        # every pick-count invariant unchanged.
+        # --- 工程配額（檔1）：各通道封頂「純工程」選取數。危險區是實測漏風口
+        # （07-16 兩名額之一給了過期工程筆記），配額更緊。比例走 config；
+        # 一般通道 ceil（寬）、危險區 floor（嚴）。回填邏輯保證所有
+        # 「選取數」不變量照舊。---
+        surf_cfg = config.get("surfacing", {}) or {}
+        try:
+            eng_ratio = float(surf_cfg.get("eng_quota_ratio", 1 / 3))
+        except (ValueError, TypeError):
+            eng_ratio = 1 / 3
+        try:
+            dz_eng_ratio = float(surf_cfg.get("dz_eng_quota_ratio", 0.5))
+        except (ValueError, TypeError):
+            dz_eng_ratio = 0.5
+        eng_domains = _eng_domain_set()
+
         danger_slots = result_slots // 3
         danger_pick: list = []
         if danger_slots > 0:
             ranked = sorted(
                 ((_prio_of(b), b) for b in unresolved), key=lambda t: -t[0]
             )
-            danger_pick = [b for prio, b in ranked if prio > 0][:danger_slots]
+            dz_quota = min(danger_slots, math.floor(danger_slots * dz_eng_ratio))
+            danger_pick = _pick_with_eng_quota(
+                [b for prio, b in ranked if prio > 0],
+                danger_slots, dz_quota, eng_domains,
+            )
         danger_ids = {b["id"] for b in danger_pick}
         # Unclaimed danger slots go back to the normal channel rather than
         # being burned — a quiet danger zone shouldn't shrink the whole breath.
@@ -1157,11 +1277,20 @@ async def breath(
 
         # The normal channel carries only what's still retrievable. 'lost'
         # buckets aren't dropped — they're named in the tombstone below.
+        # (Read before coding, 檔1 必答題: lost is filtered BEFORE the slot
+        # slice, so a high-score lost bucket never occupies a slot — which is
+        # why the metabolism factor multiplies heat only, never score.)
         # 一般通道只載還提取得到的。lost 的不是被丟掉，是在下面被點名。
-        normal_pick = [
-            b for b in candidates
-            if b["id"] not in danger_ids and _tier_of(b) != "lost"
-        ][:normal_slots]
+        # （檔1 必答題讀碼結論：lost 在切名額「之前」就被濾掉，高分 lost 桶
+        # 不佔名額——所以代謝係數只乘 heat、不乘 score。）
+        eng_quota = min(normal_slots, math.ceil(normal_slots * eng_ratio))
+        normal_pick = _pick_with_eng_quota(
+            [
+                b for b in candidates
+                if b["id"] not in danger_ids and _tier_of(b) != "lost"
+            ],
+            normal_slots, eng_quota, eng_domains,
+        )
 
         dynamic_results = []
         surfaced_ids: list[str] = []
@@ -1260,6 +1389,7 @@ async def breath(
     # --- With args: search mode (keyword + vector dual channel) ---
     # --- 有參數：檢索模式（關鍵詞 + 向量雙通道）---
     domain_filter = [d.strip() for d in domain.split(",") if d.strip()] or None
+    exclude_filter = sorted(exclude_set) or None
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
 
@@ -1270,6 +1400,7 @@ async def breath(
             domain_filter=domain_filter,
             query_valence=q_valence,
             query_arousal=q_arousal,
+            exclude_domains=exclude_filter,
         )
     except Exception as e:
         logger.error(f"Search failed / 檢索失敗: {e}")
@@ -1297,6 +1428,11 @@ async def breath(
                 if meta.get("pinned") or meta.get("protected"):
                     continue
                 if meta.get("type") in ("feel", "plan", "mirage") or meta.get("digested"):
+                    continue
+                # exclude_domain binds the vector side door too (batch-7),
+                # checked before revive for the same reason as the gate below.
+                # exclude_domain 也約束向量側門（檔1），與下面的閘同理放在復活前。
+                if _excluded(meta):
                     continue
                 # Admissibility (2026-07-12 batch-3): the vector channel honors
                 # the explicit domain filter and the context gate — checked
@@ -1379,6 +1515,7 @@ async def breath(
                 and not b["metadata"].get("protected", False)
                 and not b["metadata"].get("resolved", False)
                 and not b["metadata"].get("digested", False)
+                and not _excluded(b["metadata"])
                 and bucket_mgr.vector_admissible(
                     b["metadata"], 0.0, q_valence, q_arousal, domain_filter
                 )
@@ -4183,8 +4320,56 @@ async def api_system_status(request):
     try:
         stats = await bucket_mgr.get_stats()
         usage = await api_usage_guard.check_all(probe_gemini=False)
+
+        # --- Metabolism gauges (batch-7 檔1): verification lives on a dial,
+        # not on someone's attention (the WORKING_ON lesson). Same helpers as
+        # the surfacing quota, so the dial can never drift from the engine.
+        # --- 代謝儀表（檔1）：驗證靠儀表不靠人的注意力（WORKING_ON 教訓）。
+        # 與浮現配額共用同一組判定，儀表永遠不會跟引擎各說各話。---
+        metabolism: dict = {}
+        try:
+            eng_domains = _eng_domain_set()
+            rel_domains = frozenset(normalize_domains(["戀愛", "人際", "內心"]))
+            all_dynamic = [
+                b for b in await bucket_mgr.list_all(include_archive=False)
+                if b["metadata"].get("type") not in ("permanent", "feel", "plan", "mirage")
+                and not (b["metadata"].get("pinned") or b["metadata"].get("protected"))
+            ]
+            pure_eng = [b for b in all_dynamic if _is_pure_eng(b["metadata"], eng_domains)]
+            danger_total = 0
+            danger_eng = 0
+            heats_eng: list[float] = []
+            heats_rel: list[float] = []
+            for b in all_dynamic:
+                meta = b["metadata"]
+                heat = decay_engine.calculate_heat(meta)
+                if _is_pure_eng(meta, eng_domains):
+                    heats_eng.append(heat)
+                if set(meta.get("domain", []) or []) & rel_domains:
+                    heats_rel.append(heat)
+                if (
+                    not meta.get("resolved", False)
+                    and not meta.get("digested", False)
+                    and decay_engine.review_priority(heat) > 0
+                ):
+                    danger_total += 1
+                    if _is_pure_eng(meta, eng_domains):
+                        danger_eng += 1
+            metabolism = {
+                "pure_eng_count": len(pure_eng),
+                "dynamic_count": len(all_dynamic),
+                "pure_eng_pct": round(100 * len(pure_eng) / len(all_dynamic), 1) if all_dynamic else 0.0,
+                "danger_zone_total": danger_total,
+                "danger_zone_eng": danger_eng,
+                "avg_heat_pure_eng": round(sum(heats_eng) / len(heats_eng), 3) if heats_eng else None,
+                "avg_heat_relation": round(sum(heats_rel) / len(heats_rel), 3) if heats_rel else None,
+            }
+        except Exception as e:
+            logger.warning(f"metabolism gauges failed / 代謝儀表計算失敗: {e}")
+
         return JSONResponse({
             "decay_engine": "running" if decay_engine.is_running else "stopped",
+            "metabolism": metabolism,
             "embedding_enabled": embedding_engine.enabled,
             "api_usage_ok": usage.get("ok", False),
             "api_usage_warnings": usage.get("warnings", []),
