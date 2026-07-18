@@ -2908,11 +2908,24 @@ async def _desire_fixation_buckets(with_detail: bool = False):
                 weight = float(m.get("weight", 0.5))
             except (TypeError, ValueError):
                 weight = 0.5
+            # 潮汐 v2 due-ramp（2026-07-19）：迫近才推。48h 內全額、7 天內半額、
+            # 更遠 1/4、無 due 全額（長期承諾不衰減）。跟 feeder 的行事曆 48h 視界
+            # 同一個哲學——07/20 的固網不會在 07-17 晚上還全額推 duty 提案，
+            # 「還不能動手的事」不再逼 veto 當靜音鍵。
+            ramp = 1.0
+            if due and not expired:
+                try:
+                    days_to_due = (_date.fromisoformat(due[:10]) - _date.today()).days
+                    ramp = 1.0 if days_to_due <= 2 else (0.5 if days_to_due <= 7 else 0.25)
+                except ValueError:
+                    ramp = 1.0
+            weight_eff = round(weight * ramp, 4)
             if with_detail:
                 detail.setdefault(drive, []).append({
                     "id": b["id"], "name": m.get("name", b["id"]),
                     "type": "plan", "kind": m.get("kind", "task"),
-                    "weight": weight, "due_at": due,
+                    "weight": weight, "weight_eff": weight_eff, "ramp": ramp,
+                    "due_at": due,
                     "expired": expired, "feeding": not expired,
                 })
             if expired:
@@ -2922,7 +2935,7 @@ async def _desire_fixation_buckets(with_detail: bool = False):
                 "name": m.get("name", b["id"]),
                 "kind": "plan",
                 "drive": drive,
-                "weight": weight,
+                "weight": weight_eff,
             })
             continue
         if btype in ("permanent", "feel", "archived", "mirage"):
@@ -2964,9 +2977,17 @@ async def _desire_state_payload() -> dict:
     buckets, boosts_detail = await _desire_fixation_buckets(with_detail=True)
     boosts = desire_kernel.drive_boosts(buckets)
 
+    lanes: dict[str, dict] = {}
+
     def _refresh(state):
         intent = desire_kernel.pick_intent(state, boosts, now)
         state["last_intent"] = intent
+        # 潮汐 v2：同一份 ticked state 上算兩條車道的冠軍（不持久化——
+        # last_intent 仍是全維提案，車道提案只供喚醒層的雙積分器用）。
+        lanes["outward"] = desire_kernel.pick_intent(
+            state, boosts, now, allowed=set(desire_kernel.OUTWARD_DRIVES))
+        lanes["inward"] = desire_kernel.pick_intent(
+            state, boosts, now, allowed=set(desire_kernel.INWARD_DRIVES))
         return state
 
     state = desire_store.mutate(_refresh, now)
@@ -3003,6 +3024,10 @@ async def _desire_state_payload() -> dict:
         # 從純文字變成能點開的門；舊 sources 保留向後相容。
         "boosts_detail": boosts_detail,
         "intent": state["last_intent"],
+        # 潮汐 v2：雙車道提案＋飽和帳（喚醒層 charge 積分器與「頂滿 N 小時」prompt 行讀這裡）
+        "lane_intents": lanes,
+        "saturated_since": state.get("saturated_since", {}),
+        "hyst_drained": state.get("hyst_drained", {}),
         "veto_until": active_vetoes,
         "recheck_until": active_rechecks,
         # 高位消退態（batch-1 hysteresis）：瓶子摸頂後不漲反落的原因，
@@ -3026,8 +3051,10 @@ async def desire(
     degree: float = -1.0,
     wake_id: str = "",
     medium: str = "",
+    feed_id: str = "",
+    hours: float = -1.0,
 ) -> str:
-    """慾望系統（只提案不執行）。action=state 看八維驅動條+執念加成+此刻提案；action=feed 餵真實事件（drive=維度或fatigue, amount=±0~1, event=因為發生了什麼）；action=satisfy 只有缺口真的被填了才用（verb+event+degree，degree 必填且 >0~1）；action=engage 做了相關的事但未滿足（verb+drive+event，水位不動、該維稍後再問）；action=defer 現在不做但不否定它（drive+reason，水位不動）；action=veto 否決提案並讓該維回落；action=outreach 在訊息/貼圖/語音等成功送達 Ruby 後記收據（medium+wake_id，不改水位）；action=gate 親密閘。自主喚醒的 satisfy/engage/defer/veto/outreach 都帶 prompt 裡的 wake_id。執念來源：active plan＋trace(affects_desire=1) 的記憶。八維：miss_ruby/reflection/curiosity/duty/social/creation/libido/knot。"""
+    """慾望系統（只提案不執行）。action=state 看八維驅動條+執念加成+此刻提案（潮汐 v2 起含 lane_intents 向她/向內雙車道與飽和帳）；action=feed 餵真實事件（drive=維度或fatigue, amount=±0~1, event=因為發生了什麼；可帶 feed_id 去重收據，重試安全）；action=satisfy 只有缺口真的被填了才用（verb+event+degree，degree 必填且 >0~1）；action=engage 做了相關的事但未滿足（verb+drive+event，水位不動、該維稍後再問）；action=defer 現在不做但不否定它（drive+reason，水位不動；可帶 hours=1~24 自訂再問時長——「今晚都不合適」記 defer hours=12，別拿 veto 倒水）；action=veto 否決提案並讓該維回落（只在提案本身不對時用）；action=outreach 在訊息/貼圖/語音等成功送達 Ruby 後記收據（medium+wake_id，不改水位）；action=gate 親密閘。自主喚醒的 satisfy/engage/defer/veto/outreach 都帶 prompt 裡的 wake_id。執念來源：active plan＋trace(affects_desire=1) 的記憶（due 越近推越滿：48h 全額/7 天半額/更遠 1/4）。八維：miss_ruby/reflection/curiosity/duty/social/creation/libido/knot。"""
     from datetime import datetime as _dt
     action = (action or "state").strip().lower()
     now = _dt.now()
@@ -3039,8 +3066,10 @@ async def desire(
         if action == "feed":
             if not drive.strip():
                 return "feed 需要 drive（七維之一或 fatigue）。"
+            fid = str(feed_id or "").strip()[:64]
             state = desire_store.mutate(
-                lambda st: desire_kernel.feed(st, drive.strip(), amount, now, event=event), now)
+                lambda st: desire_kernel.feed(st, drive.strip(), amount, now, event=event,
+                                              feed_id=fid), now)
             return f"已餵入 {drive}{amount:+.2f}（{event or '未註明來歷'}）→ 現值 " + (
                 f"{state['fatigue']:.2f}" if drive.strip() == "fatigue" else f"{state['drives'][drive.strip()]:.2f}")
         if action == "satisfy":
@@ -3065,9 +3094,11 @@ async def desire(
         if action == "defer":
             if not drive.strip():
                 return "defer 需要 drive。"
+            h = hours if hours > 0 else desire_kernel.RECHECK_COOLDOWN_HOURS
             desire_store.mutate(
-                lambda st: desire_kernel.defer(st, drive.strip(), now, reason=reason, wake_id=wake_id), now)
-            return f"已暫緩 {drive}：水位未動，{desire_kernel.RECHECK_COOLDOWN_HOURS:.0f} 小時後可再提"
+                lambda st: desire_kernel.defer(st, drive.strip(), now, reason=reason,
+                                               wake_id=wake_id, hours=h), now)
+            return f"已暫緩 {drive}：水位未動，{h:g} 小時後可再提"
         if action == "outreach":
             if not wake_id:
                 return "outreach 需要 wake_id，且只能在送達 Ruby 成功後記。"

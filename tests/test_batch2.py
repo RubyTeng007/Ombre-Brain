@@ -69,7 +69,8 @@ class TestKnotDrive:
     def test_talk_out_releases_knot_and_softens_miss(self):
         s = _state(knot=0.8, miss_ruby=0.6)
         s2 = dk.satisfy(s, "talk_out", NOW)
-        assert s2["drives"]["knot"] == pytest.approx(0.8 * 0.40)
+        # 潮汐 v2：talk_out 主維 0.40→0.16
+        assert s2["drives"]["knot"] == pytest.approx(0.8 * 0.16)
         assert s2["drives"]["miss_ruby"] == pytest.approx(0.6 * 0.85)
 
     def test_dream_feel_loosens_knot_slightly(self):

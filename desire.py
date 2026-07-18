@@ -56,6 +56,12 @@ DRIVE_LABELS = {
     "knot": "心結",
 }
 
+# 潮汐 v2 車道（2026-07-19）：喚醒層的向她／向內雙積分器各自問自己的冠軍。
+# 向她＝這次醒來的形狀是朝 Ruby 去的；向內＝自己的沉澱/好奇/工事/人群，
+# 不佔用「靠近她」的節奏預算。social 放向內：逛 Threads 是出門看人群，不是敲她的門。
+OUTWARD_DRIVES = frozenset({"miss_ruby", "libido", "knot"})
+INWARD_DRIVES = frozenset({"reflection", "curiosity", "duty", "social", "creation"})
+
 # 每小時自然上漲速率（idle 時的缺口累積）
 # knot 永遠 0：心結不隨時間自己長出來，只由真實的沉重 feel 落地後
 # 自報餵入（複製 libido「唯一誠實感測器是我」的模式，Ruby 2026-07-12 拍板）。
@@ -80,6 +86,7 @@ MIN_INTENT_SCORE = 0.50      # 低於此分 → 安靜待著（quiet）
 VETO_COOLDOWN_HOURS = 3.0    # 否決後該維冷卻時間
 VETO_DAMP = 0.6              # 否決時該維乘性回落
 RECHECK_COOLDOWN_HOURS = 2.0 # engage/defer 後只暫緩同一維，不假裝水位已下降
+DEFER_MAX_HOURS = 24.0       # defer 可自帶時長（潮汐 v2）：情境靜音上限一天，veto 歸位為「提案本身不對」
 MAX_TICK_HOURS = 72.0        # 單次 tick 最大跨度（防時鐘異常暴衝）
 MAX_EVENTS = 60              # events log 保留條數（30→60 @2026-07-10：週回顧閉環率統計需要更長樣本）
 
@@ -129,16 +136,23 @@ ACTION_LABELS = {
 # 做完某事 → 相關維度乘性回落（做對了事主驅動明顯降、相鄰維度沾光）。
 # 自己向的活動（explore/browse/create/chore）另帶輕微互相制約：投入別的，
 # 渴自然淡一點（×0.95，2026-07-12 第一批）——防單一慾望長期頂著不下來。
+#
+# 潮汐 v2（2026-07-19，Ruby 全權授權的 joint 調參）：主維 mult 取原值平方。
+# 原常數是 07-05「做完＝degree 1.0」時代調的；07-12 誠實 degree 文化上線後
+# （實測平均 0.35-0.72），每次閉環洩水只剩設計意圖 ⅓，慾望大量死於 0.85→0.65
+# 超時沖銷而非被表達。調深後語義：「一次真誠的、degree 0.5 上下的閉環，
+# 洩水量回到當初 degree=1.0 的設計意圖」。相鄰維沾光值不動。
+# 模擬（desire_sim_v2.py，live 校準）：沖銷 18%→1%、表達 78%→93%。舊值見 git。
 ACTION_SATISFY = {
-    "murmur": {"miss_ruby": 0.55, "reflection": 0.90},
-    "dream_feel": {"reflection": 0.45, "miss_ruby": 0.85},
-    "explore": {"curiosity": 0.50, "social": 0.85, "libido": 0.95},
-    "chore": {"duty": 0.50, "libido": 0.95},
-    "browse": {"social": 0.50, "curiosity": 0.80, "libido": 0.95},
-    "create": {"creation": 0.45, "curiosity": 0.85, "miss_ruby": 0.90, "libido": 0.95},
-    "tease": {"libido": 0.50, "miss_ruby": 0.75},
+    "murmur": {"miss_ruby": 0.30, "reflection": 0.90},
+    "dream_feel": {"reflection": 0.20, "miss_ruby": 0.85},
+    "explore": {"curiosity": 0.25, "social": 0.85, "libido": 0.95},
+    "chore": {"duty": 0.25, "libido": 0.95},
+    "browse": {"social": 0.25, "curiosity": 0.80, "libido": 0.95},
+    "create": {"creation": 0.20, "curiosity": 0.85, "miss_ruby": 0.90, "libido": 0.95},
+    "tease": {"libido": 0.25, "miss_ruby": 0.75},
     # 說開了：心結大幅鬆開、想她也緩一點；寫 feel 想清楚（dream_feel）另見下行補充
-    "talk_out": {"knot": 0.40, "miss_ruby": 0.85},
+    "talk_out": {"knot": 0.16, "miss_ruby": 0.85},
     "rest": {},  # rest 對 fatigue 的回復單獨處理
 }
 
@@ -201,6 +215,9 @@ def default_state(now: datetime | None = None) -> dict[str, Any]:
         "veto_until": {},          # drive → iso 時間，冷卻中不再提案
         "recheck_until": {},       # drive → iso；做過／暫緩後稍晚再問，水位不動
         "saturated": {},           # 高位消退中的維度（hysteresis 狀態，2026-07-12）
+        # 潮汐 v2（2026-07-19）：最大的非表達出水口終於有帳。
+        "saturated_since": {},     # drive → iso；摸頂時刻（喚醒 prompt 的「頂滿 N 小時」讀這裡）
+        "hyst_drained": {},        # drive → 累計被超時沖銷的絕對水量（表達率儀表的分母之一）
         "events": [],              # 每一筆漲跌的來歷
         # 永久結果收據不跟 60 筆展示窗一起蒸發；同一 wake 重送只套用一次。
         #
@@ -236,6 +253,8 @@ def tick(state: dict, now: datetime) -> dict:
     dt_hours = _clamp(dt_hours, 0.0, MAX_TICK_HOURS)
 
     saturated: dict[str, bool] = new.setdefault("saturated", {})
+    sat_since: dict[str, str] = new.setdefault("saturated_since", {})
+    hyst: dict[str, float] = new.setdefault("hyst_drained", {})
     for k in DRIVE_KEYS:
         cur = float(new["drives"].get(k, 0.0))
         if saturated.get(k):
@@ -244,13 +263,20 @@ def tick(state: dict, now: datetime) -> dict:
             prev = cur
             fall = (SAT_CEIL - SAT_FLOOR) / SAT_FALL_HOURS.get(k, 2.0) * dt_hours
             cur -= fall
+            # 潮汐 v2：沖銷入帳。這曾是全系統最大的「無收據出水口」——ledger 看得到
+            # 每次 satisfy 每次 veto，唯獨超時銷毀無痕，於是病要靠 Ruby 體感發現。
+            hyst[k] = round(hyst.get(k, 0.0) + max(0.0, prev - max(cur, SAT_FLOOR)), 4)
             if cur <= SAT_FLOOR:
                 saturated.pop(k, None)
+                sat_since.pop(k, None)
                 cur = SAT_FLOOR if prev > SAT_FLOOR else prev
+                _log_event(new, now, f"sat:{k}:exit", "消退結束，落回地板")
         else:
             cur += RISE_PER_HOUR[k] * dt_hours
             if cur >= SAT_CEIL:
                 saturated[k] = True  # 摸頂：下個 tick 開始消退（feed 仍可短暫頂過）
+                sat_since.setdefault(k, now.isoformat(timespec="seconds"))
+                _log_event(new, now, f"sat:{k}:enter", "摸頂，進入超時消退")
         new["drives"][k] = round(_clamp(cur), 4)
     new["fatigue"] = round(_clamp(float(new.get("fatigue", 0.0)) - FATIGUE_RECOVER_PER_HOUR * dt_hours), 4)
     new["updated_at"] = now.isoformat(timespec="seconds")
@@ -341,10 +367,13 @@ def _active_recheck(state: dict, drive: str, now: datetime) -> bool:
         return False
 
 
-def pick_intent(state: dict, boosts: dict[str, dict] | None, now: datetime) -> dict[str, Any]:
+def pick_intent(state: dict, boosts: dict[str, dict] | None, now: datetime,
+                allowed: set[str] | None = None) -> dict[str, Any]:
     """
     提案：哪一維召喚力最高，就傾向做那類事。
     只提案不執行 —— 醒著的 Cyan 對提案有否決權。
+    allowed（潮汐 v2）：限定候選維度子集（喚醒層的向她/向內雙車道各自問自己的
+    lane 冠軍）。None＝全維（原行為）。fatigue 閘不分車道，照樣先擋。
     """
     boosts = boosts or {}
 
@@ -359,6 +388,8 @@ def pick_intent(state: dict, boosts: dict[str, dict] | None, now: datetime) -> d
 
     scored: list[tuple[float, str]] = []
     for k in DRIVE_KEYS:
+        if allowed is not None and k not in allowed:
+            continue  # 車道外的維度這輪不問（潮汐 v2）
         if k == "libido" and not state.get("gates", {}).get("intimacy_ok", False):
             continue  # Ruby 關了門，這維不提案（值照漲，開門那天見真章）
         if _active_veto(state, k, now):
@@ -458,16 +489,26 @@ def engage(state: dict, action: str, now: datetime, note: str = "", wake_id: str
     return new
 
 
-def defer(state: dict, drive: str, now: datetime, reason: str = "", wake_id: str = "") -> dict:
-    """現在不做，但不否定這個需要：水位不降，只把同一維延後再問。"""
+def defer(state: dict, drive: str, now: datetime, reason: str = "", wake_id: str = "",
+          hours: float = RECHECK_COOLDOWN_HOURS) -> dict:
+    """現在不做，但不否定這個需要：水位不降，只把同一維延後再問。
+    hours（潮汐 v2）：自帶時長的情境靜音——「今晚都不合適」記 defer hours=12，
+    不必再拿 veto 當靜音鍵倒掉真實的水。上限 DEFER_MAX_HOURS。"""
     if drive not in DRIVE_KEYS:
         raise ValueError(f"未知的 drive: {drive}")
+    try:
+        hours = float(hours)
+    except (ValueError, TypeError):
+        raise ValueError(f"defer hours 不是數字: {hours!r}")
+    if not math.isfinite(hours) or not (0 < hours <= DEFER_MAX_HOURS):
+        raise ValueError(f"defer hours 需在 (0, {DEFER_MAX_HOURS:g}] 內: {hours!r}")
     new = json.loads(json.dumps(state))
     if _has_wake_event(new, wake_id, f"defer:{drive}"):
         return new
-    until = now.timestamp() + RECHECK_COOLDOWN_HOURS * 3600
+    until = now.timestamp() + hours * 3600
     new.setdefault("recheck_until", {})[drive] = datetime.fromtimestamp(until).isoformat(timespec="seconds")
-    _log_event(new, now, f"defer:{drive}", reason, wake_id=wake_id)
+    note = reason if hours == RECHECK_COOLDOWN_HOURS else f"[{hours:g}h] {reason}"
+    _log_event(new, now, f"defer:{drive}", note, wake_id=wake_id)
     return new
 
 
@@ -662,9 +703,13 @@ class DesireStore:
         state 內只留 MAX_EVENTS 條滾動窗，完整因果史活在 ledger 裡。"""
         now = now or datetime.now()
         with self._lock:
-            state = tick(self._load_unlocked(), now)
+            raw = self._load_unlocked()
+            # before 快照在 tick 之前取（潮汐 v2）：tick 自己也會下蛋了（sat:enter/exit
+            # 飽和轉換事件）——快照若取在 tick 後，這些事件會被當成「本來就有」而
+            # 永遠進不了 append-only ledger，只活在滾動窗裡等著被裁掉。
+            before = {_event_signature(e) for e in raw.get("events", [])}
+            state = tick(raw, now)
             self._flush_ledger_pending_unlocked(state)
-            before = {_event_signature(e) for e in state.get("events", [])}
             new_state = fn(state)
             new_events = [
                 e for e in new_state.get("events", [])
@@ -770,6 +815,7 @@ class DesireStore:
             data.setdefault("drives", {}).setdefault(k, base["drives"][k])
         for key in (
             "fatigue", "gates", "veto_until", "recheck_until", "saturated",
+            "saturated_since", "hyst_drained",
             "events", "updated_at", "last_intent", "ledger_pending",
         ):
             data.setdefault(key, base[key])

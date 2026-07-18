@@ -220,12 +220,23 @@ class TestPickIntent:
 
 class TestSatisfy:
     def test_main_drive_falls_hard_neighbors_lightly(self):
+        # 潮汐 v2：主維 mult 平方（tease 0.50→0.25），相鄰沾光不動
         s = fresh()
         s["drives"]["libido"] = 0.8
         s["drives"]["miss_ruby"] = 0.6
         s2 = satisfy(s, "tease", NOW)
-        assert s2["drives"]["libido"] == pytest.approx(0.8 * 0.5, abs=1e-3)
+        assert s2["drives"]["libido"] == pytest.approx(0.8 * 0.25, abs=1e-3)
         assert s2["drives"]["miss_ruby"] == pytest.approx(0.6 * 0.75, abs=1e-3)
+
+    def test_v2_honest_degree_reaches_v1_design_intent(self):
+        # 潮汐 v2 的存在理由釘進測試：誠實 degree≈0.5 的閉環，
+        # 洩水量要落在原設計「degree=1.0 × 舊 mult」的意圖附近。
+        s = fresh()
+        s["drives"]["miss_ruby"] = 0.8
+        s2 = satisfy(s, "murmur", NOW, degree=0.5)
+        eff = 1 - 0.5 * (1 - 0.30)
+        assert s2["drives"]["miss_ruby"] == pytest.approx(0.8 * eff, abs=1e-3)
+        assert 0.8 * eff < 0.8 * 0.72  # 至少比舊制（0.5×0.45 → eff .775）洩得深
 
     def test_rest_halves_fatigue(self):
         s = fresh()
@@ -293,6 +304,64 @@ class TestEngageDeferOutreach:
         s3 = outreach(s2, "text", NOW, note="重試", wake_id="w-out")
         assert s3["drives"] == before
         assert len([e for e in s3["events"] if e.get("kind") == "outreach:text"]) == 1
+
+
+# ---------------------------------------------------------
+# 潮汐 v2：defer 時長／車道子集／飽和記帳
+# ---------------------------------------------------------
+
+class TestTideV2:
+    def test_defer_custom_hours_sets_recheck(self):
+        s = fresh()
+        s2 = defer(s, "duty", NOW, reason="今晚不動工程", hours=12)
+        until = datetime.fromisoformat(s2["recheck_until"]["duty"])
+        assert until == NOW + timedelta(hours=12)
+        assert any(e["kind"] == "defer:duty" and "[12h]" in e["note"] for e in s2["events"])
+
+    def test_defer_hours_bounds(self):
+        for bad in (0, -1, 25, float("nan"), float("inf")):
+            with pytest.raises(ValueError):
+                defer(fresh(), "duty", NOW, hours=bad)
+
+    def test_pick_intent_allowed_subset(self):
+        s = fresh()
+        s["drives"]["curiosity"] = 0.9   # 全場最高，但在車道外
+        s["drives"]["miss_ruby"] = 0.7
+        out = pick_intent(s, {}, NOW, allowed={"miss_ruby", "libido", "knot"})
+        assert out["drive"] == "miss_ruby"
+        inw = pick_intent(s, {}, NOW, allowed={"curiosity", "reflection"})
+        assert inw["drive"] == "curiosity"
+
+    def test_pick_intent_allowed_all_low_is_quiet(self):
+        s = fresh()
+        s["drives"]["curiosity"] = 0.9
+        out = pick_intent(s, {}, NOW, allowed={"miss_ruby"})
+        assert out["action"] == "quiet"
+
+    def test_saturation_transitions_logged_and_drained_accounted(self):
+        s = fresh()
+        s["drives"]["curiosity"] = 0.84
+        s1 = tick(s, NOW + timedelta(hours=1))           # 越過 0.85 → enter
+        assert s1["saturated"].get("curiosity") is True
+        assert "curiosity" in s1["saturated_since"]
+        assert any(e["kind"] == "sat:curiosity:enter" for e in s1["events"])
+        s2 = tick(s1, NOW + timedelta(hours=3))          # fall 1h/0.2 → 落地 exit
+        assert "curiosity" not in s2["saturated"]
+        assert "curiosity" not in s2["saturated_since"]
+        assert any(e["kind"] == "sat:curiosity:exit" for e in s2["events"])
+        assert s2["hyst_drained"]["curiosity"] > 0.15    # 一輪沖銷 ≈ 0.2
+
+    def test_tick_events_reach_ledger_via_mutate(self, tmp_path):
+        store = DesireStore(str(tmp_path))
+        s = store.load(NOW)
+        s["drives"]["social"] = 0.86
+        s["saturated"] = {}
+        store.save(s)
+        store.mutate(lambda st: st, NOW + timedelta(hours=1))  # tick 產生 enter 事件
+        ledger = os.path.join(str(tmp_path), "desire_ledger.jsonl")
+        assert os.path.exists(ledger)
+        kinds = [json.loads(l).get("kind") for l in open(ledger, encoding="utf-8")]
+        assert "sat:social:enter" in kinds
 
 
 class TestFeedVetoGate:

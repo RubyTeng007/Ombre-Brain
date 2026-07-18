@@ -115,15 +115,16 @@ class TestWeightedIntentPick:
 # ---------------------------------------------------------
 class TestSatisfyDegreeAndEngage:
     def test_full_degree_matches_old_behavior(self):
+        # 潮汐 v2（2026-07-19）：主維 mult 平方，explore 0.50→0.25
         s = _state(curiosity=0.8)
         s2 = dk.satisfy(s, "explore", NOW, degree=1.0)
-        assert s2["drives"]["curiosity"] == pytest.approx(0.8 * 0.50)
+        assert s2["drives"]["curiosity"] == pytest.approx(0.8 * 0.25)
 
     def test_half_degree_halves_the_drop(self):
         s = _state(curiosity=0.8)
         s2 = dk.satisfy(s, "explore", NOW, degree=0.5)
-        # eff = 1 - 0.5*(1-0.5) = 0.75
-        assert s2["drives"]["curiosity"] == pytest.approx(0.8 * 0.75)
+        # 潮汐 v2：eff = 1 - 0.5*(1-0.25) = 0.625
+        assert s2["drives"]["curiosity"] == pytest.approx(0.8 * 0.625)
         assert any(e["kind"] == "satisfy:explore:d0.50" for e in s2["events"])
 
     def test_zero_degree_changes_nothing(self):
