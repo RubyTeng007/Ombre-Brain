@@ -2211,18 +2211,11 @@ async def pulse(verbose: bool = False, include_archive: bool = False) -> str:
     # pulse 是 session 真正會讀的地方，「多久沒做夢」必須在這裡就看得見。
     mirage_line = ""
     try:
-        if stats.get("mirage_count", 0) > 0:
-            _mts = [
-                _parse_ts(b["metadata"].get("created"))
-                for b in await bucket_mgr.list_all(include_archive=False)
-                if b["metadata"].get("type") == "mirage"
-            ]
-            _mts = [t for t in _mts if t]
-            if _mts:
-                _days = max(0, (datetime.now() - max(_mts)).days)
-                mirage_line = f"上次做夢: {'今天' if _days == 0 else f'{_days} 天前'}\n"
-        else:
+        _days = await _last_dream_days()
+        if _days is None:
             mirage_line = "上次做夢: 還沒有過（想做的話 dream(seed=True) 拿素材盤）\n"
+        else:
+            mirage_line = f"上次做夢: {'今天' if _days == 0 else f'{_days} 天前'}\n"
     except Exception:
         pass
     status = (
@@ -2331,6 +2324,20 @@ async def api_usage(force: bool = False, probe_gemini: bool = True) -> str:
 # 讀取最近新增的表層桶（≤10個），返回給 Claude 在提示詞引導下自主思考。
 # Claude then decides: resolve some, write feels, or do nothing.
 # =============================================================
+async def _last_dream_days():
+    """距上次做夢的天數（int）；還沒做過夢回 None。
+    pulse 與 /api/status 共用——工具與網頁儀表永遠不各說各話（儀表語義教訓）。"""
+    mts = [
+        _parse_ts(b["metadata"].get("created"))
+        for b in await bucket_mgr.list_all(include_archive=False)
+        if b["metadata"].get("type") == "mirage"
+    ]
+    mts = [t for t in mts if t]
+    if not mts:
+        return None
+    return max(0, (datetime.now() - max(mts)).days)
+
+
 def _seed_snip(b: dict, limit: int) -> str:
     """夢引素材的一行式切片：ID＋名字＋情緒座標＋截斷正文。"""
     meta = b["metadata"]
@@ -3633,6 +3640,10 @@ async def api_buckets(request):
                 # search hit) — the memory room's 「正在浮現」 was faking it
                 # with top-by-score; this field lets it tell the truth.
                 "last_surfaced": meta.get("last_surfaced", ""),
+                # batch-9 (audit F11b): final-text buckets — the detail page
+                # shows a 「定稿」 badge so the append-only promise is visible.
+                # 批9：定稿桶——詳情頁畫「定稿」小徽章，讓只附加的承諾看得見。
+                "verbatim_guard": bool(meta.get("verbatim_guard", False)),
             })
         result.sort(key=lambda x: x["score"], reverse=True)
         return JSONResponse(result)
@@ -4682,6 +4693,9 @@ async def api_system_status(request):
                 "letters": len(letter_store.list_letters()),
                 "total": stats.get("permanent_count", 0) + stats.get("dynamic_count", 0),
             },
+            # D 批（2026-07-19）：「多久沒做夢」的告警語義——37 天零夢時儀表
+            # 只有一個等人解讀的 0。null＝還沒做過夢；老前端安靜跳過此欄位。
+            "last_dream_days": await _last_dream_days(),
             "using_env_password": bool(os.environ.get("OMBRE_DASHBOARD_PASSWORD", "")),
             "version": "1.4.0",
         })
