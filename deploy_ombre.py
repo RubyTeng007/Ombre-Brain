@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deploy Ombre Brain source files to the VPS (/opt/ombre-brain).
 
-Mirrors the deploy_telegram.py discipline, sized for this repo:
+Mirrors the deploy_channel.py discipline, sized for this repo:
 refuse a dirty git tree → local pytest + py_compile gate → live-drift check
 against the last deployed commit → stage → remote py_compile with the live
 venv → backup → two-phase install in one ssh script → restart → hash verify →
@@ -241,7 +241,7 @@ def main() -> int:
     # low-privilege user could pre-create /tmp/ombre-deploy-<timestamp> and
     # swap payloads between the remote compile check and root's install.
     # mktemp 取代可預測的秒戳目錄名：被入侵的低權帳號可以預佔未來的秒戳目錄，
-    # 在遠端編譯檢查與 root 安裝之間換包。（deploy_telegram 從一開始就這樣做。）
+    # 在遠端編譯檢查與 root 安裝之間換包。（deploy_channel 從一開始就這樣做。）
     deploy_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     step("stage (remote mktemp)")
     stage = (ssh(args, ["mktemp", "-d", "/tmp/ombre-deploy.XXXXXX"],
