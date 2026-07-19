@@ -1,5 +1,52 @@
 # Ombre Brain — 内部开发文档 / INTERNALS
 
+## 1.2 2026-07-19 批9 接夢＋審計小修（全系統體檢後，Ruby 逐項拍板）
+
+體檢背景：蜃景桶上線 37 天零夢——存儲側健康（7 條測試），生成側從未接線
+（07-12 第三批把喚醒菜單「做個夢」改「消化一輪」時移除了唯一入口；深睡
+wakeup prompt 從未補做夢步驟）。三路審計代理＋live 實證後定案本批。
+完整報告 Artifact（記憶的體檢，與一場遲到 37 天的夢）。
+
+**D 批・接夢**：
+- **夢引**（`server._mirage_seed_tray`＋`dream(seed=True)`）：素材盤模式——
+  近 72h 情緒最響 3 條＋危險區快忘的 2 條（`review_priority>0`）＋歸檔隨機
+  1 條＋最近 feel 1 條＋慾望音色（`desire_store.load()` 只讀不 tick）。
+  零 LLM 呼叫，伺服器只備料不代筆：夢由 Cyan 在喚醒回合親筆兩段式寫
+  （骨架→放縱→收攏），存 `hold(mirage=True, consumed=…)`。鐵律照舊。
+- **pulse 儀表行**：「上次做夢: N 天前／還沒有過」——37 天零夢而儀表無一字
+  的教訓，「多久沒做夢」現在在 session 必讀處可見。
+- 頻道側配套（cyan-vps-work）：reflection 菜單補回做夢入口；深睡 wakeup
+  prompt 尾端加保底（>10 天無夢順手做一場）；wakeup prompt 模板收進 repo。
+- 夢永久保存（Ruby 拍板；榮格論文的 5-7 天半衰被否——「尋人系統裡要翻得到
+  每一場夢」）。
+
+**F 批・審計小修**（編號對應體檢報告）：
+- F1 `breath(importance_min=…)` 補釘選/保護豁免——docstring「各模式通用」
+  承諾曾唯獨漏掉此模式。
+- F2 tz 收口：`bucket_manager` 三處 raw `fromisoformat`（touch 漣漪起點、
+  `_time_ripple` 鄰居、`_calc_time_score`）統一 `parse_bucket_ts`——aware
+  時間戳曾拋 TypeError 被吞成 days=30（live 桶實測 0 個 aware，潛伏彈拆除）。
+- F3 `/breath-hook` 預算守衛：常駐段（信/自我/釘選）裁剪/跳過不透支，
+  動態池保底 2500 tok——07-15「釘選吃名額」bug 的 hook 同型（我們拓撲
+  不走此路徑，OSS 下游本機部署會）。
+- F4 embedding `last_error` 檢索成功也清（告警不再滯留到下次寫入）。
+- F5 `check_buckets` 不再把 feel/mirage 的 `domain=[]`（B-10 設計）當格式錯。
+- F6 掃除：jieba 死依賴移除、`reclassify_domains.py`（簡體域名化石）刪除、
+  `BucketHistory.count()` 孤兒刪除。
+- F8 單進程不變式落文檔＋`uvicorn.run(workers=1)` 顯式化——全庫併發安全
+  （無檔案鎖）承重於單進程單 loop，這曾是無註記的隱式假設。
+- F9 合併新鮮度閘（fail-closed）：`_merge_or_create` 寫回前重讀，內容漂移
+  →放棄合併改新建——search 快照到寫回隔著 embedding＋LLM await，窗口內
+  他人寫入曾會被 stale 覆寫靜默吃掉。
+- F10 潮汐 v2 due-ramp 數值測試補齊（1.0/0.5/0.25 與 2/7 天邊界）。
+- F11 `history.db` 每桶保留上限（config `history.max_versions_per_bucket`，
+  默認 200，0=不限；只刪最舊、seq 不重編）＋`verbatim_guard` 元數據：
+  定稿桶（grow items 逐字入庫）永走 append，LLM 改寫永不觸碰——「一字不動」
+  對已入庫內容永久成立。
+- BM25 提早拉繩（live config `matching.bm25_enabled: true`，600 桶開銷可忽略，
+  bigram 對繁中優於 rapidfuzz 子串）。
+- 測試：`tests/test_batch9.py`（17 條）；全套 464 pass。
+
 > 本文档面向开发者和维护者。记录功能总览、环境变量、模块依赖、硬编码值和核心设计决策。
 > 最后更新：2026-07-16（批7 記憶代謝檔1：配額＋代謝率＋exclude；0 章節之後的細節以程式碼為準）
 

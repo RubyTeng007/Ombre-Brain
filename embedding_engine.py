@@ -254,6 +254,13 @@ class EmbeddingEngine:
                 input=truncated,
             )
             if response.data and len(response.data) > 0:
+                # Success clears last_error here too (2026-07-19 audit F4):
+                # previously only generate_and_store cleared it, so a transient
+                # search-time failure kept pulse/api_usage warning until the
+                # next successful WRITE — a stale alarm, not observability.
+                # 成功也要在這裡清 last_error（audit F4）：以前只有寫入成功會清，
+                # 檢索時的一次抖動會讓 pulse/api_usage 一直掛著過期告警。
+                self.last_error = ""
                 return response.data[0].embedding
             self.last_error = "embedding API returned no data"
             return []

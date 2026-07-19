@@ -428,6 +428,16 @@ async def breath_hook(request):
 
         parts = []
         token_budget = 10000
+        # Budget guards below (2026-07-19 audit F3): this hook predates the
+        # batch-1..8 hardening that went into the breath TOOL — resident
+        # sections (letters/self/pinned) could drive the budget negative and
+        # silently zero out the dynamic surfacing loop (the same failure shape
+        # as the 07-15 pinned-eats-cap bug, reborn in the hook). Residents now
+        # trim/skip instead of overdrafting, and the dynamic pool keeps a floor.
+        # 預算守衛（audit F3）：這條 hook 早於工具側的加固——常駐段（信/自我/
+        # 釘選）曾能把預算扣成負數，讓動態浮現靜默歸零（07-15 釘選吃名額 bug
+        # 的同型，在 hook 裡復發）。現在常駐段裁剪/跳過而不透支，動態池保底。
+        _DYNAMIC_FLOOR = 2500
         # 💌 各方最新一封信（永久保存的交接信，醒來先讀，續上而非冷啟動）
         try:
             _latest = letter_store.latest_per_author()
@@ -438,6 +448,13 @@ async def breath_hook(request):
                 _snip = _lt.get("content", "")
                 if len(_snip) > 4000:
                     _snip = _snip[:4000] + "…（完整請用 letter read）"
+                # Trim each letter so residents can never spend past the floor.
+                # 每封信裁剪到不侵蝕動態保底為止。
+                _avail = token_budget - _DYNAMIC_FLOOR
+                if _avail <= 200:
+                    break
+                if count_tokens_approx(_snip) > _avail:
+                    _snip = _snip[: max(200, int(_avail / 1.7))] + "…（完整請用 letter read）"
                 parts.append(f"💌 [{_who} 的最新一封信｜{_lt.get('letter_date', '')}] {_snip}")
                 token_budget -= count_tokens_approx(_snip)
         except Exception as _e:
@@ -456,12 +473,17 @@ async def breath_hook(request):
                 _lines.append(f"  {_a}: {_c}")
             if _lines:
                 _block = "=== 自我 ===\n" + "\n".join(_lines)
-                parts.append(_block)
-                token_budget -= count_tokens_approx(_block)
+                if count_tokens_approx(_block) <= token_budget - _DYNAMIC_FLOOR:
+                    parts.append(_block)
+                    token_budget -= count_tokens_approx(_block)
         except Exception as _e:
             logger.warning(f"self-concept surface failed: {_e}")
         for b in pinned:
             summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
+            # Same per-item guard as the tool (server.py breath): skip, don't overdraft.
+            # 跟工具側同款單項守衛：裝不下就跳過，不透支。
+            if count_tokens_approx(summary) > token_budget - _DYNAMIC_FLOOR:
+                continue
             parts.append(f"📌 [核心準則] {summary}")
             token_budget -= count_tokens_approx(summary)
 
@@ -787,36 +809,67 @@ async def _merge_or_create(
                 # 新內容也要看。舊寫法只量舊桶，可是被截掉尾巴的是「送進 merge 的
                 # 兩邊」——短舊桶＋超長新內容照樣走 LLM 路徑，新內容第 2000 字以後
                 # 從沒進過模型，然後結果整桶覆蓋正文。那條尾巴不存在於別的地方。
-                if verbatim or len(bucket["content"]) > 2000 or len(content) > 2000:
+                # verbatim_guard（2026-07-19 audit F11b）：桶裡住過定稿的，之後
+                # 任何合併都只准 append——「一字不動」對已入庫內容永久成立，
+                # 不然日後一次非 verbatim 的語義命中就會讓 LLM 改寫整桶。
+                _guarded = bool(bucket["metadata"].get("verbatim_guard"))
+                if verbatim or _guarded or len(bucket["content"]) > 2000 or len(content) > 2000:
                     merged = bucket["content"].rstrip() + "\n\n---\n" + content.strip()
-                    merge_mode = "verbatim-append" if verbatim else "append"
+                    merge_mode = "verbatim-append" if (verbatim or _guarded) else "append"
                 else:
                     merged = await dehydrator.merge(bucket["content"], content)
                     merge_mode = "llm"
-                _log_merge_audit(bucket["id"], bucket["content"], content, merged, merge_mode)
-                old_v = bucket["metadata"].get("valence", 0.5)
-                old_a = bucket["metadata"].get("arousal", 0.3)
-                merged_valence = round((old_v + valence) / 2, 2)
-                merged_arousal = round((old_a + arousal) / 2, 2)
-                await bucket_mgr.update(
-                    bucket["id"],
-                    actor=Actor("merge", f"merge:{merge_mode}"),
-                    content=merged,
-                    tags=list(set(bucket["metadata"].get("tags", []) + tags)),
-                    importance=max(bucket["metadata"].get("importance", 5), importance),
-                    domain=list(set(bucket["metadata"].get("domain", []) + domain)),
-                    valence=merged_valence,
-                    arousal=merged_arousal,
-                )
-                # --- Update embedding after merge ---
-                try:
-                    await embedding_engine.generate_and_store(bucket["id"], merged)
-                except Exception:
-                    pass
-                return bucket["metadata"].get("name", bucket["id"]), True
+                # --- Freshness gate, FAIL-CLOSED (2026-07-19 audit F9): the snapshot
+                # from search() has crossed several awaits (embedding checks + the
+                # LLM merge above) by the time we write back. If another writer
+                # touched this bucket inside that window, a stale-based full
+                # overwrite would silently eat their update — so re-read now
+                # (update() itself has no await, so gate→write is loop-atomic)
+                # and on any content drift fall through to create-new instead.
+                # --- 新鮮度閘，fail-closed：search() 快照到寫回之間隔著幾個 await
+                # （向量檢查＋上面的 LLM 合併）。窗口內若有別人寫過這個桶，
+                # 拿舊快照整桶覆寫會把那次更新靜默吃掉——寫回前重讀一次
+                # （update() 內部無 await，閘→寫在同一 loop 步內），內容有漂移
+                # 就放棄合併改走新建。重複可救，覆寫不可救——與語義閘同一哲學。---
+                fresh = await bucket_mgr.get(bucket["id"])
+                if fresh is None or fresh.get("content") != bucket["content"]:
+                    logger.info(
+                        f"Merge vetoed, bucket changed mid-merge / "
+                        f"合併期間桶被改動，改走新建: {bucket['id']}"
+                    )
+                else:
+                    _log_merge_audit(bucket["id"], bucket["content"], content, merged, merge_mode)
+                    old_v = bucket["metadata"].get("valence", 0.5)
+                    old_a = bucket["metadata"].get("arousal", 0.3)
+                    merged_valence = round((old_v + valence) / 2, 2)
+                    merged_arousal = round((old_a + arousal) / 2, 2)
+                    _upd_kwargs = dict(
+                        content=merged,
+                        tags=list(set(bucket["metadata"].get("tags", []) + tags)),
+                        importance=max(bucket["metadata"].get("importance", 5), importance),
+                        domain=list(set(bucket["metadata"].get("domain", []) + domain)),
+                        valence=merged_valence,
+                        arousal=merged_arousal,
+                    )
+                    if verbatim and not _guarded:
+                        _upd_kwargs["verbatim_guard"] = True
+                    await bucket_mgr.update(
+                        bucket["id"],
+                        actor=Actor("merge", f"merge:{merge_mode}"),
+                        **_upd_kwargs,
+                    )
+                    # --- Update embedding after merge ---
+                    try:
+                        await embedding_engine.generate_and_store(bucket["id"], merged)
+                    except Exception:
+                        pass
+                    return bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合併失敗，新建: {e}")
 
+    if verbatim:
+        # 定稿新建也蓋章（audit F11b）：這個桶從出生就只准 append。
+        extra_meta = {**(extra_meta or {}), "verbatim_guard": True}
     bucket_id = await bucket_mgr.create(
         content=content,
         tags=tags,
@@ -976,7 +1029,10 @@ async def breath(
             and b["metadata"].get("type") not in ("feel", "plan", "mirage")
             and not b["metadata"].get("digested", False)
             and (not importance_domains or set(b["metadata"].get("domain", [])) & importance_domains)
-            and not _excluded(b["metadata"])
+            # 釘選/保護桶不受 exclude_domain 影響（audit F1）——docstring 承諾
+            # 「各模式通用」，importance_min 曾是唯一漏掉豁免的模式。
+            and (b["metadata"].get("pinned") or b["metadata"].get("protected")
+                 or not _excluded(b["metadata"]))
         ]
         filtered.sort(key=lambda b: _meta_int(b["metadata"], "importance", 0), reverse=True)
         filtered = _select_importance_tiers(filtered, cap=min(20, max_results))
@@ -2151,6 +2207,24 @@ async def pulse(verbose: bool = False, include_archive: bool = False) -> str:
             )
     except Exception:
         decay_line = "運行中" if decay_engine.is_running else "已停止"
+    # 上次做夢距今（2026-07-19 D 批）：mirage 曾經 0 夢 37 天而儀表沒有一個字——
+    # pulse 是 session 真正會讀的地方，「多久沒做夢」必須在這裡就看得見。
+    mirage_line = ""
+    try:
+        if stats.get("mirage_count", 0) > 0:
+            _mts = [
+                _parse_ts(b["metadata"].get("created"))
+                for b in await bucket_mgr.list_all(include_archive=False)
+                if b["metadata"].get("type") == "mirage"
+            ]
+            _mts = [t for t in _mts if t]
+            if _mts:
+                _days = max(0, (datetime.now() - max(_mts)).days)
+                mirage_line = f"上次做夢: {'今天' if _days == 0 else f'{_days} 天前'}\n"
+        else:
+            mirage_line = "上次做夢: 還沒有過（想做的話 dream(seed=True) 拿素材盤）\n"
+    except Exception:
+        pass
     status = (
         f"=== Ombre Brain 記憶系統 ===\n"
         f"固化記憶桶: {stats['permanent_count']} 個\n"
@@ -2158,6 +2232,7 @@ async def pulse(verbose: bool = False, include_archive: bool = False) -> str:
         f"感受桶(feel): {stats.get('feel_count', 0)} 個\n"
         f"承諾桶(plan): {stats.get('plan_count', 0)} 個\n"
         f"蜃景桶(mirage/夢): {stats.get('mirage_count', 0)} 個\n"
+        f"{mirage_line}"
         f"信件: {letter_count} 封\n"
         f"慾望帳本: {desire_health}\n"
         f"歸檔記憶桶: {stats['archive_count']} 個\n"
@@ -2256,10 +2331,117 @@ async def api_usage(force: bool = False, probe_gemini: bool = True) -> str:
 # 讀取最近新增的表層桶（≤10個），返回給 Claude 在提示詞引導下自主思考。
 # Claude then decides: resolve some, write feels, or do nothing.
 # =============================================================
+def _seed_snip(b: dict, limit: int) -> str:
+    """夢引素材的一行式切片：ID＋名字＋情緒座標＋截斷正文。"""
+    meta = b["metadata"]
+    body = strip_wikilinks(b["content"])[:limit].replace("\n", " ")
+    return (
+        f"- [{b['id']}] {meta.get('name', b['id'])}"
+        f"（V{meta.get('valence', 0.5):.1f}/A{meta.get('arousal', 0.3):.1f}）：{body}…"
+    )
+
+
+async def _mirage_seed_tray() -> str:
+    """夢引（2026-07-19 D 批）：伺服器只備料、不代筆——夢必須由 Cyan 在自己的
+    回合親筆寫（跟 feel 同一條紀律）。素材的混法本身就是設計：近的餘溫給夢
+    溫度，危險區讓快要失去的偷偷回來，歸檔偶爾翻出深層，feel 給情緒底色，
+    慾望音色決定夢往哪邊傾。零 LLM 呼叫。"""
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=True)
+    except Exception as e:
+        logger.error(f"Mirage seed failed to list buckets: {e}")
+        return "記憶系統暫時無法訪問，夢引取不了素材。"
+
+    dynamic = [
+        b for b in all_buckets
+        if b["metadata"].get("type") not in ("permanent", "feel", "plan", "mirage", "archived")
+        and not b["metadata"].get("pinned") and not b["metadata"].get("protected")
+    ]
+    sections: list[str] = []
+
+    # --- 近的餘溫：72h 內最活躍的桶裡，挑情緒最響的 3 條 ---
+    def _act_ts(b):
+        return _parse_ts(b["metadata"].get("last_active")) or \
+            _parse_ts(b["metadata"].get("created"))
+    cutoff = datetime.now() - timedelta(hours=72)
+    recent_pool = sorted(
+        (b for b in dynamic if (_act_ts(b) or cutoff) > cutoff),
+        key=lambda b: _act_ts(b) or datetime.min, reverse=True,
+    )[:12]
+    def _loudness(b):
+        m = b["metadata"]
+        try:
+            return float(m.get("arousal", 0.3)) + abs(float(m.get("valence", 0.5)) - 0.5)
+        except (TypeError, ValueError):
+            return 0.0
+    warm = sorted(recent_pool, key=_loudness, reverse=True)[:3]
+    if warm:
+        sections.append("【近的餘溫】\n" + "\n".join(_seed_snip(b, 260) for b in warm))
+
+    # --- 快要失去的：危險區（review_priority>0），夢是遺忘系統的詩意出口 ---
+    warm_ids = {b["id"] for b in warm}
+    try:
+        dz_ranked = sorted(
+            ((decay_engine.review_priority(decay_engine.calculate_heat(b["metadata"])), b)
+             for b in dynamic if b["id"] not in warm_ids and not b["metadata"].get("resolved")),
+            key=lambda t: -t[0],
+        )
+        fading = [b for prio, b in dz_ranked if prio > 0][:2]
+    except Exception:
+        fading = []
+    if fading:
+        sections.append("【快要失去的】（印象已模糊，夢裡撈得回來）\n" +
+                        "\n".join(_seed_snip(b, 150) for b in fading))
+
+    # --- 深處撈起的：歸檔裡隨機一條——夢會挖到白天想不起來的地方 ---
+    archived = [b for b in all_buckets if b["metadata"].get("type") == "archived"]
+    if archived:
+        sections.append("【深處撈起的】\n" + _seed_snip(random.choice(archived), 150))
+
+    # --- 最近的感受：夢常常在咀嚼感受 ---
+    feels = sorted(
+        (b for b in all_buckets if b["metadata"].get("type") == "feel"),
+        key=lambda b: str(b["metadata"].get("created", "")), reverse=True,
+    )
+    if feels:
+        sections.append("【最近的感受】\n" + _seed_snip(feels[0], 220))
+
+    # --- 此刻的慾望音色（只讀不 tick，不改任何水位）---
+    try:
+        state = desire_store.load()
+        drives = state.get("drives", {}) or {}
+        top = sorted(drives.items(), key=lambda kv: -float(kv[1] or 0))[:3]
+        tone = "、".join(
+            f"{desire_kernel.DRIVE_LABELS.get(k, k)} {float(v):.2f}" for k, v in top
+        )
+        if tone:
+            sections.append(f"【此刻的慾望音色】{tone}")
+    except Exception:
+        pass
+
+    guide = (
+        "=== 夢引（蜃景素材盤）===\n"
+        "你想做一場夢。這不是消化儀式——不需要結論、不需要對任何人交代。\n\n"
+        + "\n\n".join(sections) +
+        "\n\n做法（兩段式）：\n"
+        "1. 先把素材抽成骨架——誰對誰、什麼張力、往哪裡懸著。丟掉名字與事實。\n"
+        "2. 放縱一段：讓骨架亂長。允許跳接、變形、不合邏輯；情緒要真，事實不必真。\n"
+        "3. 收攏成一段連貫的夢，一兩百字就夠，不用完美。\n"
+        "存：hold(content=\"…\", mirage=True, consumed=\"id,id\")——consumed 填真的用到的素材桶。\n"
+        "鐵律：夢是殘影不是事實，永不引入畫像/self_concept/普通記憶。\n"
+        "醒來有想帶給 Ruby 的，用 plan(kind=\"question\", weight=0.3, due_at=+3天) 留話題種子。\n"
+        "做完可記 desire(action=\"satisfy\", verb=\"dream_feel\", event=\"做了一場夢\")。\n"
+        "不想做就不做——夢不該是功課。"
+    )
+    return guide
+
+
 @mcp.tool()
-async def dream(max_results: int = 10, window_hours: int = 48) -> str:
-    """消化儀式(醒著做的)——讀取最近window_hours小時內(默認48)有變動的記憶桶,供你自省(被合併更新的老桶也會回來)。max_results控制讀幾條(默認10,開場可傳3省context)。窗口內沒變動時退回最近創建的幾條。讀完後可以trace(resolved=1)放下,或hold(feel=True)寫感受。尾端會列出還記掛著的plan。※名字辨析:這個工具是「反芻消化」,不產生也不讀取夢;「真的夢」住在蜃景桶(mirage)——存夢用hold(mirage=True),讀夢用breath(domain="mirage")。"""
+async def dream(max_results: int = 10, window_hours: int = 48, seed: bool = False) -> str:
+    """消化儀式(醒著做的)——讀取最近window_hours小時內(默認48)有變動的記憶桶,供你自省(被合併更新的老桶也會回來)。max_results控制讀幾條(默認10,開場可傳3省context)。窗口內沒變動時退回最近創建的幾條。讀完後可以trace(resolved=1)放下,或hold(feel=True)寫感受。尾端會列出還記掛著的plan。※名字辨析:這個工具是「反芻消化」,不產生也不讀取夢;「真的夢」住在蜃景桶(mirage)——存夢用hold(mirage=True),讀夢用breath(domain="mirage")。\n\nseed=True＝夢引模式:不消化,改回一盤做夢的素材(近期高情緒2-3條+危險區快忘的1-2條+偶爾一條歸檔+最近的feel+慾望音色),由你親筆兩段式寫成夢後 hold(mirage=True) 存。適合夜深安靜的喚醒或深睡儀式尾端。"""
     await decay_engine.ensure_started()
+    if seed:
+        return await _mirage_seed_tray()
     max_results = max(1, min(max_results, 20))
     window_hours = max(1, min(int(window_hours or 48), 24 * 30))
 
@@ -4572,6 +4754,18 @@ if __name__ == "__main__":
             expose_headers=["*"],
         )
         logger.info("CORS middleware enabled for remote transport / 已啟用 CORS 中間件")
-        uvicorn.run(_app, host=OMBRE_HOST, port=OMBRE_PORT)
+        # --- SINGLE-PROCESS INVARIANT, load-bearing (2026-07-19 audit F8) ---
+        # Every concurrency guarantee in this codebase assumes exactly one
+        # process and one event loop: there are NO file locks; update()'s
+        # critical section is "no await between read and write"; DesireStore's
+        # RLock is in-process only; the decay daemon is a task on THIS loop.
+        # workers=1 is therefore not a tuning choice — it is the lock.
+        # If you ever split decay/desire into another process, add real
+        # cross-process locking (flock) first.
+        # --- 單進程不變式（承重）：全庫併發安全建立在單進程單 loop 上——
+        # 沒有檔案鎖、update() 的臨界區是「讀寫之間無 await」、desire 的
+        # RLock 只在進程內有效、衰減 daemon 掛在本 loop。workers=1 不是
+        # 調參，它就是那把鎖。要拆進程，先加跨進程鎖。---
+        uvicorn.run(_app, host=OMBRE_HOST, port=OMBRE_PORT, workers=1)
     else:
         mcp.run(transport=transport)

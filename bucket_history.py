@@ -103,6 +103,15 @@ class BucketHistory:
         self.path = os.path.join(self.base_dir, "history.db")
         hist_cfg = config.get("history", {}) or {}
         self.enabled = bool(hist_cfg.get("enabled", True))
+        # Per-bucket retention (2026-07-19 audit F11a): append-only with no cap
+        # was an omission, not a decision. Newest N survive; seq stays monotonic
+        # (only low seqs are pruned, MAX(seq)+1 unaffected; deleted-bucket
+        # recovery uses the newest row, also unaffected). 0 = unlimited.
+        # 每桶保留上限：只刪最舊的、seq 單調性與刪桶救援（用最新列）都不受影響。
+        try:
+            self.max_versions = max(0, int(hist_cfg.get("max_versions_per_bucket", 200)))
+        except (TypeError, ValueError):
+            self.max_versions = 200
         if self.enabled:
             self._init_db()
 
@@ -187,6 +196,12 @@ class BucketHistory:
                                 json.dumps(meta, ensure_ascii=False, default=str),
                             ),
                         )
+                        if self.max_versions > 0:
+                            conn.execute(
+                                "DELETE FROM bucket_history WHERE bucket_id = ? "
+                                "AND seq <= ?",
+                                (bucket_id, seq - self.max_versions),
+                            )
                         return seq
                     except sqlite3.IntegrityError:
                         # Lost a seq race; recompute once. The UNIQUE index is
@@ -232,15 +247,3 @@ class BucketHistory:
             logger.warning(f"History get failed / 讀歷史失敗: {bucket_id}#{seq}: {e}")
             return None
 
-    def count(self, bucket_id: str) -> int:
-        if not self.enabled:
-            return 0
-        try:
-            with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM bucket_history WHERE bucket_id = ?",
-                    (bucket_id,),
-                ).fetchone()
-                return int(row[0])
-        except Exception:
-            return 0

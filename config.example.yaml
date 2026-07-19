@@ -141,6 +141,12 @@ matching:
   max_results: 5                  # Max results per search / 单次搜索最多返回条数
   # bm25_enabled: false          # Pre-built BM25 keyword channel (flip when corpus > ~2000 buckets or recall misses)
 
+# --- Edit history / 修改史（快照可復原）---
+history:
+  enabled: true
+  max_versions_per_bucket: 200    # Newest N snapshots kept per bucket; 0 = unlimited
+                                  # 每桶保留最新 N 版快照（seq 不重編、刪桶救援不受影響）；0 = 不修剪
+
 # --- Obsidian wikilinks / Obsidian 双链自动注入 ---
 wikilink:
   enabled: true

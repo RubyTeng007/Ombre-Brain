@@ -49,7 +49,7 @@ class DeleteResult(NamedTuple):
     ok: bool
     seq: Optional[int]
 
-from utils import generate_bucket_id, sanitize_name, safe_path, now_iso
+from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, parse_bucket_ts
 
 # --- Domain normalization: canonical form is Traditional Chinese (Ruby's call) ---
 # --- 主題域正規化：一律繁體（Ruby 拍板：全部繁體）。---
@@ -126,6 +126,10 @@ _EXTRA_META_KEYS = (
     # dream provenance (2026-07-12 batch-2): which buckets the dream consumed.
     # dream 出處（第二批）：這個夢消化了哪些桶。
     "consumed",
+    # verbatim guard (2026-07-19 audit F11b): bucket holds final-text content —
+    # merges must append, never LLM-rewrite.
+    # 逐字保護（audit F11b）：桶裡住著定稿——合併只准 append，不准 LLM 改寫。
+    "verbatim_guard",
 )
 _FLOAT_META_KEYS = ("weight", "progress")
 
@@ -332,6 +336,9 @@ class BucketManager:
             elif key == "status":
                 if str(value) in _PLAN_STATUSES:
                     metadata[key] = str(value)
+            elif key == "verbatim_guard":
+                # 布林旗標存真 bool（str 化會讓 'False' 也為真）。
+                metadata[key] = bool(value)
             else:
                 metadata[key] = str(value)[:200]
 
@@ -533,6 +540,10 @@ class BucketManager:
             post["why_remembered"] = str(kwargs["why_remembered"])[:200]
         if "related_bucket" in kwargs:
             post["related_bucket"] = str(kwargs["related_bucket"])[:64]
+        if "verbatim_guard" in kwargs:
+            # 逐字保護（2026-07-19 audit F11b）：桶裡一旦住進「一字不動」的定稿，
+            # 日後任何合併都只准 append、不准 LLM 改寫——承諾要對已入庫的內容永久成立。
+            post["verbatim_guard"] = bool(kwargs["verbatim_guard"])
 
         # --- Auto-refresh activation time / 自動刷新激活時間 ---
         post["last_active"] = now_iso()
@@ -822,9 +833,13 @@ class BucketManager:
 
             # --- Time ripple: boost memories created within ±48h of this one ---
             # --- 時間漣漪：喚醒與本桶創建時間相鄰（±48h）的記憶 ---
+            # tz 收口（2026-07-19 audit F2）：aware 時間戳（手改/舊 import）在這裡
+            # 曾直接 fromisoformat，naive−aware 相減拋 TypeError 被外層吞掉——
+            # 統一走 parse_bucket_ts（decay_engine 07-15 已收口，這邊補齊另一半）。
             created_str = post.get("created", "")
-            if ripple and created_str:
-                await self._time_ripple(bucket_id, datetime.fromisoformat(str(created_str)))
+            _ripple_ref = parse_bucket_ts(created_str) if (ripple and created_str) else None
+            if _ripple_ref is not None:
+                await self._time_ripple(bucket_id, _ripple_ref)
         except Exception as e:
             logger.warning(f"Failed to touch bucket / 觸碰桶失敗: {bucket_id}: {e}")
 
@@ -852,12 +867,10 @@ class BucketManager:
             if meta.get("resolved") or meta.get("digested"):
                 continue
 
-            created_str = meta.get("created", "")
-            try:
-                created = datetime.fromisoformat(str(created_str))
-                delta_hours = abs((reference_time - created).total_seconds()) / 3600
-            except (ValueError, TypeError):
+            created = parse_bucket_ts(meta.get("created", ""))
+            if created is None:
                 continue
+            delta_hours = abs((reference_time - created).total_seconds()) / 3600
             if delta_hours <= hours:
                 eligible.append(bucket["id"])
 
@@ -1161,12 +1174,13 @@ class BucketManager:
         Calculate time proximity score (0~1, more recent = higher).
         計算時間親近度。
         """
-        last_active_str = meta.get("last_active", meta.get("created", ""))
-        try:
-            last_active = datetime.fromisoformat(str(last_active_str))
+        # parse_bucket_ts 而非 raw fromisoformat（2026-07-19 audit F2）：aware 時間戳
+        # 曾在此拋 TypeError 被吞成 days=30——「30 天前」與真實新舊脫鉤，兩個方向都錯。
+        last_active = parse_bucket_ts(meta.get("last_active", meta.get("created", "")))
+        if last_active is None:
+            days = 30.0
+        else:
             days = max(0.0, (datetime.now() - last_active).total_seconds() / 86400)
-        except (ValueError, TypeError):
-            days = 30
         return math.exp(-0.02 * days)
 
     # ---------------------------------------------------------

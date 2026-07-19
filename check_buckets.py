@@ -20,7 +20,10 @@ async def main():
     issues = 0
     for b in buckets:
         meta = b.get("metadata", {})
-        if not meta.get("name") or not meta.get("domain") or not b.get("content"):
+        # feel/mirage 的 domain=[] 是設計（B-10）不是格式錯誤（audit F5）——
+        # 116 個假陽性會把真訊號淹掉。
+        domain_ok = bool(meta.get("domain")) or meta.get("type") in ("feel", "mirage")
+        if not meta.get("name") or not domain_ok or not b.get("content"):
             print(f"Format issue in {b['id']}")
             issues += 1
             
